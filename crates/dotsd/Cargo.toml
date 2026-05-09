@@ -1,0 +1,19 @@
+[package]
+name = "dotsd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "DOTS broker daemon — listens on TCP and routes pub/sub between guests."
+
+[dependencies]
+dots-transport.workspace = true
+
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+
+[lints]
+workspace = true

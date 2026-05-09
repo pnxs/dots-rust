@@ -124,6 +124,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dotsd"
+version = "0.1.0"
+dependencies = [
+ "dots-transport",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
