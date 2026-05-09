@@ -13,12 +13,17 @@ repository = "https://github.com/thomas-schaetzlein/dots-rust"
 dots-core = { path = "crates/dots-core", version = "0.1.0" }
 dots-derive = { path = "crates/dots-derive", version = "0.1.0" }
 dots-model = { path = "crates/dots-model", version = "0.1.0" }
+dots-transport = { path = "crates/dots-transport", version = "0.1.0" }
 
 minicbor = { version = "2", default-features = false, features = ["alloc"] }
 
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
+
+tokio = { version = "1", default-features = false }
+tokio-util = { version = "0.7", default-features = false }
+bytes = "1"
 
 [workspace.lints.rust]
 # Unsafe is denied workspace-wide; the only opt-in is dots-core's internal
