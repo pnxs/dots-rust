@@ -1,0 +1,34 @@
+/// Simple cached pubsub type with string + numeric fields.
+struct Pinger [cached] {
+    /// Stable identity.
+    1: [key] uint32 id;
+    /// Free-form payload.
+    2: string message;
+    3: uint64 sequence;
+}
+
+/// Connection state mirroring dots-cpp's enum.
+enum DotsConnectionState {
+    1: connecting,
+    2: early_subscribe,
+    3: connected,
+    4: suspended,
+    5: closed
+}
+
+/// Per-client record published by a hypothetical broker.
+struct DotsClient [internal, cached] {
+    1: [key] uint32 id;
+    2: string name;
+    3: bool running;
+    4: vector<string> publishedTypes;
+    5: vector<string> subscribedTypes;
+    6: DotsConnectionState connectionState;
+}
+
+/// Tests temporal field rendering.
+struct StatusReport [internal, cached] {
+    1: [key] string serverName;
+    2: timepoint startTime;
+    3: duration uptime;
+}

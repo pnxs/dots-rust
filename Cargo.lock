@@ -62,6 +62,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dots-build"
+version = "0.1.0"
+
+[[package]]
+name = "dots-build-test"
+version = "0.1.0"
+dependencies = [
+ "dots-build",
+ "dots-core",
+ "dots-derive",
+]
+
+[[package]]
 name = "dots-core"
 version = "0.1.0"
 dependencies = [
