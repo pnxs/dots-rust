@@ -44,6 +44,12 @@ struct RoundtripData {
 
     #[dots(tag = 5)]
     home: Option<Address>,
+
+    #[dots(tag = 6)]
+    raw: Option<Vec<u8>>,           // CBOR byte string
+
+    #[dots(tag = 7)]
+    counters: Option<Vec<u32>>,     // CBOR array of u32
 }
 
 fn print_summary(label: &str, value: &dyn StructValue) {
@@ -66,6 +72,8 @@ fn main() {
             street: Some("Lovelace Lane".into()),
             number: Some(11_u32),
         },
+        raw: vec![0xde_u8, 0xad, 0xbe, 0xef],
+        counters: vec![1_u32, 2, 3],
     });
     print_summary("from dots! macro", &from_macro);
 
@@ -82,6 +90,10 @@ fn main() {
     for p in RoundtripData::DESCRIPTOR.properties {
         let kind_label = match p.kind {
             FieldKind::Struct(d) => format!("Struct({})", d.name),
+            FieldKind::Vec(inner) => match inner {
+                FieldKind::Struct(d) => format!("Vec(Struct({}))", d.name),
+                _ => format!("Vec({inner:?})"),
+            },
             other => format!("{other:?}"),
         };
         println!(

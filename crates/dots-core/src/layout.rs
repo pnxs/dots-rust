@@ -275,21 +275,18 @@ fn deallocate(ptr: NonNull<u8>, layout: Layout) {
 
 // ===== DotsField: uniform encode/decode trait =====
 //
-// `DotsField` abstracts over "any type that can appear in a DOTS struct
-// field". It's the trait the per-property thunks dispatch through.
-// Two impl families exist:
+// `DotsField` abstracts over "any type that can occupy a DOTS struct
+// field". The per-property thunks dispatch through it.
 //
-//   1. A blanket impl for primitives (and `String`, `Vec<u8>`, etc.)
-//      — anything minicbor already knows how to encode/decode.
-//   2. Manual impls emitted by `#[derive(DotsStruct)]` on every derived
-//      struct, delegating to the descriptor-driven codec via the safe
-//      `encode_struct_value` / `decode_struct_default` wrappers.
+// We do *not* use a blanket impl over `T: minicbor::Encode + Decode`,
+// because that would force `Vec<u8>` to encode as a CBOR array (minicbor's
+// default for `Vec<T>`) rather than as a CBOR byte string. The wire-format
+// compatibility with C++ DOTS requires byte-string for `Vec<u8>`, so we
+// write explicit per-leaf-type impls below.
 //
-// The two families are disjoint: DOTS structs do *not* implement
-// `minicbor::Encode<()> + Decode<'_, ()>`, so the blanket and manual
-// impls never overlap. Nested DOTS struct fields work transparently:
-// `Option<Inner>` dispatches through `Inner: DotsField` (manual impl),
-// which recursively walks `Inner`'s descriptor.
+// `#[derive(DotsStruct)]` adds one more impl family on top: every derived
+// struct gets a manual `DotsField` impl that delegates to the descriptor-
+// driven codec via `encode_struct_value` / `decode_struct_default`.
 
 /// Trait implemented by every type that can occupy a DOTS property slot.
 pub trait DotsField: Sized {
@@ -300,17 +297,47 @@ pub trait DotsField: Sized {
     fn dots_decode(d: &mut CborDecoder<'_>) -> Result<Self, DecodeError>;
 }
 
-impl<T> DotsField for T
-where
-    T: minicbor::Encode<()> + for<'a> minicbor::Decode<'a, ()>,
-{
+/// Manual `DotsField` impls for the leaf types that already have
+/// `minicbor::Encode + Decode` and whose default minicbor wire format
+/// matches what DOTS expects (so we just delegate).
+macro_rules! impl_dots_field_via_minicbor {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl DotsField for $t {
+                #[inline]
+                fn dots_encode(&self, e: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
+                    <Self as minicbor::Encode<()>>::encode(self, e, &mut ())
+                }
+                #[inline]
+                fn dots_decode(d: &mut CborDecoder<'_>) -> Result<Self, DecodeError> {
+                    <Self as minicbor::Decode<'_, ()>>::decode(d, &mut ())
+                }
+            }
+        )*
+    };
+}
+
+impl_dots_field_via_minicbor!(
+    bool,
+    u8, u16, u32, u64,
+    i8, i16, i32, i64,
+    f32, f64,
+    alloc::string::String,
+);
+
+/// `Vec<u8>` is a special case: minicbor's default `Vec<T>` impl encodes
+/// as a CBOR array, but DOTS uses CBOR byte strings for raw bytes
+/// (cross-language compatibility with C++ DOTS). Manual impl writes
+/// `bytes` / reads `bytes` directly.
+impl DotsField for Vec<u8> {
     #[inline]
     fn dots_encode(&self, e: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
-        <Self as minicbor::Encode<()>>::encode(self, e, &mut ())
+        e.bytes(self)?;
+        Ok(())
     }
     #[inline]
     fn dots_decode(d: &mut CborDecoder<'_>) -> Result<Self, DecodeError> {
-        <Self as minicbor::Decode<'_, ()>>::decode(d, &mut ())
+        Ok(d.bytes()?.to_vec())
     }
 }
 
@@ -430,4 +457,70 @@ pub unsafe fn opt_drop<T>(ptr: *mut u8) {
     unsafe {
         core::ptr::drop_in_place(ptr as *mut Option<T>);
     }
+}
+
+// ===== Vec<T> thunk family =====
+//
+// For `Option<Vec<X>>` fields where `X` is not `u8`, the proc-macro
+// reaches for these helpers instead of `opt_encode`/`opt_decode`. The
+// wire format is a CBOR array of `X` (whereas `Vec<u8>` stays on the
+// byte-string path through the regular `opt_*` thunks).
+//
+// `is_set` and `drop_in_place` simply use `opt_is_set::<Vec<X>>` and
+// `opt_drop::<Vec<X>>` — `Vec<X>` is a normal owned type for those
+// purposes.
+
+/// Encode the inner `Vec<T>` of `Option<Vec<T>>` at `ptr` as a CBOR array.
+///
+/// # Safety
+///
+/// `ptr` must point to a valid `Option<Vec<T>>` whose discriminant is `Some`.
+pub unsafe fn opt_encode_vec<T>(
+    ptr: *const u8,
+    e: &mut CborEncoder<'_>,
+) -> Result<(), EncodeError>
+where
+    T: DotsField,
+{
+    // SAFETY: caller-upheld.
+    let opt = unsafe { &*(ptr as *const Option<Vec<T>>) };
+    let v = opt
+        .as_ref()
+        .expect("opt_encode_vec invoked on a None field — caller must check is_set first");
+    e.array(v.len() as u64)?;
+    for item in v {
+        item.dots_encode(e)?;
+    }
+    Ok(())
+}
+
+/// Decode a CBOR array into `Vec<T>`, drop any existing `Option<Vec<T>>`
+/// at `ptr`, and write `Some(value)` in its place.
+///
+/// # Safety
+///
+/// `ptr` must point to a valid `Option<Vec<T>>` (initialized — at minimum
+/// zero-initialized, which is `None`).
+pub unsafe fn opt_decode_vec<T>(
+    ptr: *mut u8,
+    d: &mut CborDecoder<'_>,
+) -> Result<(), DecodeError>
+where
+    T: DotsField,
+{
+    let len = d.array()?.ok_or_else(|| {
+        DecodeError::message("indefinite-length arrays are not supported in DOTS Vec fields")
+    })?;
+    let mut out: Vec<T> = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        out.push(T::dots_decode(d)?);
+    }
+    let p = ptr as *mut Option<Vec<T>>;
+    // SAFETY: `p` points to a valid `Option<Vec<T>>` per caller contract;
+    // dropping the existing value is sound.
+    unsafe {
+        core::ptr::drop_in_place(p);
+        core::ptr::write(p, Some(out));
+    }
+    Ok(())
 }

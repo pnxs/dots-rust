@@ -282,9 +282,29 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// Emit a `static` `PropertyVtable` for a single property, with
 /// fn-pointer fields pointing at monomorphizations of the generic
 /// `opt_*` helpers from `dots_core::layout`.
+///
+/// `Option<Vec<X>>` fields where `X != u8` route through the
+/// `opt_*_vec<X>` helpers (CBOR array). `Option<Vec<u8>>` and all
+/// other field types stay on the regular `opt_*<T>` helpers, which
+/// dispatch through `T: DotsField` (byte-string for `Vec<u8>` via
+/// the manual minicbor delegate).
 fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
     let inner_ty = f.inner_ty;
     let vtable_ident = vtable_ident(f.ident);
+
+    if let Some(elem_ty) = vec_element_type(inner_ty) {
+        // `inner_ty` is `Vec<elem_ty>` (and elem_ty is not `u8`).
+        return quote! {
+            static #vtable_ident: ::dots_core::PropertyVtable = ::dots_core::PropertyVtable {
+                layout: ::core::alloc::Layout::new::<::core::option::Option<#inner_ty>>(),
+                is_set: ::dots_core::layout::opt_is_set::<#inner_ty>,
+                encode_value: ::dots_core::layout::opt_encode_vec::<#elem_ty>,
+                decode_value: ::dots_core::layout::opt_decode_vec::<#elem_ty>,
+                drop_in_place: ::dots_core::layout::opt_drop::<#inner_ty>,
+            };
+        };
+    }
+
     quote! {
         static #vtable_ident: ::dots_core::PropertyVtable = ::dots_core::PropertyVtable {
             layout: ::core::alloc::Layout::new::<::core::option::Option<#inner_ty>>(),
@@ -294,6 +314,30 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
             drop_in_place: ::dots_core::layout::opt_drop::<#inner_ty>,
         };
     }
+}
+
+/// If `ty` is `Vec<X>` for some `X != u8`, return `&X`. Otherwise `None`.
+fn vec_element_type(ty: &Type) -> Option<&Type> {
+    let Type::Path(tp) = ty else {
+        return None;
+    };
+    let last = tp.path.segments.last()?;
+    if last.ident != "Vec" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
+    let inner = args.args.iter().find_map(|a| match a {
+        GenericArgument::Type(t) => Some(t),
+        _ => None,
+    })?;
+    if let Type::Path(inner_tp) = inner {
+        if inner_tp.path.is_ident("u8") {
+            return None;
+        }
+    }
+    Some(inner)
 }
 
 fn vtable_ident(field_ident: &Ident) -> Ident {
@@ -449,9 +493,11 @@ fn option_inner_type(ty: &Type) -> Option<&Type> {
 /// Map the syntactic field type to a `FieldKind` expression.
 ///
 /// Recognized primitives produce the matching `FieldKind` variant.
-/// `Vec<u8>` becomes `FieldKind::Bytes`. Anything else is treated as
-/// a nested DOTS struct: we emit `FieldKind::Struct(<T>::DESCRIPTOR)`,
-/// which fails to compile if the type is not in fact `#[derive(DotsStruct)]`.
+/// `Vec<u8>` becomes `FieldKind::Bytes`. `Vec<X>` for non-byte `X`
+/// becomes `FieldKind::Vec(&<inner kind>)` (recursive). Anything else
+/// is treated as a nested DOTS struct: we emit
+/// `FieldKind::Struct(<T>::DESCRIPTOR)`, which fails to compile if the
+/// type is not in fact `#[derive(DotsStruct)]`.
 fn field_kind_for(ty: &Type) -> TokenStream2 {
     if let Type::Path(tp) = ty {
         if let Some(last) = tp.path.segments.last() {
@@ -475,12 +521,18 @@ fn field_kind_for(ty: &Type) -> TokenStream2 {
                 let kind_ident = Ident::new(p, last.ident.span());
                 return quote! { ::dots_core::FieldKind::#kind_ident };
             }
-            if name == "Vec" && is_vec_of_u8(&last.arguments) {
-                return quote! { ::dots_core::FieldKind::Bytes };
+            if name == "Vec" {
+                if is_vec_of_u8(&last.arguments) {
+                    return quote! { ::dots_core::FieldKind::Bytes };
+                }
+                // `Vec<X>` for non-byte X — recurse on inner type and
+                // wrap in `FieldKind::Vec(&inner)`. Rvalue static
+                // promotion lifts the inner literal to `'static`.
+                if let Some(inner) = vec_element_type(ty) {
+                    let inner_kind = field_kind_for(inner);
+                    return quote! { ::dots_core::FieldKind::Vec(&#inner_kind) };
+                }
             }
-            // `Vec<T>` for non-byte T is not yet supported; falls through
-            // to the struct branch, which will fail to compile with a
-            // clear error if `Vec` doesn't have a `DESCRIPTOR`.
         }
     }
     // Treat as nested DOTS struct: pull the descriptor from the type.
