@@ -7,7 +7,7 @@ use dots_derive::DotsStruct;
 use dots_model::{
     DotsHeader, FramingError, MAX_BODY_SIZE, Registry, SIZE_PREFIX_LEN, SIZE_PREFIX_MARKER,
     StructDescriptorData, Transmission, decode_typed_transmission, encode_typed_transmission,
-    parse_size_prefix,
+    encode_typed_transmission_into, parse_size_prefix,
 };
 
 #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
@@ -252,6 +252,84 @@ fn decode_returns_need_more_data_when_prefix_short() {
 }
 
 // ----- Cross-roundtrip: typed encode → dynamic decode → re-encode -----
+
+// ----- encode_into / batching -----
+
+#[test]
+fn encode_into_appends_to_existing_buffer() {
+    let mut buf = vec![0xAB_u8, 0xCD]; // pre-existing bytes
+    encode_typed_transmission_into(
+        &header_for("Sample"),
+        &Sample {
+            id: Some(1),
+            label: Some("hi".into()),
+        },
+        &mut buf,
+    );
+
+    // Pre-existing bytes preserved at the front.
+    assert_eq!(&buf[..2], &[0xAB, 0xCD]);
+    // Frame begins at offset 2 with the size prefix marker.
+    assert_eq!(buf[2], SIZE_PREFIX_MARKER);
+    let body_size = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]) as usize;
+    assert_eq!(2 + SIZE_PREFIX_LEN + body_size, buf.len());
+}
+
+#[test]
+fn encode_into_batches_multiple_frames() {
+    let mut buf = Vec::new();
+    let h = header_for("Sample");
+    encode_typed_transmission_into(
+        &h,
+        &Sample {
+            id: Some(1),
+            ..Default::default()
+        },
+        &mut buf,
+    );
+    let after_first = buf.len();
+    encode_typed_transmission_into(
+        &h,
+        &Sample {
+            id: Some(2),
+            ..Default::default()
+        },
+        &mut buf,
+    );
+
+    // Each frame's size prefix points only at its own body — not the
+    // total buffer length.
+    assert_eq!(buf[0], SIZE_PREFIX_MARKER);
+    let first_body = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    assert_eq!(SIZE_PREFIX_LEN + first_body, after_first);
+
+    assert_eq!(buf[after_first], SIZE_PREFIX_MARKER);
+    let second_body = u32::from_be_bytes([
+        buf[after_first + 1],
+        buf[after_first + 2],
+        buf[after_first + 3],
+        buf[after_first + 4],
+    ]) as usize;
+    assert_eq!(after_first + SIZE_PREFIX_LEN + second_body, buf.len());
+}
+
+#[test]
+fn transmission_encode_into_matches_encode() {
+    let registry = populated_registry();
+    let typed_frame = encode_typed_transmission(
+        &header_for("Sample"),
+        &Sample {
+            id: Some(7),
+            label: Some("equiv".into()),
+        },
+    );
+    let (txn, _) = Transmission::decode(&typed_frame, &registry).unwrap();
+
+    let one_shot = txn.encode();
+    let mut buf = Vec::new();
+    txn.encode_into(&mut buf);
+    assert_eq!(one_shot, buf);
+}
 
 #[test]
 fn typed_encode_then_dynamic_reencode_is_byte_identical() {

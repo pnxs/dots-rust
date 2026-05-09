@@ -119,28 +119,56 @@ impl From<DecodeError> for FramingError {
 /// or override it.
 pub fn encode_typed_transmission(header: &DotsHeader, payload: &dyn StructValue) -> Vec<u8> {
     let mut out = Vec::with_capacity(SIZE_PREFIX_LEN + 64);
-    out.extend_from_slice(&[SIZE_PREFIX_MARKER, 0, 0, 0, 0]);
-    encode_into_vec(header, &mut out);
-    encode_into_vec(payload, &mut out);
-    patch_size_prefix(&mut out);
+    encode_typed_transmission_into(header, payload, &mut out);
     out
+}
+
+/// Append a typed-payload transmission to an existing buffer.
+///
+/// Lets callers (e.g. the async transport's encoder) reuse a scratch
+/// buffer across many sends, eliminating the per-send allocation. Also
+/// usable for building a single buffer of back-to-back frames — each
+/// call appends one complete frame whose size prefix references only
+/// that frame's body.
+pub fn encode_typed_transmission_into(
+    header: &DotsHeader,
+    payload: &dyn StructValue,
+    out: &mut Vec<u8>,
+) {
+    let frame_start = out.len();
+    out.extend_from_slice(&[SIZE_PREFIX_MARKER, 0, 0, 0, 0]);
+    encode_into_vec(header, out);
+    encode_into_vec(payload, out);
+    patch_size_prefix(out, frame_start);
 }
 
 impl Transmission {
     /// Encode this transmission (with its dynamic payload) into a v2 frame.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(SIZE_PREFIX_LEN + 64);
-        out.extend_from_slice(&[SIZE_PREFIX_MARKER, 0, 0, 0, 0]);
-        encode_into_vec(&self.header, &mut out);
-        self.payload.encode_into(&mut out);
-        patch_size_prefix(&mut out);
+        self.encode_into(&mut out);
         out
+    }
+
+    /// Append this transmission's frame bytes to an existing buffer.
+    /// Same scratch-buffer / batching benefits as
+    /// [`encode_typed_transmission_into`].
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        let frame_start = out.len();
+        out.extend_from_slice(&[SIZE_PREFIX_MARKER, 0, 0, 0, 0]);
+        encode_into_vec(&self.header, out);
+        self.payload.encode_into(out);
+        patch_size_prefix(out, frame_start);
     }
 }
 
-fn patch_size_prefix(buf: &mut [u8]) {
-    let body_size = (buf.len() - SIZE_PREFIX_LEN) as u32;
-    buf[1..5].copy_from_slice(&body_size.to_be_bytes());
+/// Patch the 4-byte big-endian size field of a frame whose 5-byte
+/// prefix begins at `frame_start` in `buf`.
+fn patch_size_prefix(buf: &mut [u8], frame_start: usize) {
+    let frame_end = buf.len();
+    let body_size = (frame_end - frame_start - SIZE_PREFIX_LEN) as u32;
+    buf[frame_start + 1..frame_start + SIZE_PREFIX_LEN]
+        .copy_from_slice(&body_size.to_be_bytes());
 }
 
 // ===== Decoding =====

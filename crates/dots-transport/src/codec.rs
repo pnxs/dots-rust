@@ -10,18 +10,29 @@ use crate::TransportError;
 ///
 /// `Framed<S, TransmissionCodec>` over any `AsyncRead+AsyncWrite` stream
 /// `S` gives a `Stream<Item = Result<Transmission, TransportError>>` plus
-/// `Sink<Transmission, Error = TransportError>`. The codec carries only an
-/// `Arc<Registry>` for resolving payload type names during decode, so it's
-/// `Clone` + `Send` + `Sync` and can be shared across connections.
-#[derive(Debug, Clone)]
+/// `Sink<Transmission, Error = TransportError>`. The codec carries an
+/// `Arc<Registry>` for resolving payload type names during decode, so it
+/// can be shared across connections via `Clone`.
+///
+/// The encoder reuses a per-codec scratch buffer across calls so that
+/// streaming many transmissions doesn't allocate-per-send. Cloning a
+/// codec gives the clone its own independent scratch buffer (the
+/// existing one isn't shared).
+#[derive(Debug)]
 pub struct TransmissionCodec {
     registry: Arc<Registry>,
+    /// Encoder scratch — reused across `encode` calls to amortize
+    /// allocation. Cleared at the start of each frame.
+    scratch: Vec<u8>,
 }
 
 impl TransmissionCodec {
     /// Build a codec backed by the given registry.
     pub fn new(registry: Arc<Registry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            scratch: Vec::new(),
+        }
     }
 
     /// Read-only handle to the registry. Callers can reach inside if
@@ -29,6 +40,15 @@ impl TransmissionCodec {
     /// descriptor before its first transmission arrives).
     pub fn registry(&self) -> &Arc<Registry> {
         &self.registry
+    }
+}
+
+impl Clone for TransmissionCodec {
+    /// Clones the registry handle but starts the new codec with a
+    /// fresh empty scratch buffer — copying it is wasted work since
+    /// it gets cleared on the first encode.
+    fn clone(&self) -> Self {
+        Self::new(self.registry.clone())
     }
 }
 
@@ -62,11 +82,18 @@ impl Encoder<Transmission> for TransmissionCodec {
     type Error = TransportError;
 
     fn encode(&mut self, item: Transmission, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        // Transmission::encode produces a complete v2 frame (size
-        // prefix + header + payload). Append it to the output buffer.
-        let frame = item.encode();
-        dst.reserve(frame.len());
-        dst.put_slice(&frame);
+        // Encode into the per-codec scratch buffer first, then copy
+        // the bytes into the framed output. The scratch keeps its
+        // capacity across calls so streaming many sends doesn't
+        // re-allocate. The copy from scratch into the BytesMut is
+        // unavoidable: minicbor's Write trait is foreign and
+        // BytesMut isn't, so we can't write directly through the
+        // typed property thunks (whose fn-pointer signatures fix the
+        // writer to `&mut Vec<u8>`).
+        self.scratch.clear();
+        item.encode_into(&mut self.scratch);
+        dst.reserve(self.scratch.len());
+        dst.put_slice(&self.scratch);
         Ok(())
     }
 }
