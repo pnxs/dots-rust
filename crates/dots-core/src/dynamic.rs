@@ -229,7 +229,17 @@ impl DynamicStruct {
         bytes: &[u8],
     ) -> Result<Self, DecodeError> {
         let mut decoder = minicbor::Decoder::new(bytes);
-        decode_struct(&descriptor, &mut decoder).map(|(valid, properties)| Self {
+        Self::decode_from_decoder(descriptor, &mut decoder)
+    }
+
+    /// Decode a wire-only struct from an active decoder. Useful when
+    /// reading a stream of CBOR items and needing to track consumed
+    /// bytes via `decoder.position()`.
+    pub fn decode_from_decoder(
+        descriptor: Arc<DynamicStructDescriptor>,
+        decoder: &mut CborDecoder<'_>,
+    ) -> Result<Self, DecodeError> {
+        decode_struct(&descriptor, decoder).map(|(valid, properties)| Self {
             descriptor,
             valid,
             properties,
@@ -239,11 +249,20 @@ impl DynamicStruct {
     /// Encode this value to a freshly allocated `Vec<u8>`.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
-        {
-            let mut encoder = minicbor::Encoder::new(&mut buf);
-            encode_struct(self, &mut encoder).expect("Vec<u8> writes are infallible");
-        }
+        self.encode_into(&mut buf);
         buf
+    }
+
+    /// Append the encoded form of this value to an existing `Vec<u8>`.
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
+        let mut encoder = minicbor::Encoder::new(buf);
+        encode_struct(self, &mut encoder).expect("Vec<u8> writes are infallible");
+    }
+
+    /// Encode directly into an active CBOR encoder. Used by the framing
+    /// layer to assemble header + payload into a single buffer.
+    pub fn encode_into_encoder(&self, encoder: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
+        encode_struct(self, encoder)
     }
 }
 

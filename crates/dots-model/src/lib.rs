@@ -19,6 +19,7 @@
 
 pub mod connection;
 pub mod descriptors;
+pub mod framing;
 pub mod registry;
 
 pub use connection::{
@@ -28,5 +29,9 @@ pub use connection::{
 pub use descriptors::{
     DotsStructFlags, DotsStructScope, EnumDescriptorData, EnumElementDescriptor,
     StructDescriptorData, StructDocumentation, StructPropertyData,
+};
+pub use framing::{
+    FramingError, MAX_BODY_SIZE, SIZE_PREFIX_LEN, SIZE_PREFIX_MARKER, Transmission,
+    decode_typed_transmission, encode_typed_transmission, parse_size_prefix,
 };
 pub use registry::{DescriptorEntry, Registry, RegistryError};

@@ -32,7 +32,8 @@ pub use dynamic::{
     DynamicStruct, DynamicStructDescriptor, DynamicValue,
 };
 pub use layout::{
-    AnyStruct, DecodeError, DotsField, EncodeError, decode_typed_from_slice, encode_to_vec,
+    AnyStruct, DecodeError, DotsField, EncodeError, decode_typed_from_decoder,
+    decode_typed_from_slice, encode_into_encoder, encode_into_vec, encode_to_vec,
 };
 pub use property_set::PropertySet;
 pub use value::StructValue;

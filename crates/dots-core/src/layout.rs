@@ -142,22 +142,46 @@ impl StructValue for AnyStruct {
 /// implementation produces.
 pub fn encode_to_vec(value: &dyn StructValue) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
-    {
-        let mut encoder = minicbor::Encoder::new(&mut buf);
-        // SAFETY: `value.data_ptr()` is valid for the lifetime of `value`,
-        // and the property offsets are within `descriptor().layout().size()`
-        // by descriptor construction.
-        unsafe {
-            encode_from_raw(
-                value.descriptor(),
-                value.data_ptr(),
-                value.valid_set(),
-                &mut encoder,
-            )
-            .expect("Vec<u8> writes are infallible");
-        }
-    }
+    encode_into_vec(value, &mut buf);
     buf
+}
+
+/// Append the encoded form of `value` to an existing `Vec<u8>`.
+/// Useful when assembling multi-part wire frames (e.g. transmission
+/// envelopes containing a header + payload) without an intermediate
+/// allocation per part.
+pub fn encode_into_vec(value: &dyn StructValue, buf: &mut Vec<u8>) {
+    let mut encoder = minicbor::Encoder::new(buf);
+    // SAFETY: `value.data_ptr()` is valid for the lifetime of `value`,
+    // and the property offsets are within `descriptor().layout().size()`
+    // by descriptor construction.
+    unsafe {
+        encode_from_raw(
+            value.descriptor(),
+            value.data_ptr(),
+            value.valid_set(),
+            &mut encoder,
+        )
+        .expect("Vec<u8> writes are infallible");
+    }
+}
+
+/// Encode any `&dyn StructValue` directly into an active CBOR encoder.
+/// The encoder's writer is generic — useful for encoders writing into
+/// shared buffers managed by callers (e.g. the framing layer).
+pub fn encode_into_encoder(
+    value: &dyn StructValue,
+    encoder: &mut CborEncoder<'_>,
+) -> Result<(), EncodeError> {
+    // SAFETY: same invariants as `encode_into_vec`.
+    unsafe {
+        encode_from_raw(
+            value.descriptor(),
+            value.data_ptr(),
+            value.valid_set(),
+            encoder,
+        )
+    }
 }
 
 /// Walk the descriptor and emit each set property to the encoder.
@@ -233,17 +257,27 @@ pub fn decode_typed_from_slice<T>(bytes: &[u8]) -> Result<T, DecodeError>
 where
     T: StructValue + Default,
 {
+    let mut decoder = minicbor::Decoder::new(bytes);
+    decode_typed_from_decoder(&mut decoder)
+}
+
+/// Decode a typed struct from an active decoder. Useful when the
+/// caller is reading a stream of CBOR items and needs to know how
+/// many bytes were consumed (via `decoder.position()`).
+pub fn decode_typed_from_decoder<T>(decoder: &mut CborDecoder<'_>) -> Result<T, DecodeError>
+where
+    T: StructValue + Default,
+{
     let mut value = T::default();
     let descriptor = StructValue::descriptor(&value);
     let mut valid = PropertySet::EMPTY;
-    let mut decoder = minicbor::Decoder::new(bytes);
     let base = (&raw mut value) as *mut u8;
     // SAFETY: `T: StructValue` enforces the layout invariant — its
     // descriptor matches `T`'s `(size, align)` and the field offsets
     // come from `offset_of!(T, _)`. Treating `&mut value` as `*mut u8`
     // for byte-precise field writes via typed thunks is sound.
     unsafe {
-        decode_into_raw(descriptor, base, &mut valid, &mut decoder)?;
+        decode_into_raw(descriptor, base, &mut valid, decoder)?;
     }
     Ok(value)
 }
