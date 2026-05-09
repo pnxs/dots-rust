@@ -18,12 +18,17 @@
 extern crate alloc;
 
 mod descriptor;
+pub mod dynamic;
 pub mod layout;
 mod property_set;
 mod value;
 
 pub use descriptor::{
     FieldKind, PropertyDescriptor, PropertyVtable, StructDescriptor, StructFlags,
+};
+pub use dynamic::{
+    DynamicFieldKind, DynamicPropertyDescriptor, DynamicStruct, DynamicStructDescriptor,
+    DynamicValue,
 };
 pub use layout::{
     AnyStruct, DecodeError, DotsField, EncodeError, decode_typed_from_slice, encode_to_vec,

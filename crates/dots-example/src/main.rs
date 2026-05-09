@@ -15,7 +15,12 @@
 //!
 //! [`AnyStruct`]: dots_core::AnyStruct
 
-use dots_core::{AnyStruct, FieldKind, StructValue, decode_typed_from_slice, dots, encode_to_vec};
+use std::sync::Arc;
+
+use dots_core::{
+    AnyStruct, DynamicStruct, DynamicStructDescriptor, FieldKind, StructValue,
+    decode_typed_from_slice, dots, encode_to_vec,
+};
 use dots_derive::DotsStruct;
 
 #[derive(DotsStruct, Default, Debug)]
@@ -142,6 +147,35 @@ fn main() {
         "typed and dynamic encode paths must produce identical bytes"
     );
     println!("typed-bytes == dynamic-bytes: ok");
+
+    // -- Wire-only path: decode using ONLY descriptor metadata --
+    //
+    // This simulates dotsd's situation: it has never compiled
+    // RoundtripData, but it received a descriptor (here projected from
+    // the static one as a stand-in for descriptor exchange) and can
+    // still decode + re-encode the value to byte-identical output.
+    println!();
+    let wire_only_descriptor = Arc::new(DynamicStructDescriptor::from_static(
+        RoundtripData::DESCRIPTOR,
+    ));
+    let wire_only_value = DynamicStruct::decode(wire_only_descriptor, &typed_bytes)
+        .expect("wire-only decode must succeed");
+    println!(
+        "wire-only valid_set: {:?} ({} props)",
+        wire_only_value.valid,
+        wire_only_value.properties.len()
+    );
+    let wire_only_bytes = wire_only_value.encode();
+    println!(
+        "wire-only encoded ({} bytes): {}",
+        wire_only_bytes.len(),
+        hex(&wire_only_bytes)
+    );
+    assert_eq!(
+        typed_bytes, wire_only_bytes,
+        "wire-only path must produce identical bytes — this is the cross-language compat contract"
+    );
+    println!("typed-bytes == wire-only-bytes: ok");
 }
 
 fn hex(bytes: &[u8]) -> String {
