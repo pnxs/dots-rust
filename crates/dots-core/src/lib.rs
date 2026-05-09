@@ -7,13 +7,20 @@
 
 extern crate alloc;
 
+mod codec;
 mod descriptor;
 mod property_set;
 mod value;
 
+pub use codec::{DecodeError, EncodeError, decode_from_slice, encode_into_vec, encode_to_vec};
 pub use descriptor::{PropertyDescriptor, StructDescriptor, StructFlags};
 pub use property_set::PropertySet;
 pub use value::StructValue;
+
+/// Re-export of the `minicbor` crate so derived code and downstream users
+/// reference a single, version-aligned copy. Prefer importing
+/// `dots_core::minicbor` over adding minicbor directly to your `Cargo.toml`.
+pub use minicbor;
 
 /// Construct a DOTS struct literal with terse syntax.
 ///

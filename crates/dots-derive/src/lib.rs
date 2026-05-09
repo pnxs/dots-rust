@@ -161,6 +161,30 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     });
 
+    let encode_arms = fields.iter().map(|f| {
+        let ident = f.ident;
+        let tag = f.tag;
+        quote! {
+            if let ::core::option::Option::Some(__v) = &self.#ident {
+                __e.u32(#tag)?;
+                <_ as ::dots_core::minicbor::Encode<()>>::encode(__v, __e, __ctx)?;
+            }
+        }
+    });
+
+    let decode_arms = fields.iter().map(|f| {
+        let ident = f.ident;
+        let tag = f.tag;
+        let inner_ty = f.inner_ty;
+        quote! {
+            #tag => {
+                __out.#ident = ::core::option::Option::Some(
+                    <#inner_ty as ::dots_core::minicbor::Decode<'_b, ()>>::decode(__d, __ctx)?,
+                );
+            }
+        }
+    });
+
     let descriptor_const_ident = Ident::new(
         &format!("_DOTS_DESCRIPTOR_{}", struct_ident.to_string().to_uppercase()),
         struct_ident.span(),
@@ -210,6 +234,52 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             #[inline]
             fn as_any(&self) -> &dyn ::core::any::Any {
                 self
+            }
+        }
+
+        impl #impl_generics ::dots_core::minicbor::Encode<()> for #struct_ident #ty_generics
+            #where_clause
+        {
+            fn encode<__W>(
+                &self,
+                __e: &mut ::dots_core::minicbor::Encoder<__W>,
+                __ctx: &mut (),
+            ) -> ::core::result::Result<
+                (),
+                ::dots_core::minicbor::encode::Error<__W::Error>,
+            >
+            where
+                __W: ::dots_core::minicbor::encode::Write,
+            {
+                let __valid = <Self as ::dots_core::StructValue>::valid_set(self);
+                __e.map(__valid.len() as u64)?;
+                #( #encode_arms )*
+                ::core::result::Result::Ok(())
+            }
+        }
+
+        impl<'_b> #impl_generics ::dots_core::minicbor::Decode<'_b, ()> for #struct_ident #ty_generics
+            #where_clause
+        {
+            fn decode(
+                __d: &mut ::dots_core::minicbor::Decoder<'_b>,
+                __ctx: &mut (),
+            ) -> ::core::result::Result<Self, ::dots_core::minicbor::decode::Error> {
+                #[allow(unused_mut)]
+                let mut __out = <Self as ::core::default::Default>::default();
+                let __len = __d.map()?.ok_or_else(|| {
+                    ::dots_core::minicbor::decode::Error::message(
+                        "indefinite-length maps are not supported in DOTS structs",
+                    )
+                })?;
+                for _ in 0..__len {
+                    let __tag = __d.u32()?;
+                    match __tag {
+                        #( #decode_arms )*
+                        _ => __d.skip()?,
+                    }
+                }
+                ::core::result::Result::Ok(__out)
             }
         }
     };

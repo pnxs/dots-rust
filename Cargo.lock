@@ -5,11 +5,15 @@ version = 4
 [[package]]
 name = "dots-core"
 version = "0.1.0"
+dependencies = [
+ "minicbor",
+]
 
 [[package]]
 name = "dots-derive"
 version = "0.1.0"
 dependencies = [
+ "dots-core",
  "proc-macro2",
  "quote",
  "syn",
@@ -22,6 +26,12 @@ dependencies = [
  "dots-core",
  "dots-derive",
 ]
+
+[[package]]
+name = "minicbor"
+version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e70eae6d4f18f7d76877fe7b13f0bc21f7c2b7239d2041c338335f7b388d0dd7"
 
 [[package]]
 name = "proc-macro2"
