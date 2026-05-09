@@ -20,9 +20,11 @@
 //! ```
 
 mod codec;
+mod connection;
 mod error;
 
 pub use codec::TransmissionCodec;
+pub use connection::{Connection, ConnectionError};
 pub use error::TransportError;
 
 // Re-export the framing layer's public types so callers don't need to

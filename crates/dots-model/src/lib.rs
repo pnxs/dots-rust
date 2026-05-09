@@ -36,3 +36,40 @@ pub use framing::{
     parse_size_prefix,
 };
 pub use registry::{DescriptorEntry, Registry, RegistryError};
+
+/// Register the DOTS-internal types — the handshake messages, the
+/// per-transmission [`DotsHeader`], descriptor-data types, and
+/// connection-state enum — into a [`Registry`].
+///
+/// Any client that wants the codec to decode handshake traffic must
+/// have these registered. Order doesn't matter for static registration
+/// since each `&'static StructDescriptor` already references its
+/// nested types directly; the registry just needs name → descriptor
+/// entries.
+pub fn register_dots_internal_types(reg: &mut Registry) {
+    // Connection / handshake.
+    reg.register_struct_static(DotsHeader::DESCRIPTOR);
+    reg.register_struct_static(DotsMsgHello::DESCRIPTOR);
+    reg.register_struct_static(DotsMsgConnect::DESCRIPTOR);
+    reg.register_struct_static(DotsMsgConnectResponse::DESCRIPTOR);
+    reg.register_struct_static(DotsMsgError::DESCRIPTOR);
+    reg.register_enum_static(DotsConnectionState::DESCRIPTOR);
+
+    // Descriptor exchange.
+    reg.register_struct_static(StructPropertyData::DESCRIPTOR);
+    reg.register_struct_static(StructDocumentation::DESCRIPTOR);
+    reg.register_struct_static(DotsStructFlags::DESCRIPTOR);
+    reg.register_enum_static(DotsStructScope::DESCRIPTOR);
+    reg.register_struct_static(StructDescriptorData::DESCRIPTOR);
+    reg.register_struct_static(EnumElementDescriptor::DESCRIPTOR);
+    reg.register_struct_static(EnumDescriptorData::DESCRIPTOR);
+}
+
+/// One-line constructor: a [`Registry`] pre-populated with the DOTS-
+/// internal types. Equivalent to `Registry::new()` followed by
+/// [`register_dots_internal_types`].
+pub fn registry_with_internal_types() -> Registry {
+    let mut reg = Registry::new();
+    register_dots_internal_types(&mut reg);
+    reg
+}

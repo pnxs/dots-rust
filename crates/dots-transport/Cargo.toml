@@ -14,12 +14,12 @@ dots-model.workspace = true
 bytes.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 tokio-util = { workspace = true, features = ["codec"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [dev-dependencies]
 dots-derive.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync"] }
 tokio-util = { workspace = true, features = ["codec"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [lints]
 workspace = true

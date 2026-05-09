@@ -1,0 +1,19 @@
+[package]
+name = "dots-demo-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Minimal demo client that connects to a DOTS broker (dotsd) over TCP."
+
+[dependencies]
+dots-core.workspace = true
+dots-model.workspace = true
+dots-transport.workspace = true
+
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal"] }
+
+[lints]
+workspace = true
