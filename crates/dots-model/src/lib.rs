@@ -23,8 +23,9 @@ pub mod framing;
 pub mod registry;
 
 pub use connection::{
-    DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgError,
-    DotsMsgHello,
+    DotsCacheInfo, DotsClearCache, DotsCloneInformation, DotsConnectionState, DotsDescriptorRequest,
+    DotsEcho, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect, DotsMsgConnectResponse,
+    DotsMsgError, DotsMsgHello, DotsMt,
 };
 pub use descriptors::{
     DotsStructFlags, DotsStructScope, EnumDescriptorData, EnumElementDescriptor,
@@ -54,6 +55,18 @@ pub fn register_dots_internal_types(reg: &mut Registry) {
     reg.register_struct_static(DotsMsgConnectResponse::DESCRIPTOR);
     reg.register_struct_static(DotsMsgError::DESCRIPTOR);
     reg.register_enum_static(DotsConnectionState::DESCRIPTOR);
+
+    // Group membership / events / cache metadata.
+    reg.register_enum_static(DotsMemberEvent::DESCRIPTOR);
+    reg.register_struct_static(DotsMember::DESCRIPTOR);
+    reg.register_enum_static(DotsMt::DESCRIPTOR);
+    reg.register_struct_static(DotsCloneInformation::DESCRIPTOR);
+
+    // System events the broker pushes (user.dots).
+    reg.register_struct_static(DotsCacheInfo::DESCRIPTOR);
+    reg.register_struct_static(DotsClearCache::DESCRIPTOR);
+    reg.register_struct_static(DotsDescriptorRequest::DESCRIPTOR);
+    reg.register_struct_static(DotsEcho::DESCRIPTOR);
 
     // Descriptor exchange.
     reg.register_struct_static(StructPropertyData::DESCRIPTOR);

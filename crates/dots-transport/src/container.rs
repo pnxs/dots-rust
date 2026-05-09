@@ -121,6 +121,85 @@ where
     }
 }
 
+impl<T> Container<T> {
+    /// A cheap, cloneable read-only handle on this container's
+    /// data. Useful for sharing into callback handlers and tasks
+    /// without giving up the [`Container`]'s RAII unregister.
+    ///
+    /// Dropping a handle does *not* unregister the underlying
+    /// dispatch entry — that lifetime stays tied to the original
+    /// [`Container`].
+    pub fn handle(&self) -> ContainerHandle<T> {
+        ContainerHandle {
+            entries: self.entries.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// Cheap, cloneable read-only handle on a [`Container`]'s state.
+/// Yielded by [`Container::handle`].
+pub struct ContainerHandle<T> {
+    entries: Arc<Mutex<Entries<T>>>,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> Clone for ContainerHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T> ContainerHandle<T>
+where
+    T: StructValue + Default + Send + 'static,
+{
+    pub fn len(&self) -> usize {
+        self.entries.lock().expect("container mutex poisoned").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries
+            .lock()
+            .expect("container mutex poisoned")
+            .is_empty()
+    }
+
+    pub fn with_entries<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Entries<T>) -> R,
+    {
+        let entries = self.entries.lock().expect("container mutex poisoned");
+        f(&entries)
+    }
+}
+
+impl<T> ContainerHandle<T>
+where
+    T: StructValue + Default + Send + Clone + 'static,
+{
+    pub fn snapshot(&self) -> Vec<ContainerEntry<T>> {
+        self.entries
+            .lock()
+            .expect("container mutex poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn get(&self, query: &T) -> Option<ContainerEntry<T>> {
+        let key = encode_key_bytes(query);
+        self.entries
+            .lock()
+            .expect("container mutex poisoned")
+            .get(&key)
+            .cloned()
+    }
+}
+
 impl<T> Drop for Container<T> {
     fn drop(&mut self) {
         if let Some(dispatch) = self.dispatch.upgrade() {

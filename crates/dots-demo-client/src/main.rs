@@ -1,45 +1,25 @@
-//! DOTS demo client.
+//! DOTS demo client — App-based.
 //!
-//! Connects to a `dotsd` broker over TCP, runs the handshake, then:
+//! Connects to a `dotsd` broker over TCP, publishes a `Pinger` once
+//! per second, and prints every incoming `Pinger` event from the
+//! callback subscription. Container alongside the callback so the
+//! local cache stays in sync; we print its size on each event.
 //!
-//! - Subscribes to `Pinger` events.
-//! - Publishes a `Pinger` once per second with an incrementing sequence
-//!   number.
-//! - Drives the connection's read loop, printing every incoming
-//!   transmission's header summary.
-//! - Prints typed `Pinger` events as they arrive — including its own
-//!   publications looped back through the broker, plus any other
-//!   `Pinger` traffic from other clients on the same broker.
-//!
-//! ## Running
-//!
-//! Start a `dotsd` (from the dots-cpp repo) on its default port:
+//! Run two instances against the same broker to see them route
+//! Pingers to each other.
 //!
 //! ```text
-//! ./dotsd
+//! ./dotsd                                                  # in one terminal
+//! cargo run --bin dots-demo-client                         # default 127.0.0.1:11235
+//! cargo run --bin dots-demo-client -- 127.0.0.1:11235 bob  # second client
 //! ```
-//!
-//! Then in another terminal:
-//!
-//! ```text
-//! cargo run --bin dots-demo-client
-//! cargo run --bin dots-demo-client -- 127.0.0.1:11235 my-name
-//! ```
-//!
-//! Run two instances at once to see the broker route Pinger publications
-//! between them.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use dots_core::decode_typed_from_slice;
 use dots_derive::DotsStruct;
-use dots_model::{
-    DotsMsgError, StructDescriptorData, Transmission, registry_with_internal_types,
-};
-use dots_transport::{ConnectionBuilder, ConnectionError, TransportError};
-use tokio::net::TcpStream;
-use tokio::signal::ctrl_c;
+use dots_model::DotsCacheInfo;
+use dots_transport::App;
 
 #[derive(DotsStruct, Default, Debug, Clone)]
 #[dots(name = "Pinger", cached)]
@@ -62,178 +42,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let name = args.next().unwrap_or_else(|| DEFAULT_NAME.into());
 
     eprintln!("connecting to {addr} as `{name}` ...");
-    let stream = TcpStream::connect(&addr).await?;
-    stream.set_nodelay(true)?;
+    let app = App::connect(&addr, &name).await?;
 
-    let mut registry = registry_with_internal_types();
-    registry.register_struct_static(Pinger::DESCRIPTOR);
-    let registry = Arc::new(registry);
+    // Container — typed local mirror of the broker's Pinger cache.
+    let pingers = app.container::<Pinger>();
+    let pingers_for_handler = pingers.handle();
 
-    // Phase 1: handshake + publish our type's descriptor so the
-    // broker knows about Pinger before we start using it.
-    let mut conn = match ConnectionBuilder::new(stream, &name, registry)
-        .publishes::<Pinger>()
-        .preload(true)
-        .connect()
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => return handshake_failed(e),
-    };
-    eprintln!(
-        "connected: server=`{}` client_id={:?}  state={:?}",
-        conn.server_name().unwrap_or("?"),
-        conn.client_id(),
-        conn.state(),
-    );
+    // Synchronous callback handler — fires from App::run's read loop.
+    let name_for_handler = Arc::new(name.clone());
+    app.subscribe::<Pinger>(move |event| {
+        let from_me = event.header.is_from_myself == Some(true);
+        println!(
+            "✦ Pinger:  id={:?}  message={:?}  seq={:?}  from={:?}  cache_len={}{}",
+            event.value.id,
+            event.value.message,
+            event.value.sequence,
+            event.header.sender,
+            pingers_for_handler.len(),
+            if from_me { "  (from me)" } else { "" },
+        );
+        let _ = name_for_handler;
+    })
+    .discard();
 
-    // Phase 2: build a Pinger Container (typed local mirror of the
-    // broker's cache for this type) and a Subscription (event stream).
-    // Both must be in place before the cache is drained — the
-    // Container fills automatically as cached transmissions arrive.
-    let pingers = conn.container::<Pinger>();
-    let mut pinger_sub = conn.subscribe::<Pinger>();
-    let our_id = conn.client_id().unwrap_or(0);
-
-    // Phase 3: drain the cache. Cached transmissions flow through the
-    // dispatch loop — both into the container (state) and the
-    // subscription (event stream).
-    eprintln!("draining cache ...");
-    if let Err(e) = conn.finish_preload().await {
-        return handshake_failed(e);
-    }
-    eprintln!("preload complete; state={:?}", conn.state());
-
-    // Inspect the post-preload container state.
-    pingers.with_entries(|map| {
-        if map.is_empty() {
-            eprintln!("(no cached Pingers — fresh broker or first publisher)");
-            return;
+    // Per-type cache-end notifications from dotsd. Sent after the
+    // broker streams the cached objects following a DotsMember(join).
+    app.subscribe::<DotsCacheInfo>(|event| {
+        if event.value.end_transmission == Some(true) {
+            if let Some(name) = event.value.type_name.as_deref() {
+                eprintln!("⌛ cache transmission complete for `{name}`");
+            }
+        } else if event.value.end_descriptor_request == Some(true) {
+            eprintln!("⌛ descriptor request complete");
         }
-        eprintln!("({} cached Pinger(s) in local container)", map.len());
-        for entry in map.values() {
-            println!(
-                "★ cached Pinger:  id={:?}  message={:?}  seq={:?}  created_by={:?}",
-                entry.value.id,
-                entry.value.message,
-                entry.value.sequence,
-                entry.clone_info.created_sender,
-            );
-        }
-    });
-    // Drain any subscription events that piled up during preload too,
-    // so the steady-state loop starts with an empty channel.
-    while pinger_sub.try_recv().is_ok() {}
+    })
+    .discard();
 
-    // Publish a Pinger every second.
-    let mut publish_timer = tokio::time::interval(Duration::from_secs(1));
-    publish_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut sequence: u64 = 0;
-
-    eprintln!("subscribed to `Pinger`; publishing one per second; press Ctrl-C to exit");
-
-    loop {
-        tokio::select! {
-            biased;
-            _ = ctrl_c() => {
-                eprintln!("\ninterrupted, exiting.");
+    // Periodic publisher running concurrently with App::run.
+    let client = app.client();
+    let pinger_name = name.clone();
+    tokio::spawn(async move {
+        let mut sequence: u64 = 0;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            sequence += 1;
+            let p = Pinger {
+                id: Some(0),
+                message: Some(format!("hello from {pinger_name}")),
+                sequence: Some(sequence),
+            };
+            if client.publish(&p).is_err() {
+                eprintln!("connection closed; publisher exiting.");
                 break;
             }
-            _ = publish_timer.tick() => {
-                sequence += 1;
-                let pinger = Pinger {
-                    id: Some(our_id),
-                    message: Some(format!("hello from {name}")),
-                    sequence: Some(sequence),
-                };
-                if let Err(e) = conn.publish(&pinger).await {
-                    eprintln!("publish error: {e}");
-                    break;
-                }
-                eprintln!("→ published Pinger seq={sequence}");
-            }
-            event = pinger_sub.recv() => {
-                match event {
-                    Some(ev) => {
-                        let total = pingers.len();
-                        println!(
-                            "✦ Pinger event:  id={:?}  message={:?}  seq={:?}  sender={:?}  container_len={total}{}",
-                            ev.value.id, ev.value.message, ev.value.sequence, ev.header.sender,
-                            if ev.header.is_from_myself == Some(true) { "  (from me)" } else { "" },
-                        );
-                    }
-                    None => {
-                        eprintln!("subscription channel closed.");
-                        break;
-                    }
-                }
-            }
-            maybe = conn.next() => {
-                match maybe {
-                    Some(Ok(txn)) => print_transmission(&txn),
-                    Some(Err(e)) => return decode_failed(e),
-                    None => {
-                        eprintln!("server closed the connection.");
-                        break;
-                    }
-                }
-            }
         }
-    }
+    });
+
+    eprintln!("subscribed; publishing one Pinger/sec; press Ctrl-C to exit.");
+    eprintln!("(initial container size after preload: {})", pingers.len());
+
+    app.run_until_signal().await?;
+    eprintln!("exited.");
     Ok(())
-}
-
-fn handshake_failed(err: ConnectionError) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("handshake failed: {err}");
-    Err(Box::new(err))
-}
-
-fn decode_failed(err: TransportError) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("transport error: {err}");
-    Err(Box::new(err))
-}
-
-fn print_transmission(txn: &Transmission) {
-    let type_name = txn.header.type_name.as_deref().unwrap_or("?");
-    // Don't double-print Pinger here — the typed subscription handler
-    // already prints them with full detail.
-    if type_name == "Pinger" {
-        return;
-    }
-    let sender = txn
-        .header
-        .sender
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "-".into());
-    let valid = txn.payload.valid.len();
-    println!(
-        "← {type_name}  sender={sender}  fields={valid}  remove={}",
-        txn.header.remove_obj.unwrap_or(false),
-    );
-    annotate_known_internal(type_name, txn);
-}
-
-/// Pretty-print a few of the DOTS-internal types we care about.
-fn annotate_known_internal(type_name: &str, txn: &Transmission) {
-    let bytes = txn.payload.encode();
-    match type_name {
-        "DotsMsgError" => {
-            if let Ok(err) = decode_typed_from_slice::<DotsMsgError>(&bytes) {
-                println!(
-                    "    error_code={:?} text={:?}",
-                    err.error_code, err.error_text
-                );
-            }
-        }
-        "StructDescriptorData" => {
-            if let Ok(d) = decode_typed_from_slice::<StructDescriptorData>(&bytes) {
-                let n_props = d.properties.as_ref().map(|p| p.len()).unwrap_or(0);
-                println!(
-                    "    name={:?}  properties={}  publisher_id={:?}",
-                    d.name, n_props, d.publisher_id
-                );
-            }
-        }
-        _ => {}
-    }
 }

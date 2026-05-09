@@ -30,7 +30,7 @@ struct Sample {
 }
 
 fn populated_registry() -> Arc<Registry> {
-    let mut reg = Registry::new();
+    let reg = Registry::new();
     let data = StructDescriptorData::from_static(Sample::DESCRIPTOR);
     let dyn_desc = reg.build_dynamic_struct(&data).unwrap();
     reg.register_struct_dynamic(Arc::new(dyn_desc));
@@ -176,7 +176,9 @@ async fn framed_pair_streams_multiple_transmissions_in_order() {
             for txn in txns {
                 sender.send(txn).await.unwrap();
             }
-            sender.close().await.unwrap();
+            // Disambiguate Sink::close — there's now both a Sink<Transmission>
+            // and Sink<Vec<u8>> impl on TransmissionCodec.
+            SinkExt::<Transmission>::close(&mut sender).await.unwrap();
         })
     };
 

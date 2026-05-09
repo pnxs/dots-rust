@@ -208,3 +208,205 @@ pub enum DotsConnectionState {
     #[dots(tag = 5)]
     Closed,
 }
+
+// ===== Group membership =====
+
+/// A client's join/leave/kill action against a routing group. dotsd
+/// uses one group per type-name as the basis for subscription
+/// routing — to be sent events for type `T`, a client publishes
+/// `DotsMember { groupName: T, event: join }` once.
+///
+/// Mirrors `.dots`:
+/// ```text
+/// enum DotsMemberEvent {
+///     1: join,
+///     2: leave,
+///     3: kill
+/// }
+/// ```
+#[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[dots(name = "DotsMemberEvent")]
+pub enum DotsMemberEvent {
+    #[default]
+    #[dots(tag = 1)]
+    Join,
+    #[dots(tag = 2)]
+    Leave,
+    #[dots(tag = 3)]
+    Kill,
+}
+
+/// A group membership event. Publishing this is how a client tells
+/// the broker to start (or stop) routing transmissions of a given
+/// type to it.
+///
+/// Mirrors `.dots`:
+/// ```text
+/// struct DotsMember [internal,cached=false] {
+///     1: string groupName;
+///     2: DotsMemberEvent event;
+///     3: uint32 client;
+/// }
+/// ```
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+#[dots(name = "DotsMember", internal)]
+pub struct DotsMember {
+    #[dots(tag = 1)]
+    pub group_name: Option<String>,
+    #[dots(tag = 2)]
+    pub event: Option<DotsMemberEvent>,
+    #[dots(tag = 3)]
+    pub client: Option<u32>,
+}
+
+/// Operation kind for a value-cache event — what kind of change just
+/// happened to an instance of a cached type.
+///
+/// Mirrors `.dots`:
+/// ```text
+/// enum DotsMt {
+///     1: create,
+///     2: update,
+///     3: remove
+/// }
+/// ```
+#[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[dots(name = "DotsMt")]
+pub enum DotsMt {
+    #[default]
+    #[dots(tag = 1)]
+    Create,
+    #[dots(tag = 2)]
+    Update,
+    #[dots(tag = 3)]
+    Remove,
+}
+
+/// Per-instance cache metadata held alongside each container entry on
+/// the broker side; clients receive it for cache replay events.
+///
+/// Mirrors `.dots`:
+/// ```text
+/// struct DotsCloneInformation [internal] {
+///     1: DotsMt lastOperation;
+///     2: uint32 lastUpdateFrom;
+///     3: timepoint created;
+///     4: uint32 createdFrom;
+///     5: timepoint modified;
+///     6: timepoint localUpdateTime;
+/// }
+/// ```
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+#[dots(name = "DotsCloneInformation", internal)]
+pub struct DotsCloneInformation {
+    #[dots(tag = 1)]
+    pub last_operation: Option<DotsMt>,
+    #[dots(tag = 2)]
+    pub last_update_from: Option<u32>,
+    #[dots(tag = 3)]
+    pub created: Option<f64>,
+    #[dots(tag = 4)]
+    pub created_from: Option<u32>,
+    #[dots(tag = 5)]
+    pub modified: Option<f64>,
+    #[dots(tag = 6)]
+    pub local_update_time: Option<f64>,
+}
+
+// ===== System events from dotsd (user.dots) =====
+
+/// Synchronization signal from dotsd. Sent in two situations:
+///
+/// 1. **Per-type cache end:** after a guest joins a group via
+///    `DotsMember(join, T)`, the broker streams the cached objects of
+///    `T` and then transmits `DotsCacheInfo { typeName: T,
+///    endTransmission: true }` to mark "cache for T fully delivered".
+///    Used by clients that want to wait for the initial state of a
+///    type before doing further work.
+///
+/// 2. **Descriptor request end:** after a `DotsDescriptorRequest`,
+///    the broker sends one `StructDescriptor` per matching type
+///    followed by `DotsCacheInfo { endDescriptorRequest: true }`.
+///
+/// Mirrors `.dots`:
+/// ```text
+/// struct DotsCacheInfo [internal,cached=false] {
+///     1: string typeName;
+///     2: bool startTransmission;
+///     3: bool endTransmission;
+///     4: bool endDescriptorRequest;
+/// }
+/// ```
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+#[dots(name = "DotsCacheInfo", internal)]
+pub struct DotsCacheInfo {
+    #[dots(tag = 1)]
+    pub type_name: Option<String>,
+    #[dots(tag = 2)]
+    pub start_transmission: Option<bool>,
+    #[dots(tag = 3)]
+    pub end_transmission: Option<bool>,
+    #[dots(tag = 4)]
+    pub end_descriptor_request: Option<bool>,
+}
+
+/// Tells the broker (or a client) to clear cached instances of one or
+/// more types.
+///
+/// Mirrors `.dots`:
+/// ```text
+/// struct DotsClearCache [internal,cached=false] {
+///     1: vector<string> typeNames;
+/// }
+/// ```
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+#[dots(name = "DotsClearCache", internal)]
+pub struct DotsClearCache {
+    #[dots(tag = 1)]
+    pub type_names: Option<Vec<String>>,
+}
+
+/// Asks the broker to (re-)publish the descriptors of all known types,
+/// optionally filtered by white/blacklist.
+///
+/// Mirrors `.dots`:
+/// ```text
+/// struct DotsDescriptorRequest [internal,cached=false] {
+///     1: vector<string> whitelist;
+///     2: vector<string> blacklist;
+/// }
+/// ```
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+#[dots(name = "DotsDescriptorRequest", internal)]
+pub struct DotsDescriptorRequest {
+    #[dots(tag = 1)]
+    pub whitelist: Option<Vec<String>>,
+    #[dots(tag = 2)]
+    pub blacklist: Option<Vec<String>>,
+}
+
+/// Echo / keep-alive / RTT-measurement primitive. Guests may send
+/// `DotsEcho { request: true, ... }` and the broker replies with the
+/// same payload but `request: false`.
+///
+/// Mirrors `.dots`:
+/// ```text
+/// struct DotsEcho [internal,cached=false] {
+///     1: bool request;
+///     2: uint32 identifier;
+///     3: uint32 sequenceNumber;
+///     4: string data;
+/// }
+/// ```
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+#[dots(name = "DotsEcho", internal)]
+pub struct DotsEcho {
+    #[dots(tag = 1)]
+    pub request: Option<bool>,
+    #[dots(tag = 2)]
+    pub identifier: Option<u32>,
+    #[dots(tag = 3)]
+    pub sequence_number: Option<u32>,
+    #[dots(tag = 4)]
+    pub data: Option<String>,
+}

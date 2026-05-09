@@ -456,6 +456,38 @@ where
     pub fn into_inner(self) -> S {
         self.framed.into_inner()
     }
+
+    /// Crate-internal: a handle on the dispatch state, shared with
+    /// any [`Subscription`] / [`Container`] / [`crate::App`]
+    /// callbacks attached to this connection.
+    pub(crate) fn dispatch_handle(&self) -> Arc<Mutex<DispatchState>> {
+        self.dispatch.clone()
+    }
+
+    /// Crate-internal: consume the connection, returning the framed
+    /// stream and the shared dispatch state. [`crate::App`] uses this
+    /// to take over the read/write loop after the handshake.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (Framed<S, TransmissionCodec>, Arc<Mutex<DispatchState>>) {
+        (self.framed, self.dispatch)
+    }
+
+    /// Crate-internal: dispatch a transmission to subscribers from
+    /// outside the connection's own `next()` (e.g. the App's read
+    /// loop after taking the framed via `into_parts`).
+    pub(crate) fn dispatch_external(
+        dispatch: &Arc<Mutex<DispatchState>>,
+        txn: &Transmission,
+    ) {
+        let Some(type_name) = txn.header.type_name.as_deref() else {
+            return;
+        };
+        let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+        if let Some(entries) = state.entries.get_mut(type_name) {
+            entries.retain_mut(|(_, entry)| entry.dispatch(txn).unwrap_or(true));
+        }
+    }
 }
 
 // ===== Pub/sub: Event, Subscription, dispatch =====
@@ -486,6 +518,21 @@ impl<T> Subscription<T> {
     /// [`Stream`] impl for callers not using `StreamExt`.
     pub async fn recv(&mut self) -> Option<Event<T>> {
         self.rx.recv().await
+    }
+
+    pub(crate) fn from_parts(
+        rx: mpsc::UnboundedReceiver<Event<T>>,
+        type_name: String,
+        id: u64,
+        dispatch: Weak<Mutex<DispatchState>>,
+    ) -> Self {
+        Self {
+            rx,
+            type_name,
+            id,
+            dispatch,
+            _phantom: PhantomData,
+        }
     }
 
     /// Try to receive a queued event without waiting. Returns

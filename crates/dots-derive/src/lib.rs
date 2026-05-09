@@ -429,10 +429,10 @@ fn parse_field(field: &Field) -> syn::Result<DotsField<'_>> {
             "DOTS tags are 1-based; tag must be > 0",
         ));
     }
-    if tag > 64 {
+    if tag > 63 {
         return Err(syn::Error::new(
             field.span(),
-            "this iteration supports tags 1..=64 (PropertySet is u64)",
+            "this iteration supports tags 1..=63 (PropertySet is u64 with bit n = tag n)",
         ));
     }
 

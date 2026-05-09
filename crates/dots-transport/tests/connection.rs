@@ -271,7 +271,7 @@ struct Demo {
 #[tokio::test]
 async fn send_typed_after_handshake_reaches_server() {
     let (client_io, server_io) = tokio::io::duplex(4096);
-    let mut reg_owned = registry_with_internal_types();
+    let reg_owned = registry_with_internal_types();
     reg_owned.register_struct_static(Demo::DESCRIPTOR);
     let reg = Arc::new(reg_owned);
 
@@ -328,7 +328,7 @@ async fn send_typed_after_handshake_reaches_server() {
 #[tokio::test]
 async fn next_after_handshake_yields_server_traffic() {
     let (client_io, server_io) = tokio::io::duplex(4096);
-    let mut reg_owned = registry_with_internal_types();
+    let reg_owned = registry_with_internal_types();
     reg_owned.register_struct_static(Demo::DESCRIPTOR);
     let reg = Arc::new(reg_owned);
 

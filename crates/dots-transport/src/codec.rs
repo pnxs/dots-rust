@@ -78,6 +78,21 @@ impl Decoder for TransmissionCodec {
     }
 }
 
+impl Encoder<Vec<u8>> for TransmissionCodec {
+    type Error = TransportError;
+
+    /// Append already-framed bytes verbatim. Used by [`crate::App`] /
+    /// [`crate::Client`] to push pre-encoded transmissions through the
+    /// `Framed` sink without re-routing through `Sink<Transmission>`
+    /// (which would require wrapping every typed publish in a
+    /// `DynamicStruct`).
+    fn encode(&mut self, item: Vec<u8>, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        dst.reserve(item.len());
+        dst.put_slice(&item);
+        Ok(())
+    }
+}
+
 impl Encoder<Transmission> for TransmissionCodec {
     type Error = TransportError;
 

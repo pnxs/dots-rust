@@ -156,7 +156,7 @@ fn dots_header_decodes_via_wire_only_path() {
     // A wire-receiver who only knows the descriptor (no compiled type)
     // can decode a DotsHeader via the registry → DynamicStructDescriptor
     // path, the same way it would for any user-defined type.
-    let mut reg = Registry::new();
+    let reg = Registry::new();
     reg.register_struct_static(DotsHeader::DESCRIPTOR);
 
     let original = DotsHeader {
@@ -180,7 +180,7 @@ fn handshake_descriptors_resolve_through_registry_from_wire() {
     // Same as above but with descriptor-data round-tripping through
     // the registry's reverse conversion — proves a peer who learns
     // the handshake structs entirely from the wire can decode them.
-    let mut reg = Registry::new();
+    let reg = Registry::new();
     for static_desc in [
         DotsMsgHello::DESCRIPTOR,
         DotsMsgConnect::DESCRIPTOR,

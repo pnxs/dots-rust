@@ -21,7 +21,7 @@
 //! never compiled against, then routes their instances.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use dots_core::{
     DynamicEnumDescriptor, DynamicEnumElement, DynamicFieldKind, DynamicPropertyDescriptor,
@@ -64,9 +64,14 @@ impl core::fmt::Display for RegistryError {
 impl std::error::Error for RegistryError {}
 
 /// A name-keyed registry of [`DescriptorEntry`]s.
-#[derive(Debug, Default, Clone)]
+///
+/// Uses interior `RwLock` mutability so registrations can happen via
+/// `&self` — including from the [`crate::App`]-equivalent layer in
+/// `dots-transport`, which auto-registers user types on `subscribe<T>`
+/// while the codec holds a long-lived `Arc<Registry>` for decoding.
+#[derive(Debug, Default)]
 pub struct Registry {
-    entries: BTreeMap<String, DescriptorEntry>,
+    entries: RwLock<BTreeMap<String, DescriptorEntry>>,
 }
 
 impl Registry {
@@ -79,48 +84,58 @@ impl Registry {
     /// behind an `Arc` — subsequent lookups are cheap.
     ///
     /// Existing entries with the same name are silently overwritten.
-    pub fn register_struct_static(&mut self, d: &'static StructDescriptor) {
+    pub fn register_struct_static(&self, d: &'static StructDescriptor) {
         let arc = Arc::new(DynamicStructDescriptor::from_static(d));
         self.entries
+            .write()
+            .expect("registry poisoned")
             .insert(d.name.into(), DescriptorEntry::Struct(arc));
     }
 
     /// Register a compile-time enum descriptor.
-    pub fn register_enum_static(&mut self, d: &'static EnumDescriptor) {
+    pub fn register_enum_static(&self, d: &'static EnumDescriptor) {
         let arc = Arc::new(DynamicEnumDescriptor::from_static(d));
         self.entries
+            .write()
+            .expect("registry poisoned")
             .insert(d.name.into(), DescriptorEntry::Enum(arc));
     }
 
     /// Register a runtime-received struct descriptor.
-    pub fn register_struct_dynamic(&mut self, d: Arc<DynamicStructDescriptor>) {
+    pub fn register_struct_dynamic(&self, d: Arc<DynamicStructDescriptor>) {
         self.entries
+            .write()
+            .expect("registry poisoned")
             .insert(d.name.clone(), DescriptorEntry::Struct(d));
     }
 
     /// Register a runtime-received enum descriptor.
-    pub fn register_enum_dynamic(&mut self, d: Arc<DynamicEnumDescriptor>) {
+    pub fn register_enum_dynamic(&self, d: Arc<DynamicEnumDescriptor>) {
         self.entries
+            .write()
+            .expect("registry poisoned")
             .insert(d.name.clone(), DescriptorEntry::Enum(d));
     }
 
-    /// Look up an entry by name.
-    pub fn lookup(&self, name: &str) -> Option<&DescriptorEntry> {
-        self.entries.get(name)
+    /// Look up an entry by name. Returns an owned `DescriptorEntry`
+    /// (which holds an `Arc` internally, so cloning is cheap) — this
+    /// avoids holding the registry's read lock across the caller's
+    /// usage.
+    pub fn lookup(&self, name: &str) -> Option<DescriptorEntry> {
+        self.entries
+            .read()
+            .expect("registry poisoned")
+            .get(name)
+            .cloned()
     }
 
     /// Number of registered types.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.read().expect("registry poisoned").len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Iterate `(name, entry)` pairs, sorted by name (BTreeMap order).
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &DescriptorEntry)> {
-        self.entries.iter()
+        self.entries.read().expect("registry poisoned").is_empty()
     }
 
     // ----- Reverse conversion -----
@@ -263,9 +278,9 @@ impl Registry {
             return Ok(DynamicFieldKind::Vec(Box::new(inner_kind)));
         }
 
-        match self.entries.get(s) {
-            Some(DescriptorEntry::Struct(d)) => Ok(DynamicFieldKind::Struct(d.clone())),
-            Some(DescriptorEntry::Enum(d)) => Ok(DynamicFieldKind::Enum(d.clone())),
+        match self.lookup(s) {
+            Some(DescriptorEntry::Struct(d)) => Ok(DynamicFieldKind::Struct(d)),
+            Some(DescriptorEntry::Enum(d)) => Ok(DynamicFieldKind::Enum(d)),
             None => Err(RegistryError::UnknownType(s.into())),
         }
     }

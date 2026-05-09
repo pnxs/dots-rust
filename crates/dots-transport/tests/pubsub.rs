@@ -42,7 +42,7 @@ struct Bonk {
 }
 
 fn registry() -> Arc<Registry> {
-    let mut reg = registry_with_internal_types();
+    let reg = registry_with_internal_types();
     reg.register_struct_static(Pinger::DESCRIPTOR);
     reg.register_struct_static(Bonk::DESCRIPTOR);
     Arc::new(reg)

@@ -28,7 +28,7 @@ fn header_for(payload_type: &str) -> DotsHeader {
 }
 
 fn populated_registry() -> Registry {
-    let mut reg = Registry::new();
+    let reg = Registry::new();
     let data = StructDescriptorData::from_static(Sample::DESCRIPTOR);
     let dyn_desc = reg.build_dynamic_struct(&data).unwrap();
     reg.register_struct_dynamic(Arc::new(dyn_desc));

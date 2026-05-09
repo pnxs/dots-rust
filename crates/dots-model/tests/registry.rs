@@ -66,7 +66,7 @@ struct LogEntry {
 /// and register. Returns a registry where the broker has learned
 /// about every type LogEntry transitively references.
 fn registry_from_wire() -> Registry {
-    let mut reg = Registry::new();
+    let reg = Registry::new();
 
     // Dependency order: enum first, then nested struct, then top-level.
     let severity_data = EnumDescriptorData::from_static(Severity::DESCRIPTOR);
@@ -215,7 +215,7 @@ fn vector_of_struct_resolves_correctly() {
 
 #[test]
 fn registering_static_then_looking_up_works() {
-    let mut reg = Registry::new();
+    let reg = Registry::new();
     reg.register_struct_static(Address::DESCRIPTOR);
     let entry = reg.lookup("Address").expect("must be present");
     match entry {
@@ -249,7 +249,7 @@ fn struct_descriptor_data_missing_name_errors() {
 fn struct_descriptor_data_with_nested_dynamic_struct_in_registry() {
     // Round-trip a Foo containing a registered-via-wire nested struct.
     // First, register Address dynamically (not from static).
-    let mut reg = Registry::new();
+    let reg = Registry::new();
     let address_data = StructDescriptorData::from_static(Address::DESCRIPTOR);
     let address_dyn = Arc::new(reg.build_dynamic_struct(&address_data).unwrap());
     reg.register_struct_dynamic(address_dyn.clone());
@@ -280,7 +280,7 @@ fn struct_descriptor_data_with_nested_dynamic_struct_in_registry() {
 
 #[test]
 fn registering_overwrites_existing_entry() {
-    let mut reg = Registry::new();
+    let reg = Registry::new();
     reg.register_struct_static(Address::DESCRIPTOR);
     assert_eq!(reg.len(), 1);
 
@@ -289,7 +289,7 @@ fn registering_overwrites_existing_entry() {
     reg.register_struct_dynamic(a2.clone());
     assert_eq!(reg.len(), 1, "register replaces, not duplicates");
     match reg.lookup("Address").unwrap() {
-        dots_model::DescriptorEntry::Struct(d) => assert!(Arc::ptr_eq(d, &a2)),
+        dots_model::DescriptorEntry::Struct(d) => assert!(Arc::ptr_eq(&d, &a2)),
         _ => panic!(),
     }
 }

@@ -26,7 +26,7 @@ struct Pinger {
 }
 
 fn registry() -> Arc<Registry> {
-    let mut reg = registry_with_internal_types();
+    let reg = registry_with_internal_types();
     reg.register_struct_static(Pinger::DESCRIPTOR);
     Arc::new(reg)
 }

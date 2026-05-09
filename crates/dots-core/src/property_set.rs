@@ -2,12 +2,16 @@ use core::fmt;
 
 /// Bitmask of valid properties, indexed by property tag.
 ///
-/// Tags are 1-based on the wire (matching DOTS / `.dots` conventions).
-/// Internally bit `n` of the underlying `u64` represents tag `n + 1`,
-/// so tag `1` is bit `0`, tag `64` is bit `63`. Tags above 64 are not
-/// supported in this iteration — DOTS allows up to 256 in principle,
-/// but no real type approaches that and a `u64` keeps `PropertySet`
-/// `Copy`-cheap.
+/// **Wire layout matches C++ DOTS:** bit `n` of the underlying `u64`
+/// represents tag `n`. Tag `0` is unused (DOTS tags are 1-based, so
+/// bit 0 is always zero in valid encodings); tag `1` is bit `1`,
+/// up to tag `63` at bit `63`.
+///
+/// This 1:1 tag→bit mapping is what `PropertySet::FromIndex(tag)` does
+/// in dots-cpp (`lib/include/dots/type/PropertySet.h`). Diverging from
+/// it would silently corrupt the `DotsHeader.attributes` field — a
+/// peer would read our bitmask one bit "off", treat properties at the
+/// wrong tags as valid/invalid, and propagate broken cache merges.
 #[derive(Copy, Clone, PartialEq, Eq, Default)]
 pub struct PropertySet(u64);
 
@@ -16,9 +20,11 @@ impl PropertySet {
     pub const EMPTY: Self = Self(0);
 
     /// Maximum tag value supported by this representation.
-    pub const MAX_TAG: u32 = 64;
+    /// Tag = bit-position, so we lose tag 0 (unused in DOTS) and the
+    /// max usable tag is 63.
+    pub const MAX_TAG: u32 = 63;
 
-    /// Construct from a raw bitmask. Bit `n` corresponds to tag `n + 1`.
+    /// Construct from a raw bitmask. Bit `n` corresponds to tag `n`.
     #[inline]
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
@@ -36,7 +42,7 @@ impl PropertySet {
         if tag == 0 || tag > Self::MAX_TAG {
             return false;
         }
-        (self.0 & (1u64 << (tag - 1))) != 0
+        (self.0 & (1u64 << tag)) != 0
     }
 
     /// Return a new set with `tag` added.
@@ -44,7 +50,7 @@ impl PropertySet {
     #[must_use]
     pub const fn with_tag(self, tag: u32) -> Self {
         debug_assert!(tag != 0 && tag <= Self::MAX_TAG);
-        Self(self.0 | (1u64 << (tag - 1)))
+        Self(self.0 | (1u64 << tag))
     }
 
     /// Return a new set with `tag` removed.
@@ -52,7 +58,7 @@ impl PropertySet {
     #[must_use]
     pub const fn without_tag(self, tag: u32) -> Self {
         debug_assert!(tag != 0 && tag <= Self::MAX_TAG);
-        Self(self.0 & !(1u64 << (tag - 1)))
+        Self(self.0 & !(1u64 << tag))
     }
 
     /// True if no tags are set.
@@ -76,7 +82,7 @@ impl PropertySet {
             } else {
                 let tz = bits.trailing_zeros();
                 bits &= bits - 1;
-                Some(tz + 1)
+                Some(tz)
             }
         })
     }
@@ -133,15 +139,15 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
         assert!(!s.has(1));
-        assert!(!s.has(64));
+        assert!(!s.has(63));
     }
 
     #[test]
     fn add_and_query_tags() {
-        let s = PropertySet::EMPTY.with_tag(1).with_tag(7).with_tag(64);
+        let s = PropertySet::EMPTY.with_tag(1).with_tag(7).with_tag(63);
         assert!(s.has(1));
         assert!(s.has(7));
-        assert!(s.has(64));
+        assert!(s.has(63));
         assert!(!s.has(2));
         assert_eq!(s.len(), 3);
     }
@@ -157,7 +163,7 @@ mod tests {
     fn out_of_range_tags_are_not_set() {
         let s = PropertySet::EMPTY;
         assert!(!s.has(0));
-        assert!(!s.has(65));
+        assert!(!s.has(64));
         assert!(!s.has(u32::MAX));
     }
 
@@ -176,5 +182,17 @@ mod tests {
         assert_eq!((a | b).iter().collect::<Vec<_>>(), [1, 2, 3]);
         assert_eq!((a & b).iter().collect::<Vec<_>>(), [2]);
         assert_eq!((a - b).iter().collect::<Vec<_>>(), [1]);
+    }
+
+    /// Wire-format spot-check: tag→bit mapping matches C++
+    /// `PropertySet::FromIndex(tag)` which is `1 << tag`.
+    #[test]
+    fn bit_layout_matches_cpp_from_index() {
+        assert_eq!(PropertySet::EMPTY.with_tag(1).bits(), 0b10);
+        assert_eq!(PropertySet::EMPTY.with_tag(2).bits(), 0b100);
+        assert_eq!(PropertySet::EMPTY.with_tag(3).bits(), 0b1000);
+        // Pinger-shaped (tags 1, 2, 3) → bits 1, 2, 3 set → 0b1110 = 14.
+        let s = PropertySet::EMPTY.with_tag(1).with_tag(2).with_tag(3);
+        assert_eq!(s.bits(), 0b1110);
     }
 }
