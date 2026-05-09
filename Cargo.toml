@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["Thomas Schätzlein <ts@aibiot.de>"]
+repository = "https://github.com/thomas-schaetzlein/dots-rust"
+
+[workspace.dependencies]
+dots-core = { path = "crates/dots-core", version = "0.1.0" }
+dots-derive = { path = "crates/dots-derive", version = "0.1.0" }
+
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

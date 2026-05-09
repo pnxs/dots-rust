@@ -1,0 +1,85 @@
+//! Core runtime types for dots-rust.
+//!
+//! Re-exports the types used by `dots-derive`-generated code and consumers
+//! of derived DOTS structs.
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+mod descriptor;
+mod property_set;
+mod value;
+
+pub use descriptor::{PropertyDescriptor, StructDescriptor, StructFlags};
+pub use property_set::PropertySet;
+pub use value::StructValue;
+
+/// Construct a DOTS struct literal with terse syntax.
+///
+/// Every named field is wrapped in `Some(_)` and converted via `Into`,
+/// so `&str` literals become `String` and most coercions Just Work.
+/// Unspecified fields fall back to `Default::default()` (which for
+/// DOTS structs is all-`None`).
+///
+/// **Integer literal note:** integer literals default to `i32` before
+/// `Into` resolution. For non-`i32` integer fields, use a type suffix:
+/// `dots!(Foo { id: 42_u32 })`. The generated `with_<field>(...)` builder
+/// methods accept `impl Into<T>` so you can pass an unsuffixed literal
+/// when the target type is more constrained.
+///
+/// See the `dots-example` crate for a runnable demonstration.
+#[macro_export]
+macro_rules! dots {
+    ($($ty:ident)::+ { $($field:ident : $value:expr),* $(,)? }) => {
+        $($ty)::+ {
+            $(
+                $field: ::core::option::Option::Some(
+                    ::core::convert::Into::into($value)
+                ),
+            )*
+            ..::core::default::Default::default()
+        }
+    };
+}
+
+#[cfg(test)]
+mod macro_tests {
+    use alloc::string::String;
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Foo {
+        id: Option<i32>,
+        big_id: Option<u64>,
+        name: Option<String>,
+        flag: Option<bool>,
+    }
+
+    #[test]
+    fn dots_macro_constructs_partial_struct() {
+        let foo = dots!(Foo { id: 42, name: "hi" });
+        assert_eq!(foo.id, Some(42));
+        assert_eq!(foo.name.as_deref(), Some("hi"));
+        assert_eq!(foo.flag, None);
+        assert_eq!(foo.big_id, None);
+    }
+
+    #[test]
+    fn dots_macro_handles_typed_integer_literals() {
+        let foo = dots!(Foo { big_id: 9000_u64, flag: true });
+        assert_eq!(foo.big_id, Some(9000));
+        assert_eq!(foo.flag, Some(true));
+    }
+
+    #[test]
+    fn dots_macro_supports_trailing_comma() {
+        let foo = dots!(Foo { id: 1, });
+        assert_eq!(foo.id, Some(1));
+    }
+
+    #[test]
+    fn dots_macro_with_no_fields_yields_default() {
+        let foo = dots!(Foo {});
+        assert_eq!(foo, Foo::default());
+    }
+}
