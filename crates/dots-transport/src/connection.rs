@@ -23,10 +23,11 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
 use bytes::BufMut;
-use dots_core::{StructValue, decode_typed_from_slice};
+use dots_core::{EnumDescriptor, StructDescriptor, StructValue, decode_typed_from_slice};
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
-    Registry, Transmission, encode_typed_transmission_into,
+    EnumDescriptorData, Registry, StructDescriptorData, Transmission,
+    encode_typed_transmission_into,
 };
 use futures_util::{SinkExt, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -59,6 +60,12 @@ pub enum ConnectionError {
     /// Decoding a typed handshake payload from the dynamic transmission
     /// failed.
     DecodeFailure(String),
+    /// A connection method was called from the wrong state — e.g.
+    /// `finish_preload` while not in [`DotsConnectionState::EarlySubscribe`].
+    InvalidState {
+        expected: DotsConnectionState,
+        actual: DotsConnectionState,
+    },
 }
 
 impl core::fmt::Display for ConnectionError {
@@ -79,6 +86,10 @@ impl core::fmt::Display for ConnectionError {
                 server_name.as_deref().unwrap_or("?")
             ),
             Self::DecodeFailure(msg) => write!(f, "handshake decode error: {msg}"),
+            Self::InvalidState { expected, actual } => write!(
+                f,
+                "invalid connection state: expected {expected:?}, currently {actual:?}"
+            ),
         }
     }
 }
@@ -118,38 +129,54 @@ impl<S> Connection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Connect over an established byte stream and run the DOTS handshake.
+    /// Connect over an established byte stream and run the basic DOTS
+    /// handshake **without** preload. Equivalent to:
     ///
-    /// `client_name` is what the broker will display / log this client
-    /// as. `registry` must already contain the DOTS-internal types
-    /// (use [`dots_model::registry_with_internal_types`] for the easy
-    /// path). On success the returned [`Connection`] is in the
-    /// [`DotsConnectionState::Connected`] state.
+    /// ```ignore
+    /// ConnectionBuilder::new(stream, name, registry).preload(false).connect().await
+    /// ```
+    ///
+    /// On success the returned [`Connection`] is in the
+    /// [`DotsConnectionState::Connected`] state — type registration
+    /// and cache preload are skipped. For typical clients use
+    /// [`ConnectionBuilder`] instead, which handles the full lifecycle.
     ///
     /// Authentication is not supported yet; if the server's
-    /// [`DotsMsgHello.authentication_required`] is `Some(true)`, this
+    /// [`DotsMsgHello`]`.authentication_required` is `Some(true)`, this
     /// returns [`ConnectionError::AuthenticationNotSupported`].
     pub async fn establish(
         stream: S,
         client_name: &str,
         registry: Arc<Registry>,
     ) -> Result<Self, ConnectionError> {
-        let codec = TransmissionCodec::new(registry);
-        let framed = Framed::new(stream, codec);
-        let mut conn = Self {
+        ConnectionBuilder::new(stream, client_name, registry)
+            .preload(false)
+            .connect()
+            .await
+    }
+
+    /// Construct an empty connection wrapping the given framed stream.
+    /// Used internally by [`ConnectionBuilder::connect`].
+    fn from_framed(framed: Framed<S, TransmissionCodec>) -> Self {
+        Self {
             framed,
             state: DotsConnectionState::Connecting,
             server_name: None,
             client_id: None,
             scratch: Vec::with_capacity(256),
             dispatch: Arc::new(Mutex::new(DispatchState::default())),
-        };
-        conn.run_handshake(client_name).await?;
-        Ok(conn)
+        }
     }
 
-    async fn run_handshake(&mut self, client_name: &str) -> Result<(), ConnectionError> {
-        // 1) Receive Hello.
+    /// Drive the initial Hello → Connect → ConnectResponse exchange.
+    /// After this returns, `self.state` is `EarlySubscribe` if the
+    /// server agreed to preload (`response.preload == Some(true)`),
+    /// otherwise `Connected`.
+    async fn run_initial_handshake(
+        &mut self,
+        client_name: &str,
+        request_preload: bool,
+    ) -> Result<(), ConnectionError> {
         let txn = self.read_next().await?;
         let hello: DotsMsgHello = self.expect_typed(&txn, "DotsMsgHello")?;
         if hello.authentication_required == Some(true) {
@@ -157,15 +184,13 @@ where
         }
         self.server_name = hello.server_name;
 
-        // 2) Send Connect (no preload, no auth in this iteration).
         let connect = DotsMsgConnect {
             client_name: Some(client_name.into()),
-            preload_cache: Some(false),
+            preload_cache: Some(request_preload),
             ..Default::default()
         };
         self.send_typed("DotsMsgConnect", &connect).await?;
 
-        // 3) Receive ConnectResponse.
         let txn = self.read_next().await?;
         let response: DotsMsgConnectResponse =
             self.expect_typed(&txn, "DotsMsgConnectResponse")?;
@@ -175,9 +200,61 @@ where
             });
         }
         self.client_id = response.client_id;
-        // No preload requested, so we're directly in the connected state.
-        self.state = DotsConnectionState::Connected;
+        self.state = if response.preload == Some(true) {
+            DotsConnectionState::EarlySubscribe
+        } else {
+            DotsConnectionState::Connected
+        };
         Ok(())
+    }
+
+    /// Signal "I'm done publishing descriptors and subscribing", then
+    /// drive the cache-preload phase: incoming cached transmissions
+    /// flow through the normal subscription dispatch path. Returns
+    /// when the server sends `DotsMsgConnectResponse` with
+    /// `preload_finished = true`, transitioning to
+    /// [`DotsConnectionState::Connected`].
+    ///
+    /// Errors with [`ConnectionError::InvalidState`] if not currently
+    /// in [`DotsConnectionState::EarlySubscribe`] (e.g. preload was
+    /// not requested, or this is being called twice).
+    pub async fn finish_preload(&mut self) -> Result<(), ConnectionError> {
+        if self.state != DotsConnectionState::EarlySubscribe {
+            return Err(ConnectionError::InvalidState {
+                expected: DotsConnectionState::EarlySubscribe,
+                actual: self.state,
+            });
+        }
+
+        let connect = DotsMsgConnect {
+            preload_client_finished: Some(true),
+            ..Default::default()
+        };
+        self.send_typed("DotsMsgConnect", &connect).await?;
+
+        // Stream cache transmissions. Cache events have header.from_cache
+        // set to a remaining count (0 for the last). The terminator is
+        // a DotsMsgConnectResponse with preload_finished = true.
+        loop {
+            let txn = self.read_next().await?;
+            let type_name = txn
+                .header
+                .type_name
+                .as_deref()
+                .ok_or(ConnectionError::HeaderMissingTypeName)?;
+            if type_name == "DotsMsgConnectResponse" {
+                let response: DotsMsgConnectResponse =
+                    self.expect_typed(&txn, "DotsMsgConnectResponse")?;
+                if response.preload_finished == Some(true) {
+                    self.state = DotsConnectionState::Connected;
+                    return Ok(());
+                }
+                // Some other (intermediate?) response; continue.
+                continue;
+            }
+            // Cache event — fan out to subscriptions.
+            self.dispatch_to_subscribers(&txn);
+        }
     }
 
     async fn read_next(&mut self) -> Result<Transmission, ConnectionError> {
@@ -229,8 +306,14 @@ where
     where
         T: StructValue,
     {
+        // dotsd requires `attributes` on every published header — it's
+        // the bitmask of payload properties that are valid. The CBOR
+        // map is already sparse with the same information, but the
+        // header field is mandatory at the protocol level.
         let header = DotsHeader {
             type_name: Some(type_name.into()),
+            attributes: Some(payload.valid_set().bits()),
+            sender: self.client_id,
             ..Default::default()
         };
         self.scratch.clear();
@@ -395,6 +478,14 @@ impl<T> Subscription<T> {
     pub async fn recv(&mut self) -> Option<Event<T>> {
         self.rx.recv().await
     }
+
+    /// Try to receive a queued event without waiting. Returns
+    /// `Err(_)` if the channel is empty (or disconnected) — useful
+    /// for draining the cache events that arrived during
+    /// [`Connection::finish_preload`].
+    pub fn try_recv(&mut self) -> Result<Event<T>, mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
 }
 
 impl<T: Unpin> Stream for Subscription<T> {
@@ -481,5 +572,122 @@ where
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+// ===== ConnectionBuilder =====
+
+/// Build a [`Connection`] with type registration and optional cache preload.
+///
+/// Typical full lifecycle:
+///
+/// ```ignore
+/// let mut conn = ConnectionBuilder::new(stream, "my-client", registry)
+///     .publishes::<MyType1>()
+///     .publishes::<MyType2>()
+///     .preload(true)
+///     .connect().await?;
+/// // conn.state() == DotsConnectionState::EarlySubscribe
+///
+/// let sub = conn.subscribe::<MyType2>();
+/// conn.finish_preload().await?;
+/// // Cache events for MyType2 have been dispatched into `sub`.
+/// // conn.state() == DotsConnectionState::Connected.
+/// ```
+///
+/// `connect()` runs the initial handshake and publishes a
+/// `StructDescriptorData` (or `EnumDescriptorData`) for every type
+/// declared via the `publishes_*` methods, so the broker learns the
+/// shape of each user-defined type before any value of it flows.
+pub struct ConnectionBuilder<S> {
+    stream: S,
+    client_name: String,
+    registry: Arc<Registry>,
+    preload: bool,
+    pending: Vec<PendingDescriptor>,
+}
+
+enum PendingDescriptor {
+    Struct(&'static StructDescriptor),
+    Enum(&'static EnumDescriptor),
+}
+
+impl<S> ConnectionBuilder<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    pub fn new(stream: S, client_name: impl Into<String>, registry: Arc<Registry>) -> Self {
+        Self {
+            stream,
+            client_name: client_name.into(),
+            registry,
+            preload: true,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Whether to request the broker's cache preload during connect.
+    /// Default: `true`. Setting to `false` skips the
+    /// [`DotsConnectionState::EarlySubscribe`] phase — `connect()`
+    /// returns directly in [`DotsConnectionState::Connected`] and
+    /// [`Connection::finish_preload`] must not be called.
+    pub fn preload(mut self, on: bool) -> Self {
+        self.preload = on;
+        self
+    }
+
+    /// Publish a struct type's descriptor during connect, telling the
+    /// broker about the shape of values it'll route on this client's
+    /// behalf. Convenience over [`publishes_struct`](Self::publishes_struct)
+    /// for types that implement [`StructValue`].
+    pub fn publishes<T>(self) -> Self
+    where
+        T: StructValue,
+    {
+        self.publishes_struct(T::type_descriptor())
+    }
+
+    /// Publish a struct type's descriptor by descriptor reference.
+    pub fn publishes_struct(mut self, descriptor: &'static StructDescriptor) -> Self {
+        self.pending.push(PendingDescriptor::Struct(descriptor));
+        self
+    }
+
+    /// Publish an enum type's descriptor by descriptor reference.
+    pub fn publishes_enum(mut self, descriptor: &'static EnumDescriptor) -> Self {
+        self.pending.push(PendingDescriptor::Enum(descriptor));
+        self
+    }
+
+    /// Run the handshake, publish all queued type descriptors, and
+    /// return a [`Connection`] in the appropriate state (see
+    /// [`preload`](Self::preload)).
+    pub async fn connect(self) -> Result<Connection<S>, ConnectionError> {
+        let codec = TransmissionCodec::new(self.registry);
+        let framed = Framed::new(self.stream, codec);
+        let mut conn = Connection::from_framed(framed);
+
+        conn.run_initial_handshake(&self.client_name, self.preload)
+            .await?;
+
+        // After the initial Connect/ConnectResponse, publish each
+        // declared type's descriptor data so the broker can route /
+        // route subscriptions for them. We do this regardless of
+        // preload — even non-preload clients still need to register
+        // their types before publishing values.
+        for pending in &self.pending {
+            match pending {
+                PendingDescriptor::Struct(d) => {
+                    let data = StructDescriptorData::from_static(d);
+                    conn.send_typed("StructDescriptorData", &data).await?;
+                }
+                PendingDescriptor::Enum(d) => {
+                    let data = EnumDescriptorData::from_static(d);
+                    conn.send_typed("EnumDescriptorData", &data).await?;
+                }
+            }
+        }
+
+        Ok(conn)
     }
 }

@@ -37,7 +37,7 @@ use dots_derive::DotsStruct;
 use dots_model::{
     DotsMsgError, StructDescriptorData, Transmission, registry_with_internal_types,
 };
-use dots_transport::{Connection, ConnectionError, TransportError};
+use dots_transport::{ConnectionBuilder, ConnectionError, TransportError};
 use tokio::net::TcpStream;
 use tokio::signal::ctrl_c;
 
@@ -69,18 +69,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register_struct_static(Pinger::DESCRIPTOR);
     let registry = Arc::new(registry);
 
-    let mut conn = match Connection::establish(stream, &name, registry).await {
+    // Phase 1: handshake + publish our type's descriptor so the
+    // broker knows about Pinger before we start using it.
+    let mut conn = match ConnectionBuilder::new(stream, &name, registry)
+        .publishes::<Pinger>()
+        .preload(true)
+        .connect()
+        .await
+    {
         Ok(c) => c,
         Err(e) => return handshake_failed(e),
     };
     eprintln!(
-        "connected: server=`{}` client_id={:?}",
+        "connected: server=`{}` client_id={:?}  state={:?}",
         conn.server_name().unwrap_or("?"),
-        conn.client_id()
+        conn.client_id(),
+        conn.state(),
     );
 
+    // Phase 2: subscribe before draining the cache, so cached
+    // Pingers (from previous demo runs that published with cached=true)
+    // are dispatched into our subscription.
     let mut pinger_sub = conn.subscribe::<Pinger>();
     let our_id = conn.client_id().unwrap_or(0);
+
+    // Phase 3: drain the cache. Each cached Pinger flows through the
+    // subscription with header.from_cache > 0.
+    eprintln!("draining cache ...");
+    if let Err(e) = conn.finish_preload().await {
+        return handshake_failed(e);
+    }
+    eprintln!("preload complete; state={:?}", conn.state());
+
+    // Pull any cache events that already arrived. They're queued in
+    // the subscription's channel — drain non-blocking.
+    let mut cache_count = 0;
+    while let Ok(event) = pinger_sub.try_recv() {
+        cache_count += 1;
+        println!(
+            "★ cached Pinger:  id={:?}  message={:?}  remaining={:?}",
+            event.value.id, event.value.message, event.header.from_cache
+        );
+    }
+    if cache_count == 0 {
+        eprintln!("(no cached Pingers — fresh broker or first publisher)");
+    } else {
+        eprintln!("({cache_count} cached Pinger(s) replayed)");
+    }
 
     // Publish a Pinger every second.
     let mut publish_timer = tokio::time::interval(Duration::from_secs(1));
