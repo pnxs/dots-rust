@@ -18,8 +18,10 @@
 //! triplet, etc.
 
 pub mod descriptors;
+pub mod registry;
 
 pub use descriptors::{
     DotsStructFlags, DotsStructScope, EnumDescriptorData, EnumElementDescriptor,
     StructDescriptorData, StructDocumentation, StructPropertyData,
 };
+pub use registry::{DescriptorEntry, Registry, RegistryError};
