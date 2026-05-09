@@ -23,15 +23,19 @@
 //! For non-TCP carriers (in-memory `tokio::io::duplex`, Unix sockets,
 //! etc.), drop down to [`GuestTransceiver::from_connection`] directly.
 
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use dots_core::{EnumDescriptor, StructValue};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::connection::{ConnectionBuilder, ConnectionError, Event};
+use crate::connection::{Connection, ConnectionBuilder, ConnectionError, Event};
 use crate::container::Container;
 use crate::error::TransportError;
-use crate::guest::{GuestDriver, GuestError, GuestTransceiver, SubscriptionHandle};
+use crate::guest::{GuestError, GuestTransceiver, SubscriptionHandle};
 
 pub use crate::guest::{ClientClosed, now_timepoint};
 
@@ -93,14 +97,21 @@ impl From<GuestError> for AppError {
 /// `Deref`.
 pub type Client = Arc<GuestTransceiver>;
 
-/// High-level DOTS client over TCP.
+/// Type-erased future for the guest-side I/O loop. Used by [`App`] so
+/// it can hold a driver without exposing its underlying stream type
+/// (TCP, UDS, etc.) in the [`App`] struct.
+type DriverFuture = Pin<Box<dyn Future<Output = Result<(), GuestError>> + Send>>;
+
+/// High-level DOTS client.
 ///
-/// Owns an [`Arc<GuestTransceiver>`](GuestTransceiver) (the
-/// shareable API surface) and a [`GuestDriver<TcpStream>`] (consumed
-/// by [`run`](Self::run)).
+/// Owns an [`Arc<GuestTransceiver>`](GuestTransceiver) (the shareable
+/// API surface) and a type-erased driver future (consumed by
+/// [`run`](Self::run)). Constructed via [`connect`](Self::connect)
+/// for TCP or [`connect_unix`](Self::connect_unix) for Unix domain
+/// sockets.
 pub struct App {
     transceiver: Arc<GuestTransceiver>,
-    driver: Option<GuestDriver<TcpStream>>,
+    driver: Option<DriverFuture>,
 }
 
 impl App {
@@ -108,7 +119,7 @@ impl App {
     /// `preload = true`). Returns an `App` ready for the user to add
     /// subscriptions, then `run()`.
     pub async fn connect(addr: &str, client_name: &str) -> Result<App, AppError> {
-        Self::connect_inner(addr, client_name, None).await
+        Self::connect_tcp_inner(addr, client_name, None).await
     }
 
     /// Same as [`connect`](Self::connect) but supplies a shared secret
@@ -118,10 +129,31 @@ impl App {
         client_name: &str,
         secret: &str,
     ) -> Result<App, AppError> {
-        Self::connect_inner(addr, client_name, Some(secret)).await
+        Self::connect_tcp_inner(addr, client_name, Some(secret)).await
     }
 
-    async fn connect_inner(
+    /// Connect to a DOTS broker over a Unix domain socket. `path` is
+    /// the filesystem path of the broker's listening socket.
+    #[cfg(unix)]
+    pub async fn connect_unix(
+        path: impl AsRef<Path>,
+        client_name: &str,
+    ) -> Result<App, AppError> {
+        Self::connect_unix_inner(path.as_ref(), client_name, None).await
+    }
+
+    /// Same as [`connect_unix`](Self::connect_unix) but supplies a
+    /// shared secret for challenge-response authentication.
+    #[cfg(unix)]
+    pub async fn connect_unix_with_auth(
+        path: impl AsRef<Path>,
+        client_name: &str,
+        secret: &str,
+    ) -> Result<App, AppError> {
+        Self::connect_unix_inner(path.as_ref(), client_name, Some(secret)).await
+    }
+
+    async fn connect_tcp_inner(
         addr: &str,
         client_name: &str,
         secret: Option<&str>,
@@ -130,23 +162,52 @@ impl App {
             addr,
             client_name,
             with_auth = secret.is_some(),
+            transport = "tcp",
             "connecting to dotsd"
         );
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
+        Self::build_app(stream, client_name, secret).await
+    }
 
+    #[cfg(unix)]
+    async fn connect_unix_inner(
+        path: &Path,
+        client_name: &str,
+        secret: Option<&str>,
+    ) -> Result<App, AppError> {
+        tracing::info!(
+            path = %path.display(),
+            client_name,
+            with_auth = secret.is_some(),
+            transport = "uds",
+            "connecting to dotsd"
+        );
+        let stream = tokio::net::UnixStream::connect(path).await?;
+        Self::build_app(stream, client_name, secret).await
+    }
+
+    async fn build_app<S>(
+        stream: S,
+        client_name: &str,
+        secret: Option<&str>,
+    ) -> Result<App, AppError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let registry = Arc::new(dots_model::registry_with_internal_types());
         let mut builder =
             ConnectionBuilder::new(stream, client_name, registry.clone()).preload(true);
         if let Some(s) = secret {
             builder = builder.with_auth(s);
         }
-        let conn = builder.connect().await?;
+        let conn: Connection<S> = builder.connect().await?;
         let (transceiver, driver) =
             GuestTransceiver::from_connection(client_name.to_string(), registry, conn);
+        let driver_future: DriverFuture = Box::pin(driver.run());
         Ok(App {
             transceiver,
-            driver: Some(driver),
+            driver: Some(driver_future),
         })
     }
 
@@ -213,8 +274,8 @@ impl App {
     /// Run the read/write event loop until [`exit`](Self::exit) is
     /// called or the connection closes.
     pub async fn run(mut self) -> Result<(), AppError> {
-        let driver = self.driver.take().expect("App::run called twice");
-        driver.run().await.map_err(Into::into)
+        let fut = self.driver.take().expect("App::run called twice");
+        fut.await.map_err(Into::into)
     }
 
     /// Same as [`run`](Self::run) but also installs a Ctrl-C handler

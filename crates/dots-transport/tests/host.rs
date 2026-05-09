@@ -11,6 +11,7 @@ use std::time::Duration;
 use dots_derive::DotsStruct;
 use dots_model::{Registry, registry_with_internal_types};
 use dots_transport::{Connection, ConnectionBuilder, GuestTransceiver, HostTransceiver};
+use tokio::net::{UnixListener, UnixStream};
 
 #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Pinger", cached)]
@@ -563,6 +564,75 @@ async fn host_publishes_dots_client_on_connect_and_disconnect() {
 
     gt_obs.exit();
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_obs_handle).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn host_serve_unix_routes_pinger_round_trip() {
+    let host = HostTransceiver::new("uds-host");
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    // Allocate a unique socket path under the temp dir; clean any
+    // stale leftover from a previous run.
+    let sock_path = std::env::temp_dir().join(format!(
+        "dots-uds-test-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&sock_path);
+
+    let listener = UnixListener::bind(&sock_path).expect("bind UDS");
+    let serve_handle = host.serve_unix(listener);
+
+    // Client side: connect via UDS, run handshake, subscribe to Pinger.
+    let stream = UnixStream::connect(&sock_path).await.expect("uds connect");
+    let registry = Arc::new(registry_with_internal_types());
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    let conn = ConnectionBuilder::new(stream, "uds-client", registry.clone())
+        .preload(false)
+        .publishes::<Pinger>()
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) = GuestTransceiver::from_connection(
+        "uds-client".to_string(),
+        registry.clone(),
+        conn,
+    );
+    let mut sub = gt.subscribe_stream::<Pinger>();
+    let driver_handle = tokio::spawn(driver.run());
+
+    // Wait for the join to land.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("Pinger") == 1 {
+            break;
+        }
+    }
+    assert_eq!(host.group_size("Pinger"), 1);
+
+    // Host publishes; client receives over UDS.
+    host.publish(&Pinger {
+        id: Some(1),
+        message: Some("hi over uds".into()),
+        sequence: Some(7),
+    });
+    let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("timed out")
+        .expect("sub closed");
+    assert_eq!(event.value.id, Some(1));
+    assert_eq!(event.value.message.as_deref(), Some("hi over uds"));
+    assert_eq!(event.value.sequence, Some(7));
+
+    // Cleanup.
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+    serve_handle.abort();
+    let _ = std::fs::remove_file(&sock_path);
 }
 
 #[tokio::test]

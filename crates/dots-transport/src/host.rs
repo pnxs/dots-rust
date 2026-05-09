@@ -189,6 +189,49 @@ impl HostTransceiver {
         client_id
     }
 
+    /// Spawn an accept loop that pulls TCP connections off `listener`
+    /// and feeds each one into [`accept`](Self::accept). The returned
+    /// [`JoinHandle`] yields `Ok(())` only on graceful end-of-stream;
+    /// the loop runs until the listener errors (e.g. socket closed,
+    /// resource exhausted).
+    pub fn serve_tcp(
+        self: &Arc<Self>,
+        listener: tokio::net::TcpListener,
+    ) -> JoinHandle<std::io::Result<()>> {
+        let host = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, peer) = listener.accept().await?;
+                if let Err(e) = stream.set_nodelay(true) {
+                    tracing::warn!(?peer, error = %e, "set_nodelay failed on accepted TCP stream");
+                }
+                let id = host.accept(stream);
+                tracing::info!(?peer, client_id = id, "TCP guest accepted");
+            }
+        })
+    }
+
+    /// Spawn an accept loop on a Unix domain socket listener. Same
+    /// semantics as [`serve_tcp`](Self::serve_tcp). Linux/macOS only.
+    #[cfg(unix)]
+    pub fn serve_unix(
+        self: &Arc<Self>,
+        listener: tokio::net::UnixListener,
+    ) -> JoinHandle<std::io::Result<()>> {
+        let host = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await?;
+                let peer = stream
+                    .peer_addr()
+                    .ok()
+                    .and_then(|a| a.as_pathname().map(|p| p.display().to_string()));
+                let id = host.accept(stream);
+                tracing::info!(peer = ?peer, client_id = id, "UDS guest accepted");
+            }
+        })
+    }
+
     /// Publish a typed value from the host itself. Routes to every
     /// guest currently subscribed to `T`'s type-name group, and folds
     /// the value into the cache pool if `T` is `cached`.
@@ -575,31 +618,27 @@ where
     W: futures_util::Sink<Vec<u8>, Error = crate::TransportError> + Unpin,
 {
     let type_name = txn.header.type_name.as_deref().unwrap_or("");
-    match type_name {
-        "DotsMsgConnect" => {
-            let connect: DotsMsgConnect = decode_handshake(txn, "DotsMsgConnect")?;
-            if connect.preload_client_finished == Some(true) {
-                let resp = DotsMsgConnectResponse {
-                    server_name: Some(host.self_name.clone()),
-                    client_id: Some(client_id),
-                    accepted: Some(true),
-                    preload_finished: Some(true),
-                    ..Default::default()
-                };
-                send_typed(sink, "DotsMsgConnectResponse", &resp).await?;
-                return Ok(true);
-            }
+    if type_name == "DotsMsgConnect" {
+        let connect: DotsMsgConnect = decode_handshake(txn, "DotsMsgConnect")?;
+        if connect.preload_client_finished == Some(true) {
+            let resp = DotsMsgConnectResponse {
+                server_name: Some(host.self_name.clone()),
+                client_id: Some(client_id),
+                accepted: Some(true),
+                preload_finished: Some(true),
+                ..Default::default()
+            };
+            send_typed(sink, "DotsMsgConnectResponse", &resp).await?;
+            return Ok(true);
         }
-        "StructDescriptorData" => register_incoming_struct(host, txn),
-        "EnumDescriptorData" => register_incoming_enum(host, txn),
-        "DotsMember" => {
-            handle_member(host, client_id, txn);
-        }
-        _ => {
-            // Anything else during preload — treat as a normal publish.
-            handle_connected_message(host, client_id, txn);
-        }
+        return Ok(false);
     }
+    // Everything else during preload — including descriptor data and
+    // DotsMember — flows through the same dispatch the connected
+    // phase uses. That ensures descriptors received during one
+    // guest's preload are also fanned out to other already-connected
+    // guests subscribed to `StructDescriptorData`.
+    handle_connected_message(host, client_id, txn);
     Ok(false)
 }
 
@@ -614,22 +653,24 @@ fn handle_connected_message(
         return;
     };
     if type_name == "DotsMember" {
+        // Group membership is for the broker; not fanned out.
         handle_member(host, client_id, txn);
         return;
     }
     if type_name == "DotsEcho" {
+        // Direct reply only; no fan-out.
         handle_echo(host, client_id, txn);
         return;
     }
     if type_name == "StructDescriptorData" {
+        // Register locally so we can decode subsequent payloads of
+        // the new type, then fall through to fan-out — other guests
+        // subscribed to `StructDescriptorData` (e.g. dots-cpp guests
+        // populating their own type registry) need to see it too.
         register_incoming_struct(host, txn);
-        return;
-    }
-    if type_name == "EnumDescriptorData" {
+    } else if type_name == "EnumDescriptorData" {
         register_incoming_enum(host, txn);
-        return;
-    }
-    if type_name == "DotsMsgConnect"
+    } else if type_name == "DotsMsgConnect"
         || type_name == "DotsMsgConnectResponse"
         || type_name == "DotsMsgHello"
         || type_name == "DotsMsgError"

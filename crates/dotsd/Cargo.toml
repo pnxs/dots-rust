@@ -10,6 +10,7 @@ description = "DOTS broker daemon — listens on TCP and routes pub/sub between 
 
 [dependencies]
 dots-transport.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal"] }
 tracing.workspace = true

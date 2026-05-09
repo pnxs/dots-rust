@@ -141,6 +141,7 @@ name = "dotsd"
 version = "0.1.0"
 dependencies = [
  "dots-transport",
+ "futures-util",
  "tokio",
  "tracing",
  "tracing-subscriber",
