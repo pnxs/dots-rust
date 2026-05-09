@@ -972,6 +972,32 @@ async fn dots_clear_cache_drops_named_types_and_publishes_removals() {
 }
 
 #[tokio::test]
+async fn gt_exit_promptly_wakes_the_driver_on_a_quiet_connection() {
+    // Connect a guest, do nothing, call exit(). The driver should
+    // exit promptly (under 200ms), even though no traffic has flowed.
+    // Before the Notify wiring this would hang indefinitely.
+    let host = HostTransceiver::new("quiet-host");
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+
+    let conn = ConnectionBuilder::new(guest_io, "quiet-guest", registry())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) =
+        GuestTransceiver::from_connection("quiet-guest".to_string(), registry(), conn);
+    let driver_handle = tokio::spawn(driver.run());
+
+    // No traffic yet — call exit, expect prompt return.
+    gt.exit();
+    let exit_result = tokio::time::timeout(Duration::from_millis(500), driver_handle)
+        .await
+        .expect("driver should exit promptly when exit() is called");
+    assert!(exit_result.is_ok(), "driver task ended cleanly");
+}
+
+#[tokio::test]
 async fn host_does_not_loop_back_publisher_to_itself() {
     let host = HostTransceiver::new("test-host");
     let registry = registry();

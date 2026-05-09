@@ -14,45 +14,15 @@
 //! dotsd --name my-host tcp://0.0.0.0:11235           # custom daemon name
 //! ```
 //!
-//! Logging via `tracing` + `tracing-subscriber` (override the default
+//! Endpoint URI parsing + binding lives in `dots-transport` so any
+//! embedded broker can accept the same syntax. Logging is via the
+//! `tracing` crate plus `tracing-subscriber` (override the default
 //! `info` level with the `RUST_LOG` env var).
 
-use std::path::PathBuf;
-
-use dots_transport::HostTransceiver;
-use tokio::net::{TcpListener, UnixListener};
-
-/// Removes a UDS socket file when dropped. Kept alive for the
-/// daemon's lifetime so the socket file disappears on Ctrl-C, panic,
-/// or any other early exit — without relying on the next startup's
-/// best-effort cleanup.
-struct UdsSocketGuard {
-    path: PathBuf,
-}
-
-impl Drop for UdsSocketGuard {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            // ENOENT is fine — someone else (or a panic during bind)
-            // may have already removed it.
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    error = %e,
-                    "failed to remove UDS socket file on shutdown"
-                );
-            }
-        }
-    }
-}
+use dots_transport::{Endpoint, EndpointHandle, HostTransceiver, parse_endpoint};
 
 const DEFAULT_ENDPOINT: &str = "tcp://0.0.0.0:11235";
 const DEFAULT_NAME: &str = "dotsd";
-
-enum Endpoint {
-    Tcp(String),
-    Uds(PathBuf),
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,63 +38,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (daemon_name, endpoints) = parse_args()?;
 
     let host = HostTransceiver::new(daemon_name.clone());
-    let mut serve_handles = Vec::new();
-    // Held for the daemon's lifetime; their Drop impls remove the
-    // bound socket files on any exit path (Ctrl-C, panic, etc.).
-    let mut uds_guards: Vec<UdsSocketGuard> = Vec::new();
+    // EndpointHandle owns each accept loop's JoinHandle plus the
+    // UDS socket guard (for uds:// endpoints). Dropping it cleans
+    // up the socket file; we keep them all alive for the daemon's
+    // lifetime.
+    let mut handles: Vec<EndpointHandle> = Vec::new();
     for ep in endpoints {
-        match ep {
-            Endpoint::Tcp(addr) => {
-                let listener = TcpListener::bind(&addr).await?;
-                let local = listener.local_addr()?;
-                tracing::info!(name = daemon_name, listen = %local, "TCP endpoint ready");
-                serve_handles.push(host.serve_tcp(listener));
-            }
-            Endpoint::Uds(path) => {
-                // Best-effort cleanup of a stale socket file from a
-                // previous run. UnixListener::bind fails with EADDRINUSE
-                // otherwise.
-                if path.exists() {
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        tracing::warn!(path = %path.display(), error = %e,
-                            "failed to clean up stale UDS file");
-                    }
-                }
-                let listener = UnixListener::bind(&path)?;
-                tracing::info!(name = daemon_name, listen = %path.display(),
-                    "UDS endpoint ready");
-                uds_guards.push(UdsSocketGuard { path: path.clone() });
-                serve_handles.push(host.serve_unix(listener));
-            }
-        }
+        handles.push(host.serve_endpoint(ep).await?);
     }
-
-    if serve_handles.is_empty() {
+    if handles.is_empty() {
         return Err("no endpoints configured".into());
     }
+    tracing::info!(name = daemon_name, "dotsd ready — accepting guests");
 
-    // Wait for Ctrl-C OR for any serve handle to terminate (which
-    // signals a fatal accept-loop error on that listener).
-    tokio::select! {
-        biased;
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl-C received — shutting down");
-        }
-        (joined, _idx, _rest) = futures_util::future::select_all(serve_handles) => {
-            match joined {
-                Ok(Ok(())) => tracing::info!("an accept loop ended cleanly"),
-                Ok(Err(e)) => {
-                    tracing::error!(error = %e, "accept loop terminated");
-                    return Err(e.into());
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "accept loop task panicked");
-                    return Err(e.into());
-                }
-            }
-        }
-    }
-
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("Ctrl-C received — shutting down");
     Ok(())
 }
 
@@ -140,29 +68,17 @@ fn parse_args() -> Result<(String, Vec<Endpoint>), Box<dyn std::error::Error>> {
                 std::process::exit(0);
             }
             "--name" => {
-                name = args
-                    .next()
-                    .ok_or("--name requires an argument")?;
+                name = args.next().ok_or("--name requires an argument")?;
             }
             s if s.starts_with("--name=") => {
                 name = s[7..].to_string();
             }
-            s if s.starts_with("tcp://") => {
-                endpoints.push(Endpoint::Tcp(s[6..].to_string()));
-            }
-            s if s.starts_with("uds://") => {
-                // uds:///path/to/socket → strip the scheme; the
-                // remainder includes the leading slash for absolute
-                // paths.
-                endpoints.push(Endpoint::Uds(PathBuf::from(&s[6..])));
-            }
-            other => return Err(format!("unrecognized argument: {other}").into()),
+            other => endpoints.push(parse_endpoint(other)?),
         }
     }
 
     if endpoints.is_empty() {
-        // Default to a TCP endpoint matching the legacy behavior.
-        endpoints.push(Endpoint::Tcp(DEFAULT_ENDPOINT[6..].to_string()));
+        endpoints.push(parse_endpoint(DEFAULT_ENDPOINT)?);
     }
     Ok((name, endpoints))
 }

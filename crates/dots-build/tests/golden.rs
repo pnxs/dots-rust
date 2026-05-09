@@ -67,6 +67,33 @@ fn generated_source_contains_expected_items() {
 }
 
 #[test]
+fn cross_file_import_emits_use_super_path() {
+    let tmp = tempdir();
+    let a_path = tmp.join("colors.dots");
+    let b_path = tmp.join("paint.dots");
+    std::fs::write(
+        &a_path,
+        "enum Color { 1: red, 2: green, 3: blue }",
+    )
+    .unwrap();
+    std::fs::write(
+        &b_path,
+        "import Color\nstruct Paint { 1: [key] uint32 id; 2: Color hue; }",
+    )
+    .unwrap();
+
+    let out_dir = tmp.join("out");
+    compile_to_dir(&[&a_path, &b_path], &out_dir).unwrap();
+
+    let combined = std::fs::read_to_string(out_dir.join("dots_generated.rs")).unwrap();
+    // The paint module should use Color via the colors module.
+    assert!(
+        combined.contains("use super::colors::Color;"),
+        "expected `use super::colors::Color;` in generated source; got:\n{combined}"
+    );
+}
+
+#[test]
 fn compile_to_dir_writes_combined_file_with_module_per_input() {
     // Two input files in a temp dir; expect two `pub mod` blocks.
     let tmp = tempdir();

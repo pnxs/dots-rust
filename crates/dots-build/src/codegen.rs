@@ -5,18 +5,54 @@
 //! indistinguishable from hand-written ones at the API level.
 
 use core::fmt::Write;
+use std::collections::HashMap;
 
 use crate::ast::{EnumDef, EnumItem, File, Item, Property, PropertyType, StructDef};
 
-/// Render a parsed file as Rust source.
+/// Render a parsed file as Rust source. `import` directives are
+/// recorded but produce no `use` statements — the resulting code
+/// only compiles when every referenced external type lives in the
+/// same generated module. For multi-file projects use
+/// [`generate_with_imports`] instead, which resolves cross-file
+/// references via a type→module index.
 pub fn generate(file: &File) -> String {
+    generate_with_imports(file, "", &HashMap::new())
+}
+
+/// Render a parsed file as Rust source, resolving each `import T`
+/// directive to a `use super::<other_module>::T;` line based on the
+/// supplied type→module index. `current_module` names this file's
+/// own generated module — types imported from that same module are
+/// skipped (no self-imports). Types not present in the index pass
+/// through silently; the resulting compile error is the user's
+/// signal that the imported type isn't part of the build.
+pub fn generate_with_imports(
+    file: &File,
+    current_module: &str,
+    type_locations: &HashMap<String, String>,
+) -> String {
     let mut out = String::new();
-    out.push_str("use dots_derive::{DotsEnum, DotsStruct};\n\n");
+    out.push_str("use dots_derive::{DotsEnum, DotsStruct};\n");
+
+    // Emit `use super::<other_mod>::<Type>;` for each `import T`
+    // directive whose target is defined in another generated module.
+    for item in &file.items {
+        if let Item::Import { name } = item {
+            if let Some(target) = type_locations.get(name) {
+                if target != current_module {
+                    let _ = writeln!(&mut out, "use super::{}::{};", target, name);
+                }
+            }
+        }
+    }
+    out.push('\n');
+
     for item in &file.items {
         match item {
             Item::Struct(s) => emit_struct(&mut out, s),
             Item::Enum(e) => emit_enum(&mut out, e),
-            // imports/packages don't currently produce code.
+            // imports already handled above; packages are
+            // informational only.
             Item::Import { .. } | Item::Package { .. } => {}
         }
     }

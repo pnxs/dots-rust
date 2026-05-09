@@ -24,6 +24,7 @@ mod auth;
 mod codec;
 mod connection;
 mod container;
+mod endpoint;
 mod error;
 mod guest;
 mod host;
@@ -32,9 +33,10 @@ pub use app::{App, AppError, Client, ClientClosed, now_timepoint};
 pub use codec::TransmissionCodec;
 pub use connection::{Connection, ConnectionBuilder, ConnectionError, Event, Subscription};
 pub use container::{CloneInfo, Container, ContainerEntry, ContainerHandle, Operation};
+pub use endpoint::{Endpoint, EndpointError, parse_endpoint};
 pub use error::TransportError;
 pub use guest::{GuestDriver, GuestError, GuestTransceiver, SubscriptionHandle};
-pub use host::{HOST_ID, HostTransceiver};
+pub use host::{EndpointHandle, HOST_ID, HostTransceiver};
 
 // Re-export the framing layer's public types so callers don't need to
 // pull `dots-model` directly when wiring up a transport.

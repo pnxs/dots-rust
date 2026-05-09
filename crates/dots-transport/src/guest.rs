@@ -25,7 +25,7 @@ use dots_model::{
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::connection::{Connection, DispatchEntry, DispatchState, Event, GroupLeaver};
 use crate::container::Container;
@@ -126,6 +126,13 @@ pub struct GuestTransceiver {
     joined_groups: Mutex<HashMap<String, u32>>,
     outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
     exit_flag: AtomicBool,
+    /// Notifies the [`GuestDriver`]'s select-loop that the exit flag
+    /// has flipped. Without this, `exit()` only sets the flag and
+    /// the driver wouldn't notice until the next message arrives on
+    /// the wire — leaving callers blocked on `driver.await` for
+    /// quiet connections. The driver's loop awaits this in parallel
+    /// with stream/outbound so a flag flip wakes it immediately.
+    exit_notify: Notify,
     /// Client id assigned by the broker; populated after handshake
     /// and used to fill `header.sender` on outbound publishes.
     client_id: Mutex<Option<u32>>,
@@ -159,6 +166,7 @@ impl GuestTransceiver {
             joined_groups: Mutex::new(HashMap::new()),
             outbound_tx: tx,
             exit_flag: AtomicBool::new(false),
+            exit_notify: Notify::new(),
             client_id: Mutex::new(client_id),
         });
         let driver = GuestDriver {
@@ -293,8 +301,14 @@ impl GuestTransceiver {
     }
 
     /// Signal the driver's run loop to exit at the next iteration.
+    /// Signal the [`GuestDriver`]'s run loop to exit at the next
+    /// iteration. Returns immediately; the actual loop break happens
+    /// on the next pass through the select. The notify ensures that
+    /// pass happens promptly — even on a quiet connection where no
+    /// message is in flight.
     pub fn exit(&self) {
         self.exit_flag.store(true, Ordering::Release);
+        self.exit_notify.notify_waiters();
     }
 
     fn register_struct<T: StructValue + 'static>(&self) {
@@ -509,6 +523,11 @@ where
             }
             tokio::select! {
                 biased;
+                _ = self.transceiver.exit_notify.notified() => {
+                    // Loop back to the top so the exit_flag check
+                    // breaks us out cleanly.
+                    continue;
+                }
                 maybe_in = stream.next() => match maybe_in {
                     Some(Ok(txn)) => {
                         tracing::trace!(

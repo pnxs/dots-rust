@@ -153,6 +153,49 @@ impl App {
         Self::connect_unix_inner(path.as_ref(), client_name, Some(secret)).await
     }
 
+    /// Connect over a parsed [`crate::Endpoint`]. Dispatches to
+    /// [`connect`](Self::connect) for `tcp://` URIs and
+    /// [`connect_unix`](Self::connect_unix) for `uds://` URIs. Use
+    /// [`crate::parse_endpoint`] to build the [`crate::Endpoint`].
+    pub async fn connect_endpoint(
+        endpoint: crate::Endpoint,
+        client_name: &str,
+    ) -> Result<App, AppError> {
+        match endpoint {
+            crate::Endpoint::Tcp(addr) => Self::connect(&addr, client_name).await,
+            #[cfg(unix)]
+            crate::Endpoint::Uds(path) => Self::connect_unix(path, client_name).await,
+            #[cfg(not(unix))]
+            crate::Endpoint::Uds(_) => Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Unix domain sockets are unix-only",
+            ))),
+        }
+    }
+
+    /// Same as [`connect_endpoint`](Self::connect_endpoint) but with
+    /// authentication.
+    pub async fn connect_endpoint_with_auth(
+        endpoint: crate::Endpoint,
+        client_name: &str,
+        secret: &str,
+    ) -> Result<App, AppError> {
+        match endpoint {
+            crate::Endpoint::Tcp(addr) => {
+                Self::connect_with_auth(&addr, client_name, secret).await
+            }
+            #[cfg(unix)]
+            crate::Endpoint::Uds(path) => {
+                Self::connect_unix_with_auth(path, client_name, secret).await
+            }
+            #[cfg(not(unix))]
+            crate::Endpoint::Uds(_) => Err(AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Unix domain sockets are unix-only",
+            ))),
+        }
+    }
+
     async fn connect_tcp_inner(
         addr: &str,
         client_name: &str,

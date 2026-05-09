@@ -210,6 +210,41 @@ impl HostTransceiver {
         client_id
     }
 
+    /// Bind and serve an [`Endpoint`] (parsed from a `tcp://` or
+    /// `uds://` URI). For UDS endpoints, stale socket files from a
+    /// previous run are cleaned up before binding, and the returned
+    /// [`EndpointHandle`] removes the socket file on drop.
+    pub async fn serve_endpoint(
+        self: &Arc<Self>,
+        endpoint: crate::Endpoint,
+    ) -> std::io::Result<EndpointHandle> {
+        match endpoint {
+            crate::Endpoint::Tcp(addr) => {
+                let listener = tokio::net::TcpListener::bind(&addr).await?;
+                let local = listener.local_addr()?;
+                tracing::info!(listen = %local, "TCP endpoint ready");
+                Ok(EndpointHandle {
+                    join: self.serve_tcp(listener),
+                    _uds_guard: None,
+                })
+            }
+            crate::Endpoint::Uds(path) => {
+                // Best-effort cleanup of a stale socket file from a
+                // previous run. `bind` would otherwise fail with
+                // EADDRINUSE.
+                if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                let listener = tokio::net::UnixListener::bind(&path)?;
+                tracing::info!(listen = %path.display(), "UDS endpoint ready");
+                Ok(EndpointHandle {
+                    join: self.serve_unix(listener),
+                    _uds_guard: Some(UdsSocketGuard { path }),
+                })
+            }
+        }
+    }
+
     /// Spawn an accept loop that pulls TCP connections off `listener`
     /// and feeds each one into [`accept`](Self::accept). The returned
     /// [`JoinHandle`] yields `Ok(())` only on graceful end-of-stream;
@@ -1145,5 +1180,65 @@ where
     }
     let bytes = txn.payload.encode();
     decode_typed_from_slice(&bytes).map_err(|e| HostError::Decode(e.to_string()))
+}
+
+// ===== Public endpoint handle =====
+
+/// Owns a live listener task plus, for UDS endpoints, an RAII guard
+/// that removes the socket file on drop. Returned by
+/// [`HostTransceiver::serve_endpoint`].
+///
+/// Hold this for the daemon's lifetime; the listener task continues
+/// running as long as the host is alive (or until [`abort`](Self::abort)
+/// is called). Dropping the handle drops the guard (cleaning the
+/// socket file) but does *not* by itself stop the accept loop —
+/// tokio aborts the task only when the runtime shuts down or
+/// [`HostTransceiver::shutdown`] is called.
+pub struct EndpointHandle {
+    join: JoinHandle<std::io::Result<()>>,
+    /// `Some` for UDS endpoints — its `Drop` removes the bound socket
+    /// file. `None` for TCP. Underscore-prefixed because we only
+    /// rely on its `Drop` side effect; never read directly.
+    _uds_guard: Option<UdsSocketGuard>,
+}
+
+impl EndpointHandle {
+    /// Abort the underlying accept-loop task. The listener stops
+    /// accepting new connections immediately; existing per-guest
+    /// tasks keep running until they end naturally or the host is
+    /// shut down.
+    pub fn abort(&self) {
+        self.join.abort();
+    }
+
+    /// Await the accept loop. Yields `Ok(())` on a clean stream end
+    /// and `Err(io::Error)` if the listener errored. Cancel-safe.
+    pub async fn join(self) -> std::io::Result<()> {
+        match self.join.await {
+            Ok(r) => r,
+            Err(e) if e.is_cancelled() => Ok(()),
+            Err(e) => Err(std::io::Error::other(e)),
+        }
+    }
+}
+
+/// Removes a UDS socket file when dropped. Created internally by
+/// [`HostTransceiver::serve_endpoint`] for `uds://` endpoints.
+struct UdsSocketGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for UdsSocketGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "failed to remove UDS socket file on shutdown"
+                );
+            }
+        }
+    }
 }
 
