@@ -121,6 +121,14 @@ impl StructValue for AnyStruct {
         self.descriptor
     }
 
+    fn type_descriptor() -> &'static StructDescriptor {
+        // AnyStruct's descriptor is per-instance, not per-type, so
+        // there's no compile-time descriptor to return. Callers using
+        // AnyStruct shouldn't reach for this method — they have
+        // descriptor access through the instance's field directly.
+        panic!("AnyStruct has no compile-time type descriptor; use .descriptor() on an instance")
+    }
+
     fn valid_set(&self) -> PropertySet {
         self.valid
     }

@@ -257,6 +257,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
 
             #[inline]
+            fn type_descriptor() -> &'static ::dots_core::StructDescriptor {
+                Self::DESCRIPTOR
+            }
+
+            #[inline]
             fn valid_set(&self) -> ::dots_core::PropertySet {
                 #[allow(unused_mut)]
                 let mut set = ::dots_core::PropertySet::EMPTY;

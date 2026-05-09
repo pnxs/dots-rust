@@ -15,6 +15,13 @@ pub trait StructValue: Any {
     /// Static metadata for this struct's type.
     fn descriptor(&self) -> &'static StructDescriptor;
 
+    /// Static metadata for this struct's type, accessible from generic
+    /// code that doesn't have an instance. Equivalent to
+    /// `Self::DESCRIPTOR` for `#[derive(DotsStruct)]`-derived types.
+    fn type_descriptor() -> &'static StructDescriptor
+    where
+        Self: Sized;
+
     /// Bitmask of properties currently set on this instance.
     fn valid_set(&self) -> PropertySet;
 

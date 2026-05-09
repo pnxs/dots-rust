@@ -1,12 +1,19 @@
-//! Minimal DOTS demo client.
+//! DOTS demo client.
 //!
-//! Connects to a `dotsd` broker over TCP, runs the handshake, and
-//! prints every transmission that arrives until either the broker
-//! closes the connection or the user sends Ctrl-C.
+//! Connects to a `dotsd` broker over TCP, runs the handshake, then:
+//!
+//! - Subscribes to `Pinger` events.
+//! - Publishes a `Pinger` once per second with an incrementing sequence
+//!   number.
+//! - Drives the connection's read loop, printing every incoming
+//!   transmission's header summary.
+//! - Prints typed `Pinger` events as they arrive — including its own
+//!   publications looped back through the broker, plus any other
+//!   `Pinger` traffic from other clients on the same broker.
 //!
 //! ## Running
 //!
-//! Start a `dotsd` (from the C++ dots-cpp repo) on the default port:
+//! Start a `dotsd` (from the dots-cpp repo) on its default port:
 //!
 //! ```text
 //! ./dotsd
@@ -19,20 +26,31 @@
 //! cargo run --bin dots-demo-client -- 127.0.0.1:11235 my-name
 //! ```
 //!
-//! The client doesn't subscribe to anything and doesn't request
-//! preload, so the only traffic it observes is whatever the broker
-//! pushes unsolicited (typically `DotsMember` join/leave events when
-//! other clients come and go, plus any descriptor exchange).
+//! Run two instances at once to see the broker route Pinger publications
+//! between them.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use dots_core::decode_typed_from_slice;
+use dots_derive::DotsStruct;
 use dots_model::{
     DotsMsgError, StructDescriptorData, Transmission, registry_with_internal_types,
 };
 use dots_transport::{Connection, ConnectionError, TransportError};
 use tokio::net::TcpStream;
 use tokio::signal::ctrl_c;
+
+#[derive(DotsStruct, Default, Debug, Clone)]
+#[dots(name = "Pinger", cached)]
+struct Pinger {
+    #[dots(tag = 1, key)]
+    id: Option<u32>,
+    #[dots(tag = 2)]
+    message: Option<String>,
+    #[dots(tag = 3)]
+    sequence: Option<u64>,
+}
 
 const DEFAULT_ADDR: &str = "127.0.0.1:11235";
 const DEFAULT_NAME: &str = "dots-demo-client";
@@ -47,18 +65,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = TcpStream::connect(&addr).await?;
     stream.set_nodelay(true)?;
 
-    let registry = Arc::new(registry_with_internal_types());
+    let mut registry = registry_with_internal_types();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    let registry = Arc::new(registry);
+
     let mut conn = match Connection::establish(stream, &name, registry).await {
         Ok(c) => c,
         Err(e) => return handshake_failed(e),
     };
-
     eprintln!(
         "connected: server=`{}` client_id={:?}",
         conn.server_name().unwrap_or("?"),
         conn.client_id()
     );
-    eprintln!("listening for transmissions; press Ctrl-C to exit");
+
+    let mut pinger_sub = conn.subscribe::<Pinger>();
+    let our_id = conn.client_id().unwrap_or(0);
+
+    // Publish a Pinger every second.
+    let mut publish_timer = tokio::time::interval(Duration::from_secs(1));
+    publish_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut sequence: u64 = 0;
+
+    eprintln!("subscribed to `Pinger`; publishing one per second; press Ctrl-C to exit");
 
     loop {
         tokio::select! {
@@ -66,6 +95,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = ctrl_c() => {
                 eprintln!("\ninterrupted, exiting.");
                 break;
+            }
+            _ = publish_timer.tick() => {
+                sequence += 1;
+                let pinger = Pinger {
+                    id: Some(our_id),
+                    message: Some(format!("hello from {name}")),
+                    sequence: Some(sequence),
+                };
+                if let Err(e) = conn.publish(&pinger).await {
+                    eprintln!("publish error: {e}");
+                    break;
+                }
+                eprintln!("→ published Pinger seq={sequence}");
+            }
+            event = pinger_sub.recv() => {
+                match event {
+                    Some(ev) => println!(
+                        "✦ Pinger event:  id={:?}  message={:?}  seq={:?}  sender={:?}{}",
+                        ev.value.id, ev.value.message, ev.value.sequence, ev.header.sender,
+                        if ev.header.is_from_myself == Some(true) { "  (from me)" } else { "" },
+                    ),
+                    None => {
+                        eprintln!("subscription channel closed.");
+                        break;
+                    }
+                }
             }
             maybe = conn.next() => {
                 match maybe {
@@ -94,19 +149,25 @@ fn decode_failed(err: TransportError) -> Result<(), Box<dyn std::error::Error>> 
 
 fn print_transmission(txn: &Transmission) {
     let type_name = txn.header.type_name.as_deref().unwrap_or("?");
-    let sender = txn.header.sender.map(|s| s.to_string()).unwrap_or_else(|| "-".into());
+    // Don't double-print Pinger here — the typed subscription handler
+    // already prints them with full detail.
+    if type_name == "Pinger" {
+        return;
+    }
+    let sender = txn
+        .header
+        .sender
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "-".into());
     let valid = txn.payload.valid.len();
     println!(
-        "← {type_name}  sender={sender}  fields={valid}  remove={}  fromCache={:?}",
+        "← {type_name}  sender={sender}  fields={valid}  remove={}",
         txn.header.remove_obj.unwrap_or(false),
-        txn.header.from_cache,
     );
     annotate_known_internal(type_name, txn);
 }
 
-/// Pretty-print a few of the DOTS-internal types we care about. For
-/// everything else, the receive-loop summary already shows the type
-/// name and basic header fields.
+/// Pretty-print a few of the DOTS-internal types we care about.
 fn annotate_known_internal(type_name: &str, txn: &Transmission) {
     let bytes = txn.payload.encode();
     match type_name {
@@ -120,11 +181,7 @@ fn annotate_known_internal(type_name: &str, txn: &Transmission) {
         }
         "StructDescriptorData" => {
             if let Ok(d) = decode_typed_from_slice::<StructDescriptorData>(&bytes) {
-                let n_props = d
-                    .properties
-                    .as_ref()
-                    .map(|p| p.len())
-                    .unwrap_or(0);
+                let n_props = d.properties.as_ref().map(|p| p.len()).unwrap_or(0);
                 println!(
                     "    name={:?}  properties={}  publisher_id={:?}",
                     d.name, n_props, d.publisher_id

@@ -2,14 +2,25 @@
 //!
 //! [`Connection<S>`] wraps a [`Framed<S, TransmissionCodec>`] and drives
 //! the DOTS handshake (Hello → Connect → ConnectResponse). Once
-//! established, it exposes a `Stream`-like async API for receiving
-//! transmissions and methods for sending typed or dynamic payloads.
+//! established, it exposes:
+//!
+//! - [`publish`](Connection::publish) — send a typed value
+//! - [`subscribe`](Connection::subscribe) — register a typed subscription
+//!   that yields [`Event<T>`] values via a `Stream`
+//! - [`next`](Connection::next) — receive the next [`Transmission`] in
+//!   raw form, while also dispatching to any matching subscriptions as
+//!   a side effect
 //!
 //! Generic over `S: AsyncRead + AsyncWrite + Unpin`, so it works over
 //! TCP, Unix domain sockets, or any in-memory pipe like
 //! [`tokio::io::duplex`] for testing.
 
-use std::sync::Arc;
+use std::any::Any;
+use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll};
 
 use bytes::BufMut;
 use dots_core::{StructValue, decode_typed_from_slice};
@@ -17,8 +28,9 @@ use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
     Registry, Transmission, encode_typed_transmission_into,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 
 use crate::{TransmissionCodec, TransportError};
@@ -95,6 +107,11 @@ pub struct Connection<S> {
     client_id: Option<u32>,
     /// Reused encode buffer for typed sends — avoids per-message allocation.
     scratch: Vec<u8>,
+    /// Type-erased dispatch table for subscriptions. Behind a `Mutex` so
+    /// subscribers can be added/removed via `&self` (e.g. while the
+    /// owner is in the middle of an `&mut self` `next()` call), and so
+    /// the connection stays `Send` for multi-threaded runtimes.
+    dispatch: Arc<Mutex<DispatchState>>,
 }
 
 impl<S> Connection<S>
@@ -125,6 +142,7 @@ where
             server_name: None,
             client_id: None,
             scratch: Vec::with_capacity(256),
+            dispatch: Arc::new(Mutex::new(DispatchState::default())),
         };
         conn.run_handshake(client_name).await?;
         Ok(conn)
@@ -239,9 +257,89 @@ where
         Ok(())
     }
 
+    /// Publish a typed value. The wire `type_name` comes from
+    /// `T::DESCRIPTOR.name`, so this is the recommended high-level
+    /// shortcut over [`send_typed`](Self::send_typed) when the value's
+    /// own descriptor name is what should appear in the header.
+    pub async fn publish<T>(&mut self, value: &T) -> Result<(), ConnectionError>
+    where
+        T: StructValue,
+    {
+        let type_name = value.descriptor().name;
+        self.send_typed(type_name, value).await
+    }
+
     /// Receive the next transmission, or `None` on stream close.
+    ///
+    /// As a side effect, dispatches the transmission to any matching
+    /// subscriptions (typed `Event<T>` handlers registered via
+    /// [`subscribe`](Self::subscribe)). The raw `Transmission` is also
+    /// returned so callers can additionally inspect it.
     pub async fn next(&mut self) -> Option<Result<Transmission, TransportError>> {
-        self.framed.next().await
+        let result = self.framed.next().await;
+        if let Some(Ok(ref txn)) = result {
+            self.dispatch_to_subscribers(txn);
+        }
+        result
+    }
+
+    fn dispatch_to_subscribers(&self, txn: &Transmission) {
+        let Some(type_name) = txn.header.type_name.as_deref() else {
+            return;
+        };
+        let mut state = self.dispatch.lock().expect("dispatch mutex poisoned");
+        if let Some(entries) = state.entries.get_mut(type_name) {
+            // Decode failure is per-event — keep the subscription so a
+            // malformed transmission doesn't kill an otherwise-healthy
+            // subscriber.
+            entries.retain_mut(|(_, entry)| entry.dispatch(txn).unwrap_or(true));
+        }
+    }
+
+    /// Subscribe to typed events for `T`.
+    ///
+    /// Returns a [`Subscription<T>`] that implements `Stream<Item =
+    /// Event<T>>`. Each transmission whose `header.type_name` matches
+    /// `T::DESCRIPTOR.name` will be decoded and pushed to the
+    /// subscription's channel as the connection drives reads via
+    /// [`next`](Self::next).
+    ///
+    /// Dropping the subscription removes its dispatch entry on the next
+    /// matching transmission (or sooner, when the subscription's
+    /// `Drop` runs). Multiple subscriptions to the same type are
+    /// supported; each gets its own copy of the event.
+    ///
+    /// Takes `&self` so subscriptions can be created from within
+    /// `tokio::select!` arms that already hold `&mut self` for
+    /// `next`/`publish`.
+    pub fn subscribe<T>(&self) -> Subscription<T>
+    where
+        T: StructValue + Default + Send + 'static,
+    {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let entry: TypedDispatchEntry<T> = TypedDispatchEntry {
+            sender: tx,
+            _phantom: PhantomData,
+        };
+        let type_name = T::type_descriptor().name.to_string();
+        let id = {
+            let mut state = self.dispatch.lock().expect("dispatch mutex poisoned");
+            state.next_id += 1;
+            let id = state.next_id;
+            state
+                .entries
+                .entry(type_name.clone())
+                .or_default()
+                .push((id, Box::new(entry)));
+            id
+        };
+        Subscription {
+            rx,
+            type_name,
+            id,
+            dispatch: Arc::downgrade(&self.dispatch),
+            _phantom: PhantomData,
+        }
     }
 
     /// Current connection state. Becomes [`DotsConnectionState::Connected`]
@@ -265,5 +363,123 @@ where
     /// session ends.
     pub fn into_inner(self) -> S {
         self.framed.into_inner()
+    }
+}
+
+// ===== Pub/sub: Event, Subscription, dispatch =====
+
+/// One typed observation: the original [`DotsHeader`] plus the decoded
+/// payload value.
+#[derive(Debug, Clone)]
+pub struct Event<T> {
+    pub header: DotsHeader,
+    pub value: T,
+}
+
+/// RAII handle to a per-type subscription. Implements
+/// `Stream<Item = Event<T>>`; dropping it removes the dispatch entry
+/// (the connection notices on the next matching transmission, or the
+/// `Drop` impl removes it eagerly if the connection is still live).
+pub struct Subscription<T> {
+    rx: mpsc::UnboundedReceiver<Event<T>>,
+    type_name: String,
+    id: u64,
+    dispatch: Weak<Mutex<DispatchState>>,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> Subscription<T> {
+    /// Receive the next event, or `None` if the connection has dropped
+    /// the subscription (e.g. closed). Convenience over the
+    /// [`Stream`] impl for callers not using `StreamExt`.
+    pub async fn recv(&mut self) -> Option<Event<T>> {
+        self.rx.recv().await
+    }
+}
+
+impl<T: Unpin> Stream for Subscription<T> {
+    type Item = Event<T>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+impl<T> Drop for Subscription<T> {
+    fn drop(&mut self) {
+        if let Some(dispatch) = self.dispatch.upgrade() {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            if let Some(entries) = state.entries.get_mut(&self.type_name) {
+                entries.retain(|(id, _)| *id != self.id);
+                if entries.is_empty() {
+                    state.entries.remove(&self.type_name);
+                }
+            }
+        }
+    }
+}
+
+/// One subscriber entry: its id (used for removal) and the boxed
+/// type-erased dispatch implementation.
+type DispatchEntries = Vec<(u64, Box<dyn DispatchEntry>)>;
+
+/// Type-erased dispatch table: map from wire `type_name` to the list of
+/// active subscribers for that type.
+#[derive(Default)]
+struct DispatchState {
+    next_id: u64,
+    entries: HashMap<String, DispatchEntries>,
+}
+
+impl core::fmt::Debug for DispatchState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DispatchState")
+            .field("subscriptions", &self.entries.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Object-safe view of a single typed subscriber. The connection's
+/// dispatch loop calls [`dispatch`](DispatchEntry::dispatch) for each
+/// matching transmission; the impl decodes the payload as its `T` and
+/// pushes the resulting [`Event<T>`] onto the subscriber's channel.
+trait DispatchEntry: Send {
+    /// Decode and forward the transmission. Returns `Ok(false)` if the
+    /// subscriber's receiver has been dropped (so the entry should be
+    /// removed); `Ok(true)` if the entry should be kept.
+    fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError>;
+
+    /// Type-erasure escape hatch (currently unused by the dispatch
+    /// path itself; reserved for future introspection).
+    #[allow(dead_code)]
+    fn as_any(&self) -> &dyn Any;
+}
+
+struct TypedDispatchEntry<T> {
+    sender: mpsc::UnboundedSender<Event<T>>,
+    _phantom: PhantomData<fn() -> T>,
+}
+
+impl<T> DispatchEntry for TypedDispatchEntry<T>
+where
+    T: StructValue + Default + Send + 'static,
+{
+    fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError> {
+        if self.sender.is_closed() {
+            return Ok(false);
+        }
+        let bytes = txn.payload.encode();
+        let value: T = decode_typed_from_slice(&bytes)?;
+        let event = Event {
+            header: txn.header.clone(),
+            value,
+        };
+        // Send failure means the receiver was dropped between the
+        // is_closed check and the send — same outcome, drop the entry.
+        Ok(self.sender.send(event).is_ok())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

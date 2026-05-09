@@ -20,6 +20,7 @@ name = "dots-demo-client"
 version = "0.1.0"
 dependencies = [
  "dots-core",
+ "dots-derive",
  "dots-model",
  "dots-transport",
  "tokio",
