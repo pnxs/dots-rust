@@ -272,6 +272,49 @@ impl DynamicStruct {
     pub fn encode_into_encoder(&self, encoder: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
         encode_struct(self, encoder)
     }
+
+    /// Encode the key-properties of this struct as a deterministic
+    /// CBOR array — same shape as [`crate::encode_key_bytes`] for
+    /// typed values, suitable as a map key for in-memory caches that
+    /// need to dedupe instances by their declared key fields.
+    ///
+    /// Properties marked `#[dots(key)]` are emitted in declaration
+    /// order; missing key fields are encoded as `null` so partial-key
+    /// values stay distinguishable from values where the key is set
+    /// to a default-encoded zero.
+    pub fn key_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut buf);
+        let key_count = self
+            .descriptor
+            .properties
+            .iter()
+            .filter(|p| p.is_key)
+            .count() as u64;
+        encoder
+            .array(key_count)
+            .expect("Vec<u8> writes are infallible");
+        for prop in &self.descriptor.properties {
+            if !prop.is_key {
+                continue;
+            }
+            let value = if self.valid.has(prop.tag) {
+                self.properties
+                    .iter()
+                    .find(|(t, _)| *t == prop.tag)
+                    .map(|(_, v)| v)
+            } else {
+                None
+            };
+            match value {
+                Some(v) => encode_value(v, &mut encoder).expect("Vec<u8> writes are infallible"),
+                None => {
+                    encoder.null().expect("Vec<u8> writes are infallible");
+                }
+            }
+        }
+        buf
+    }
 }
 
 // ===== Encoding =====
