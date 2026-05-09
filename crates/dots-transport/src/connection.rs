@@ -454,6 +454,7 @@ where
             type_name,
             id,
             dispatch: Arc::downgrade(&self.dispatch),
+            leaver: None,
             _phantom: PhantomData,
         }
     }
@@ -539,6 +540,34 @@ pub struct Event<T> {
     pub value: T,
 }
 
+/// RAII guard run when a subscription handle is dropped, used by the
+/// guest-side transceiver to decrement its per-type subscriber count
+/// and publish `DotsMember(Leave)` when it goes to zero.
+///
+/// Carries a boxed `FnOnce` so that no module needs a direct
+/// dependency on `GuestTransceiver` — the guest layer constructs the
+/// leaver with a closure that captures a `Weak<GuestTransceiver>`.
+pub struct GroupLeaver {
+    on_drop: Option<Box<dyn FnOnce() + Send + Sync + 'static>>,
+}
+
+impl GroupLeaver {
+    /// Build a leaver from a closure. The closure runs once, on drop.
+    pub fn new(on_drop: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            on_drop: Some(Box::new(on_drop)),
+        }
+    }
+}
+
+impl Drop for GroupLeaver {
+    fn drop(&mut self) {
+        if let Some(f) = self.on_drop.take() {
+            f();
+        }
+    }
+}
+
 /// RAII handle to a per-type subscription. Implements
 /// `Stream<Item = Event<T>>`; dropping it removes the dispatch entry
 /// (the connection notices on the next matching transmission, or the
@@ -548,6 +577,12 @@ pub struct Subscription<T> {
     type_name: String,
     id: u64,
     dispatch: Weak<Mutex<DispatchState>>,
+    /// Set when this subscription was created via
+    /// [`crate::GuestTransceiver`]; runs on drop to decrement the
+    /// per-type subscriber count and publish `DotsMember(Leave)` if
+    /// this was the last subscriber. Raw `Connection::subscribe` paths
+    /// leave it `None` since they don't auto-join groups.
+    leaver: Option<GroupLeaver>,
     _phantom: PhantomData<T>,
 }
 
@@ -570,8 +605,17 @@ impl<T> Subscription<T> {
             type_name,
             id,
             dispatch,
+            leaver: None,
             _phantom: PhantomData,
         }
+    }
+
+    /// Attach a leaver — called by `GuestTransceiver`'s
+    /// subscription-creating methods after `from_parts` so that
+    /// dropping this subscription publishes `DotsMember(Leave)` once
+    /// the per-type subscriber count drops to zero.
+    pub(crate) fn set_leaver(&mut self, leaver: GroupLeaver) {
+        self.leaver = Some(leaver);
     }
 
     /// Try to receive a queued event without waiting. Returns

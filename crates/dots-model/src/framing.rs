@@ -24,8 +24,8 @@
 use std::sync::Arc;
 
 use dots_core::{
-    DecodeError, DynamicStruct, DynamicStructDescriptor, StructValue, decode_typed_from_decoder,
-    encode_into_vec,
+    DecodeError, DynamicStruct, DynamicStructDescriptor, PropertySet, StructValue,
+    decode_typed_from_decoder, encode_into_vec, encode_into_vec_with_mask,
 };
 
 use crate::{DotsHeader, Registry};
@@ -139,6 +139,23 @@ pub fn encode_typed_transmission_into(
     out.extend_from_slice(&[SIZE_PREFIX_MARKER, 0, 0, 0, 0]);
     encode_into_vec(header, out);
     encode_into_vec(payload, out);
+    patch_size_prefix(out, frame_start);
+}
+
+/// Same as [`encode_typed_transmission_into`], but emits only the
+/// payload properties whose tag is in `mask`. Used by the remove
+/// path to publish a key-only payload alongside `header.remove_obj
+/// = true`.
+pub fn encode_typed_transmission_with_mask_into(
+    header: &DotsHeader,
+    payload: &dyn StructValue,
+    mask: PropertySet,
+    out: &mut Vec<u8>,
+) {
+    let frame_start = out.len();
+    out.extend_from_slice(&[SIZE_PREFIX_MARKER, 0, 0, 0, 0]);
+    encode_into_vec(header, out);
+    encode_into_vec_with_mask(payload, mask, out);
     patch_size_prefix(out, frame_start);
 }
 

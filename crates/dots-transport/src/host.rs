@@ -18,11 +18,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use dots_core::{DynamicStruct, StructValue, decode_typed_from_slice};
+use dots_core::{DynamicStruct, StructValue, decode_typed_from_slice, key_set};
 use dots_model::{
-    DotsCacheInfo, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect,
+    DotsCacheInfo, DotsConnectionState, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect,
     DotsMsgConnectResponse, DotsMsgHello, EnumDescriptorData, Registry, StructDescriptorData,
-    Transmission, encode_typed_transmission_into,
+    Transmission, daemon::DotsClient, encode_typed_transmission_into,
+    encode_typed_transmission_with_mask_into,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -224,6 +225,45 @@ impl HostTransceiver {
         self.fan_out_bytes(type_name, &bytes, /*exclude*/ HOST_ID);
     }
 
+    /// Publish a removal from the host. Routes to every guest
+    /// subscribed to `T`'s type-name group, with `header.remove_obj
+    /// = true` and only key fields in the payload. Drops the entry
+    /// from the host's cache pool.
+    pub fn remove<T>(&self, value: &T)
+    where
+        T: StructValue,
+    {
+        let type_name = value.descriptor().name;
+        let mask = key_set(value);
+        let header = DotsHeader {
+            type_name: Some(type_name.into()),
+            attributes: Some(mask.bits()),
+            sender: Some(HOST_ID),
+            sent_time: Some(now_timepoint()),
+            server_sent_time: Some(now_timepoint()),
+            remove_obj: Some(true),
+            ..Default::default()
+        };
+
+        // Update cache: round-trip via DynamicStruct so `update_cache`
+        // can use payload.key_bytes(). Same path as host.publish.
+        if let Some(dots_model::DescriptorEntry::Struct(d)) = self.registry.lookup(type_name) {
+            if d.flags.is_cached() {
+                let mut payload_bytes = Vec::with_capacity(64);
+                let mut enc = dots_core::minicbor::Encoder::new(&mut payload_bytes);
+                dots_core::encode_into_encoder_with_mask(value, mask, &mut enc)
+                    .expect("encode infallible");
+                if let Ok(payload) = DynamicStruct::decode(d.clone(), &payload_bytes) {
+                    self.update_cache(type_name, &header, &payload);
+                }
+            }
+        }
+
+        let mut bytes = Vec::with_capacity(64);
+        encode_typed_transmission_with_mask_into(&header, value, mask, &mut bytes);
+        self.fan_out_bytes(type_name, &bytes, /*exclude*/ HOST_ID);
+    }
+
     fn fan_out_bytes(&self, type_name: &str, bytes: &[u8], exclude_client_id: u32) {
         let inner = self.inner.lock().expect("host mutex poisoned");
         let Some(targets) = inner.groups.get(type_name) else {
@@ -374,13 +414,44 @@ impl HostTransceiver {
     }
 
     fn remove_guest(&self, client_id: u32) {
-        let mut inner = self.inner.lock().expect("host mutex poisoned");
-        inner.guests.remove(&client_id);
-        for g in inner.groups.values_mut() {
-            g.remove(&client_id);
-        }
-        inner.groups.retain(|_, g| !g.is_empty());
+        // Snapshot the guest's name before we drop the record, so we
+        // can publish a final DotsClient(state=Closed) below.
+        let name = {
+            let mut inner = self.inner.lock().expect("host mutex poisoned");
+            let name = inner
+                .guests
+                .get(&client_id)
+                .and_then(|r| r.client_name.clone());
+            inner.guests.remove(&client_id);
+            for g in inner.groups.values_mut() {
+                g.remove(&client_id);
+            }
+            inner.groups.retain(|_, g| !g.is_empty());
+            name
+        };
         tracing::debug!(client_id, "guest removed");
+        self.publish_dots_client(client_id, name, DotsConnectionState::Closed, false);
+    }
+
+    /// Publish a [`DotsClient`] record for this guest's current state.
+    /// Routes through the normal publish path so the cache pool stays
+    /// in sync. C++ dotsd publishes on every connection-state
+    /// transition; we mirror that.
+    fn publish_dots_client(
+        &self,
+        client_id: u32,
+        name: Option<String>,
+        state: DotsConnectionState,
+        running: bool,
+    ) {
+        let record = DotsClient {
+            id: Some(client_id),
+            name,
+            running: Some(running),
+            connection_state: Some(state),
+            ..Default::default()
+        };
+        self.publish(&record);
     }
 }
 
@@ -428,6 +499,17 @@ where
         ..Default::default()
     };
     send_typed(&mut sink, "DotsMsgConnectResponse", &resp).await?;
+    let initial_state = if preload_requested {
+        DotsConnectionState::EarlySubscribe
+    } else {
+        DotsConnectionState::Connected
+    };
+    host.publish_dots_client(
+        client_id,
+        connect.client_name.clone(),
+        initial_state,
+        true,
+    );
 
     // ----- Phase 3: EarlySubscribe (if preload requested) -----
     if preload_requested {
@@ -452,6 +534,12 @@ where
             }
         }
         tracing::debug!(client_id, "guest preload phase complete");
+        host.publish_dots_client(
+            client_id,
+            connect.client_name.clone(),
+            DotsConnectionState::Connected,
+            true,
+        );
     }
 
     // ----- Phase 4: Connected — fan-out main loop -----
@@ -529,6 +617,10 @@ fn handle_connected_message(
         handle_member(host, client_id, txn);
         return;
     }
+    if type_name == "DotsEcho" {
+        handle_echo(host, client_id, txn);
+        return;
+    }
     if type_name == "StructDescriptorData" {
         register_incoming_struct(host, txn);
         return;
@@ -568,6 +660,43 @@ fn handle_connected_message(
     };
     outgoing.encode_into(&mut buf);
     host.fan_out_bytes(type_name, &buf, client_id);
+}
+
+/// Reply to a `DotsEcho` request: copy the payload, set `request =
+/// false`, and send it back only to the originating guest. No fan-out.
+fn handle_echo(host: &Arc<HostTransceiver>, client_id: u32, txn: &Transmission) {
+    let bytes = txn.payload.encode();
+    let echo: dots_model::DotsEcho = match decode_typed_from_slice(&bytes) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(client_id, error = %e, "failed to decode DotsEcho");
+            return;
+        }
+    };
+    if echo.request != Some(true) {
+        // Only requests get replies; ignore replies from misbehaving
+        // peers (we don't currently send our own echo requests).
+        return;
+    }
+    let reply = dots_model::DotsEcho {
+        request: Some(false),
+        ..echo
+    };
+    let header = DotsHeader {
+        type_name: Some("DotsEcho".into()),
+        attributes: Some(reply.valid_set().bits()),
+        sender: Some(HOST_ID),
+        sent_time: Some(now_timepoint()),
+        server_sent_time: Some(now_timepoint()),
+        ..Default::default()
+    };
+    let mut buf = Vec::with_capacity(64);
+    encode_typed_transmission_into(&header, &reply, &mut buf);
+
+    let inner = host.inner.lock().expect("host mutex poisoned");
+    if let Some(record) = inner.guests.get(&client_id) {
+        let _ = record.outbound_tx.send(buf);
+    }
 }
 
 fn register_incoming_struct(host: &Arc<HostTransceiver>, txn: &Transmission) {

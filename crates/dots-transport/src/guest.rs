@@ -12,23 +12,23 @@
 //! guest in the same process without networking.
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use dots_core::{
-    EnumDescriptor, StructDescriptor, StructValue, Timepoint, decode_typed_from_slice,
+    EnumDescriptor, StructDescriptor, StructValue, Timepoint, decode_typed_from_slice, key_set,
 };
 use dots_model::{
     DotsHeader, DotsMember, DotsMemberEvent, EnumDescriptorData, Registry, StructDescriptorData,
-    Transmission, encode_typed_transmission_into,
+    Transmission, encode_typed_transmission_into, encode_typed_transmission_with_mask_into,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
-use crate::connection::{Connection, DispatchEntry, DispatchState, Event};
+use crate::connection::{Connection, DispatchEntry, DispatchState, Event, GroupLeaver};
 use crate::container::Container;
 use crate::error::TransportError;
 use crate::ConnectionError;
@@ -120,9 +120,11 @@ pub struct GuestTransceiver {
     registry: Arc<Registry>,
     pending_structs: Mutex<HashSet<DescriptorPtr<StructDescriptor>>>,
     pending_enums: Mutex<HashSet<DescriptorPtr<EnumDescriptor>>>,
-    /// Group names for which we've already published a `DotsMember(Join)`.
-    /// Avoids duplicate joins from repeated subscribe<T>/container<T>.
-    joined_groups: Mutex<HashSet<String>>,
+    /// Per-group active subscriber count. Incremented on every
+    /// subscribe / container creation; decremented on the matching
+    /// drop. `DotsMember(Join)` is published when a group's count
+    /// transitions 0→1, `DotsMember(Leave)` on 1→0.
+    joined_groups: Mutex<HashMap<String, u32>>,
     outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
     exit_flag: AtomicBool,
     /// Client id assigned by the broker; populated after handshake
@@ -155,7 +157,7 @@ impl GuestTransceiver {
             registry,
             pending_structs: Mutex::new(HashSet::new()),
             pending_enums: Mutex::new(HashSet::new()),
-            joined_groups: Mutex::new(HashSet::new()),
+            joined_groups: Mutex::new(HashMap::new()),
             outbound_tx: tx,
             exit_flag: AtomicBool::new(false),
             client_id: Mutex::new(client_id),
@@ -189,38 +191,61 @@ impl GuestTransceiver {
     ///
     /// Drop the returned [`SubscriptionHandle`] to detach the handler;
     /// call [`SubscriptionHandle::discard`] to keep it installed for
-    /// the rest of the connection.
+    /// the rest of the connection. When the last subscriber of a
+    /// type goes away, this also publishes `DotsMember(Leave)` so
+    /// the broker stops routing.
     pub fn subscribe<T>(
-        &self,
+        self: &Arc<Self>,
         handler: impl FnMut(&Event<T>) + Send + 'static,
     ) -> SubscriptionHandle
     where
         T: StructValue + Default + Send + 'static,
     {
         self.register_struct::<T>();
-        self.join_group(T::type_descriptor().name);
-        register_callback::<T, _>(&self.dispatch, handler)
+        let group = T::type_descriptor().name;
+        self.join_group(group);
+        let mut handle = register_callback::<T, _>(&self.dispatch, handler);
+        handle.set_leaver(self.make_leaver(group));
+        handle
     }
 
     /// Subscribe to typed events as an async [`crate::Subscription<T>`]
     /// stream.
-    pub fn subscribe_stream<T>(&self) -> crate::Subscription<T>
+    pub fn subscribe_stream<T>(self: &Arc<Self>) -> crate::Subscription<T>
     where
         T: StructValue + Default + Send + 'static,
     {
         self.register_struct::<T>();
-        self.join_group(T::type_descriptor().name);
-        connection_subscribe::<T>(&self.dispatch)
+        let group = T::type_descriptor().name;
+        self.join_group(group);
+        let mut sub = connection_subscribe::<T>(&self.dispatch);
+        sub.set_leaver(self.make_leaver(group));
+        sub
     }
 
     /// Build a typed [`Container<T>`] for `T`.
-    pub fn container<T>(&self) -> Container<T>
+    pub fn container<T>(self: &Arc<Self>) -> Container<T>
     where
         T: StructValue + Default + Send + 'static,
     {
         self.register_struct::<T>();
-        self.join_group(T::type_descriptor().name);
-        crate::container::make_container(&self.dispatch)
+        let group = T::type_descriptor().name;
+        self.join_group(group);
+        let mut container = crate::container::make_container(&self.dispatch);
+        container.set_leaver(self.make_leaver(group));
+        container
+    }
+
+    /// Build a `GroupLeaver` whose drop publishes `DotsMember(Leave)`
+    /// for `group` if the per-group subscriber count drops to zero.
+    fn make_leaver(self: &Arc<Self>, group: &str) -> GroupLeaver {
+        let weak = Arc::downgrade(self);
+        let group = group.to_string();
+        GroupLeaver::new(move || {
+            if let Some(t) = weak.upgrade() {
+                t.leave_group(&group);
+            }
+        })
     }
 
     /// Pre-register an enum type's descriptor so it gets shipped to
@@ -245,6 +270,31 @@ impl GuestTransceiver {
         self.publish_typed(value)
     }
 
+    /// Publish a removal: tells the broker to drop the cached
+    /// instance whose key matches `value`. The wire payload contains
+    /// only the type's `#[dots(key)]` properties; `header.remove_obj
+    /// = true` and `header.attributes` is the key-only bitmask.
+    ///
+    /// Mirrors C++ `transceiver.remove(instance)`.
+    pub fn remove<T>(&self, value: &T) -> Result<(), ClientClosed>
+    where
+        T: StructValue,
+    {
+        self.register_struct_descriptor(T::type_descriptor());
+        let mask = key_set(value);
+        let header = DotsHeader {
+            type_name: Some(value.descriptor().name.into()),
+            attributes: Some(mask.bits()),
+            sender: self.client_id(),
+            sent_time: Some(now_timepoint()),
+            remove_obj: Some(true),
+            ..Default::default()
+        };
+        let mut bytes = Vec::with_capacity(64);
+        encode_typed_transmission_with_mask_into(&header, value, mask, &mut bytes);
+        self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
+    }
+
     /// Signal the driver's run loop to exit at the next iteration.
     pub fn exit(&self) {
         self.exit_flag.store(true, Ordering::Release);
@@ -266,25 +316,57 @@ impl GuestTransceiver {
         self.registry.register_struct_static(descriptor);
     }
 
-    /// Publish a `DotsMember(group_name, Join)` once per group. This
-    /// is what tells the broker to start routing transmissions of the
-    /// type to this guest — publishing the type's descriptor is not
-    /// enough on its own.
+    /// Increment the per-group subscriber count, publishing
+    /// `DotsMember(Join)` when the count transitions 0→1. Tells the
+    /// broker to start routing transmissions of `group_name` to this
+    /// guest.
     fn join_group(&self, group_name: &str) {
-        let already = !self
-            .joined_groups
-            .lock()
-            .expect("joined_groups mutex poisoned")
-            .insert(group_name.to_string());
-        if already {
-            return;
-        }
-        let member = DotsMember {
-            group_name: Some(group_name.into()),
-            event: Some(DotsMemberEvent::Join),
-            client: self.client_id(),
+        let count = {
+            let mut groups = self
+                .joined_groups
+                .lock()
+                .expect("joined_groups mutex poisoned");
+            let c = groups.entry(group_name.to_string()).or_insert(0);
+            *c += 1;
+            *c
         };
-        let _ = self.publish_typed(&member);
+        if count == 1 {
+            let member = DotsMember {
+                group_name: Some(group_name.into()),
+                event: Some(DotsMemberEvent::Join),
+                client: self.client_id(),
+            };
+            let _ = self.publish_typed(&member);
+        }
+    }
+
+    /// Decrement the per-group subscriber count, publishing
+    /// `DotsMember(Leave)` when the count reaches 0. Removes the
+    /// group entry entirely so a future re-subscribe re-publishes
+    /// Join.
+    pub(crate) fn leave_group(&self, group_name: &str) {
+        let mut should_publish_leave = false;
+        {
+            let mut groups = self
+                .joined_groups
+                .lock()
+                .expect("joined_groups mutex poisoned");
+            if let Some(count) = groups.get_mut(group_name) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    groups.remove(group_name);
+                    should_publish_leave = true;
+                }
+            }
+        }
+        if should_publish_leave {
+            let member = DotsMember {
+                group_name: Some(group_name.into()),
+                event: Some(DotsMemberEvent::Leave),
+                client: self.client_id(),
+            };
+            let _ = self.publish_typed(&member);
+        }
     }
 
     fn publish_typed<T: StructValue>(&self, value: &T) -> Result<(), ClientClosed> {
@@ -430,14 +512,27 @@ pub struct SubscriptionHandle {
     type_name: String,
     id: u64,
     dispatch: Weak<Mutex<DispatchState>>,
+    /// Set when this handle was created via
+    /// [`GuestTransceiver::subscribe`]. Runs on drop to decrement
+    /// the per-type subscriber count and publish `DotsMember(Leave)`
+    /// if this was the last subscriber.
+    leaver: Option<GroupLeaver>,
 }
 
 impl SubscriptionHandle {
     /// Detach this handle from its `Drop` cleanup, leaving the
     /// callback installed for the rest of the connection. Mirrors
     /// C++ DOTS's `Subscription::discard()`.
+    ///
+    /// Note that this also forgets the leaver, so `DotsMember(Leave)`
+    /// is *not* published — the discarded subscription stays
+    /// effective for the broker's routing as well.
     pub fn discard(self) {
         core::mem::forget(self);
+    }
+
+    fn set_leaver(&mut self, leaver: GroupLeaver) {
+        self.leaver = Some(leaver);
     }
 }
 
@@ -473,6 +568,7 @@ where
         type_name,
         id,
         dispatch: Arc::downgrade(dispatch),
+        leaver: None,
     }
 }
 

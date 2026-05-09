@@ -272,6 +272,300 @@ async fn host_replays_cached_pingers_to_late_subscriber() {
 }
 
 #[tokio::test]
+async fn dropping_last_subscription_publishes_member_leave() {
+    let host = HostTransceiver::new("test-host");
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+
+    let conn = ConnectionBuilder::new(guest_io, "guest", registry.clone())
+        .preload(false)
+        .publishes::<Pinger>()
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) =
+        GuestTransceiver::from_connection("guest".to_string(), registry.clone(), conn);
+    let driver_handle = tokio::spawn(driver.run());
+
+    let sub = gt.subscribe_stream::<Pinger>();
+
+    // Wait for the host to register the join.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("Pinger") == 1 {
+            break;
+        }
+    }
+    assert_eq!(host.group_size("Pinger"), 1, "join should have landed");
+
+    // Dropping the last subscription should publish DotsMember(Leave),
+    // which the host applies to remove the guest from the group.
+    drop(sub);
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("Pinger") == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        host.group_size("Pinger"),
+        0,
+        "leave should have removed guest from group"
+    );
+
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+}
+
+#[tokio::test]
+async fn dropping_one_of_two_subscriptions_keeps_join() {
+    let host = HostTransceiver::new("test-host");
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+
+    let conn = ConnectionBuilder::new(guest_io, "guest", registry.clone())
+        .preload(false)
+        .publishes::<Pinger>()
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) =
+        GuestTransceiver::from_connection("guest".to_string(), registry.clone(), conn);
+    let driver_handle = tokio::spawn(driver.run());
+
+    // Two subscriptions to the same type — the second should NOT
+    // publish another Join, and dropping the first should NOT publish
+    // a Leave (count is still 1).
+    let sub_a = gt.subscribe_stream::<Pinger>();
+    let _sub_b = gt.subscribe_stream::<Pinger>();
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("Pinger") == 1 {
+            break;
+        }
+    }
+    assert_eq!(host.group_size("Pinger"), 1);
+
+    drop(sub_a);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        host.group_size("Pinger"),
+        1,
+        "second subscriber should keep group alive"
+    );
+
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+}
+
+#[tokio::test]
+async fn guest_remove_drops_entry_from_host_cache() {
+    let host = HostTransceiver::new("test-host");
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+
+    // Guest A publishes two Pingers, then removes one.
+    let (host_io_a, guest_io_a) = tokio::io::duplex(8192);
+    host.accept(host_io_a);
+    let conn_a = ConnectionBuilder::new(guest_io_a, "publisher", registry.clone())
+        .preload(false)
+        .publishes::<Pinger>()
+        .connect()
+        .await
+        .unwrap();
+    let (gt_a, driver_a) = GuestTransceiver::from_connection(
+        "publisher".to_string(),
+        registry.clone(),
+        conn_a,
+    );
+    let driver_a_handle = tokio::spawn(driver_a.run());
+
+    gt_a.publish(&Pinger {
+        id: Some(1),
+        message: Some("first".into()),
+        sequence: Some(1),
+    })
+    .unwrap();
+    gt_a.publish(&Pinger {
+        id: Some(2),
+        message: Some("second".into()),
+        sequence: Some(1),
+    })
+    .unwrap();
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.cache_size("Pinger") == 2 {
+            break;
+        }
+    }
+    assert_eq!(host.cache_size("Pinger"), 2);
+
+    // Remove id=1.
+    gt_a.remove(&Pinger {
+        id: Some(1),
+        ..Default::default()
+    })
+    .unwrap();
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.cache_size("Pinger") == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        host.cache_size("Pinger"),
+        1,
+        "remove should have shrunk the cache to 1 entry"
+    );
+
+    gt_a.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_a_handle).await;
+}
+
+#[tokio::test]
+async fn host_replies_to_dots_echo_request() {
+    use dots_model::DotsEcho;
+
+    let host = HostTransceiver::new("test-host");
+    let registry = registry();
+
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+    let conn = ConnectionBuilder::new(guest_io, "echo-client", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) =
+        GuestTransceiver::from_connection("echo-client".to_string(), registry.clone(), conn);
+    let mut sub = gt.subscribe_stream::<DotsEcho>();
+    let driver_handle = tokio::spawn(driver.run());
+
+    // Wait for the join to land so the host has us in the DotsEcho
+    // group (echo replies are sent direct, but the join also keeps
+    // the guest's dispatch entry warm).
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("DotsEcho") >= 1 {
+            break;
+        }
+    }
+
+    gt.publish(&DotsEcho {
+        request: Some(true),
+        identifier: Some(7),
+        sequence_number: Some(42),
+        data: Some("ping".into()),
+    })
+    .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("timed out waiting for echo reply")
+        .expect("subscription closed");
+    assert_eq!(event.value.request, Some(false));
+    assert_eq!(event.value.identifier, Some(7));
+    assert_eq!(event.value.sequence_number, Some(42));
+    assert_eq!(event.value.data.as_deref(), Some("ping"));
+    assert_eq!(event.header.sender, Some(dots_transport::HOST_ID));
+
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+}
+
+#[tokio::test]
+async fn host_publishes_dots_client_on_connect_and_disconnect() {
+    use dots_model::{DotsConnectionState, DotsClient};
+
+    let host = HostTransceiver::new("test-host");
+
+    // Observer guest first — subscribes to DotsClient before any other
+    // guest connects, so it sees their connect/disconnect events.
+    let (host_io_obs, guest_io_obs) = tokio::io::duplex(8192);
+    host.accept(host_io_obs);
+    let conn_obs = ConnectionBuilder::new(guest_io_obs, "observer", registry())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt_obs, driver_obs) =
+        GuestTransceiver::from_connection("observer".to_string(), registry(), conn_obs);
+    let mut sub = gt_obs.subscribe_stream::<DotsClient>();
+    let driver_obs_handle = tokio::spawn(driver_obs.run());
+
+    // Drain the observer's own connect notifications first.
+    let mut observed = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(200), sub.recv()).await
+    {
+        observed.push(event.value);
+    }
+    // Observer's own DotsClient should be in the drained set.
+    assert!(observed.iter().any(|c| c.name.as_deref() == Some("observer")
+        && c.connection_state == Some(DotsConnectionState::Connected)));
+
+    // Now connect a second guest. Observer should see its connect.
+    let (host_io_b, guest_io_b) = tokio::io::duplex(8192);
+    host.accept(host_io_b);
+    let conn_b = ConnectionBuilder::new(guest_io_b, "alice", registry())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt_b, driver_b) =
+        GuestTransceiver::from_connection("alice".to_string(), registry(), conn_b);
+    let driver_b_handle = tokio::spawn(driver_b.run());
+
+    // Wait for the alice-connect event.
+    let mut alice_connected = false;
+    for _ in 0..30 {
+        if let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(100), sub.recv()).await
+        {
+            if event.value.name.as_deref() == Some("alice")
+                && event.value.connection_state == Some(DotsConnectionState::Connected)
+            {
+                alice_connected = true;
+                break;
+            }
+        }
+    }
+    assert!(alice_connected, "expected alice's connect event");
+
+    // Disconnect alice; observer should see Closed.
+    gt_b.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_b_handle).await;
+
+    let mut alice_closed = false;
+    for _ in 0..30 {
+        if let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(100), sub.recv()).await
+        {
+            if event.value.name.as_deref() == Some("alice")
+                && event.value.connection_state == Some(DotsConnectionState::Closed)
+                && event.value.running == Some(false)
+            {
+                alice_closed = true;
+                break;
+            }
+        }
+    }
+    assert!(alice_closed, "expected alice's disconnect event");
+
+    gt_obs.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_obs_handle).await;
+}
+
+#[tokio::test]
 async fn host_does_not_loop_back_publisher_to_itself() {
     let host = HostTransceiver::new("test-host");
     let registry = registry();

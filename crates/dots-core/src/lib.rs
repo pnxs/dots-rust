@@ -34,8 +34,8 @@ pub use dynamic::{
 };
 pub use layout::{
     AnyStruct, DecodeError, DotsField, EncodeError, decode_typed_from_decoder,
-    decode_typed_from_slice, encode_into_encoder, encode_into_vec, encode_key_bytes,
-    encode_key_into, encode_to_vec,
+    decode_typed_from_slice, encode_into_encoder, encode_into_encoder_with_mask, encode_into_vec,
+    encode_into_vec_with_mask, encode_key_bytes, encode_key_into, encode_to_vec, key_set,
 };
 pub use property_set::PropertySet;
 pub use temporal::{Duration, Timepoint};
@@ -63,13 +63,22 @@ pub use minicbor;
 #[macro_export]
 macro_rules! dots {
     ($($ty:ident)::+ { $($field:ident : $value:expr),* $(,)? }) => {
-        $($ty)::+ {
-            $(
-                $field: ::core::option::Option::Some(
-                    ::core::convert::Into::into($value)
-                ),
-            )*
-            ..::core::default::Default::default()
+        {
+            // The trailing `..Default::default()` is always emitted so
+            // the macro works whether the caller listed every field or
+            // not. When all fields are listed clippy flags that as
+            // `needless_update`; suppress here because the macro can't
+            // know in advance whether the caller covered the struct.
+            #[allow(clippy::needless_update)]
+            let __dots_value = $($ty)::+ {
+                $(
+                    $field: ::core::option::Option::Some(
+                        ::core::convert::Into::into($value)
+                    ),
+                )*
+                ..::core::default::Default::default()
+            };
+            __dots_value
         }
     };
 }

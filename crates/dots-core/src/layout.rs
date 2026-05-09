@@ -192,6 +192,63 @@ pub fn encode_into_encoder(
     }
 }
 
+/// Encode `value` but only emit properties whose tag is in `mask` AND
+/// is actually set on the value. The intersection means missing keys
+/// (e.g. removing an instance via key fields, where one of the keys
+/// happens to be `None`) silently get dropped — caller is responsible
+/// for ensuring all keys are present if that matters.
+///
+/// The wire form is identical to a regular `encode_into_vec` of a
+/// value where only the masked properties had been set. Used by the
+/// remove path: `mask = key_properties_mask` produces a key-only
+/// payload.
+pub fn encode_into_vec_with_mask(
+    value: &dyn StructValue,
+    mask: PropertySet,
+    buf: &mut Vec<u8>,
+) {
+    let mut encoder = minicbor::Encoder::new(buf);
+    // SAFETY: same invariants as `encode_into_vec`.
+    unsafe {
+        encode_from_raw(
+            value.descriptor(),
+            value.data_ptr(),
+            value.valid_set() & mask,
+            &mut encoder,
+        )
+        .expect("Vec<u8> writes are infallible");
+    }
+}
+
+/// Encode `value` into an existing CBOR encoder, restricted to a mask.
+/// Same semantics as [`encode_into_vec_with_mask`].
+pub fn encode_into_encoder_with_mask(
+    value: &dyn StructValue,
+    mask: PropertySet,
+    encoder: &mut CborEncoder<'_>,
+) -> Result<(), EncodeError> {
+    // SAFETY: same invariants as `encode_into_vec`.
+    unsafe {
+        encode_from_raw(
+            value.descriptor(),
+            value.data_ptr(),
+            value.valid_set() & mask,
+            encoder,
+        )
+    }
+}
+
+/// Compute the bitmask of `value`'s `#[dots(key)]` property tags.
+/// Useful for constructing remove headers (`attributes` set to the
+/// key bits) and for cache lookup.
+pub fn key_set(value: &dyn StructValue) -> PropertySet {
+    let mut set = PropertySet::EMPTY;
+    for prop in value.descriptor().key_properties() {
+        set = set.with_tag(prop.tag);
+    }
+    set
+}
+
 /// Encode the value's *key* properties — those marked `#[dots(key)]` —
 /// as a CBOR array, returning the bytes. Suitable as a `BTreeMap` /
 /// `HashMap` key for indexing instances by their primary key.

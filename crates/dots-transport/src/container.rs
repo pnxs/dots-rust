@@ -60,6 +60,12 @@ pub struct Container<T> {
     type_name: String,
     id: u64,
     dispatch: Weak<Mutex<DispatchState>>,
+    /// RAII guard that runs when this container is dropped, used by
+    /// [`crate::GuestTransceiver`] to publish `DotsMember(Leave)`
+    /// when the last subscriber for the type goes away. `None` when
+    /// the container was created via raw `Connection::container`
+    /// (which doesn't auto-join groups).
+    leaver: Option<crate::connection::GroupLeaver>,
     _phantom: PhantomData<T>,
 }
 
@@ -234,7 +240,18 @@ where
         type_name,
         id,
         dispatch: Arc::downgrade(dispatch),
+        leaver: None,
         _phantom: PhantomData,
+    }
+}
+
+impl<T> Container<T> {
+    /// Attach a leaver — called by `GuestTransceiver::container` after
+    /// `make_container` so that dropping this container publishes
+    /// `DotsMember(Leave)` once the per-type subscriber count drops
+    /// to zero.
+    pub(crate) fn set_leaver(&mut self, leaver: crate::connection::GroupLeaver) {
+        self.leaver = Some(leaver);
     }
 }
 

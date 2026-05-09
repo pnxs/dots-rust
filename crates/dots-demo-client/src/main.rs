@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-
+use dots_core::dots;
 use dots_derive::DotsStruct;
 use dots_model::DotsCacheInfo;
 use dots_transport::App;
@@ -105,11 +105,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             interval.tick().await;
             sequence += 1;
-            let p = Pinger {
-                id: Some(0),
-                message: Some(format!("hello from {pinger_name}")),
-                sequence: Some(sequence),
-            };
+            let p = dots!(Pinger {
+                id: 0_u32,
+                message: format!("hello from {pinger_name}"),
+                sequence: sequence,
+            });
             if client.publish(&p).is_err() {
                 eprintln!("connection closed; publisher exiting.");
                 break;

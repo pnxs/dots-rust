@@ -198,6 +198,14 @@ impl App {
         self.transceiver.publish(value)
     }
 
+    /// Publish a removal — see [`GuestTransceiver::remove`].
+    pub fn remove<T>(&self, value: &T) -> Result<(), ClientClosed>
+    where
+        T: StructValue,
+    {
+        self.transceiver.remove(value)
+    }
+
     pub fn exit(&self) {
         self.transceiver.exit()
     }
