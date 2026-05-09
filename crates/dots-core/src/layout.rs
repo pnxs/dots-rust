@@ -273,6 +273,86 @@ fn deallocate(ptr: NonNull<u8>, layout: Layout) {
     }
 }
 
+// ===== DotsField: uniform encode/decode trait =====
+//
+// `DotsField` abstracts over "any type that can appear in a DOTS struct
+// field". It's the trait the per-property thunks dispatch through.
+// Two impl families exist:
+//
+//   1. A blanket impl for primitives (and `String`, `Vec<u8>`, etc.)
+//      — anything minicbor already knows how to encode/decode.
+//   2. Manual impls emitted by `#[derive(DotsStruct)]` on every derived
+//      struct, delegating to the descriptor-driven codec via the safe
+//      `encode_struct_value` / `decode_struct_default` wrappers.
+//
+// The two families are disjoint: DOTS structs do *not* implement
+// `minicbor::Encode<()> + Decode<'_, ()>`, so the blanket and manual
+// impls never overlap. Nested DOTS struct fields work transparently:
+// `Option<Inner>` dispatches through `Inner: DotsField` (manual impl),
+// which recursively walks `Inner`'s descriptor.
+
+/// Trait implemented by every type that can occupy a DOTS property slot.
+pub trait DotsField: Sized {
+    /// Encode `&self` to the CBOR encoder.
+    fn dots_encode(&self, e: &mut CborEncoder<'_>) -> Result<(), EncodeError>;
+
+    /// Decode `Self` from the CBOR decoder.
+    fn dots_decode(d: &mut CborDecoder<'_>) -> Result<Self, DecodeError>;
+}
+
+impl<T> DotsField for T
+where
+    T: minicbor::Encode<()> + for<'a> minicbor::Decode<'a, ()>,
+{
+    #[inline]
+    fn dots_encode(&self, e: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
+        <Self as minicbor::Encode<()>>::encode(self, e, &mut ())
+    }
+    #[inline]
+    fn dots_decode(d: &mut CborDecoder<'_>) -> Result<Self, DecodeError> {
+        <Self as minicbor::Decode<'_, ()>>::decode(d, &mut ())
+    }
+}
+
+/// Safe wrapper used by the manual `DotsField` impl that the proc-macro
+/// emits for derived DOTS structs. Encodes via the descriptor-driven path.
+pub fn encode_struct_value(
+    value: &dyn StructValue,
+    encoder: &mut CborEncoder<'_>,
+) -> Result<(), EncodeError> {
+    // SAFETY: `value.data_ptr()` is valid for `&self`'s lifetime, the
+    // descriptor's offsets are within `descriptor().layout().size()`,
+    // and only set properties are dereferenced.
+    unsafe {
+        encode_from_raw(
+            value.descriptor(),
+            value.data_ptr(),
+            value.valid_set(),
+            encoder,
+        )
+    }
+}
+
+/// Safe wrapper used by the manual `DotsField` impl that the proc-macro
+/// emits for derived DOTS structs. Constructs `T::default()` (an
+/// all-`None` instance) and applies wire updates over it.
+pub fn decode_struct_default<T>(decoder: &mut CborDecoder<'_>) -> Result<T, DecodeError>
+where
+    T: StructValue + Default,
+{
+    let mut value = T::default();
+    let descriptor = StructValue::descriptor(&value);
+    let mut valid = PropertySet::EMPTY;
+    let base = (&raw mut value) as *mut u8;
+    // SAFETY: `T: StructValue` enforces layout consistency between
+    // `T` and its descriptor (size, align, offsets); writing through
+    // typed thunks at those offsets is sound.
+    unsafe {
+        decode_into_raw(descriptor, base, &mut valid, decoder)?;
+    }
+    Ok(value)
+}
+
 // ===== Generic per-type thunk helpers =====
 //
 // The proc-macro emits `PropertyVtable` statics whose function-pointer
@@ -285,9 +365,9 @@ fn deallocate(ptr: NonNull<u8>, layout: Layout) {
 //     }
 //
 // Generic-fn-with-explicit-type coerces to a concrete fn pointer,
-// monomorphizing per `T`. This lets every primitive (and `String`)
-// share the same thunk implementations without each property growing
-// its own bespoke functions.
+// monomorphizing per `T`. The bound is `T: DotsField`, so primitives
+// (via blanket impl) and DOTS structs (via emitted manual impl) both
+// fit through the same thunk family.
 
 /// Read whether the `Option<T>` at `ptr` is `Some(_)`.
 ///
@@ -307,14 +387,14 @@ pub unsafe fn opt_is_set<T>(ptr: *const u8) -> bool {
 /// `ptr` must point to a valid `Option<T>` whose discriminant is `Some`.
 pub unsafe fn opt_encode<T>(ptr: *const u8, e: &mut CborEncoder<'_>) -> Result<(), EncodeError>
 where
-    T: minicbor::Encode<()>,
+    T: DotsField,
 {
     // SAFETY: caller-upheld.
     let opt = unsafe { &*(ptr as *const Option<T>) };
     let v = opt
         .as_ref()
         .expect("opt_encode invoked on a None field — caller must check is_set first");
-    minicbor::Encode::encode(v, e, &mut ())
+    v.dots_encode(e)
 }
 
 /// Decode a `T` from the decoder, drop any existing `Option<T>` at `ptr`,
@@ -326,9 +406,9 @@ where
 /// zero-initialized, which is a valid `None` for every supported `T`).
 pub unsafe fn opt_decode<T>(ptr: *mut u8, d: &mut CborDecoder<'_>) -> Result<(), DecodeError>
 where
-    T: for<'a> minicbor::Decode<'a, ()>,
+    T: DotsField,
 {
-    let value: T = T::decode(d, &mut ())?;
+    let value: T = T::dots_decode(d)?;
     let p = ptr as *mut Option<T>;
     // SAFETY: `p` points to a valid `Option<T>` per caller contract;
     // dropping in place is sound because the existing value is

@@ -253,6 +253,27 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 (self as *const Self).cast::<u8>()
             }
         }
+
+        // `DotsField` lets this struct appear as a nested field inside
+        // another DOTS struct. Encoding/decoding go through the same
+        // descriptor-driven path used at the top level. Requires the
+        // user to also `#[derive(Default)]` for nested decode to work.
+        impl ::dots_core::DotsField for #struct_ident {
+            #[inline]
+            fn dots_encode(
+                &self,
+                e: &mut ::dots_core::layout::CborEncoder<'_>,
+            ) -> ::core::result::Result<(), ::dots_core::EncodeError> {
+                ::dots_core::layout::encode_struct_value(self, e)
+            }
+
+            #[inline]
+            fn dots_decode(
+                d: &mut ::dots_core::layout::CborDecoder<'_>,
+            ) -> ::core::result::Result<Self, ::dots_core::DecodeError> {
+                ::dots_core::layout::decode_struct_default::<Self>(d)
+            }
+        }
     };
 
     Ok(output)
@@ -337,13 +358,7 @@ fn parse_field(field: &Field) -> syn::Result<DotsField<'_>> {
         ));
     }
 
-    let kind = field_kind_for(inner_ty).ok_or_else(|| {
-        syn::Error::new(
-            inner_ty.span(),
-            "DotsStruct field type is not a recognized primitive — supported in this iteration: \
-             bool, u8/u16/u32/u64, i8/i16/i32/i64, f32/f64, String, Vec<u8>",
-        )
-    })?;
+    let kind = field_kind_for(inner_ty);
 
     Ok(DotsField {
         ident,
@@ -431,46 +446,57 @@ fn option_inner_type(ty: &Type) -> Option<&Type> {
     Some(inner)
 }
 
-/// Map the syntactic field type to a `FieldKind` expression, or `None`
-/// for unsupported types (which become a compile error in `parse_field`).
-fn field_kind_for(ty: &Type) -> Option<TokenStream2> {
-    let Type::Path(tp) = ty else {
-        return None;
-    };
-    let last = tp.path.segments.last()?;
-    let name = last.ident.to_string();
-    let primitive = match name.as_str() {
-        "bool" => "Bool",
-        "u8" => "U8",
-        "u16" => "U16",
-        "u32" => "U32",
-        "u64" => "U64",
-        "i8" => "I8",
-        "i16" => "I16",
-        "i32" => "I32",
-        "i64" => "I64",
-        "f32" => "F32",
-        "f64" => "F64",
-        "String" => "String",
-        "Vec" => {
-            // Treat Vec<u8> as Bytes; reject other Vec<T> for now.
-            if let PathArguments::AngleBracketed(args) = &last.arguments {
-                let inner = args.args.iter().find_map(|a| match a {
-                    GenericArgument::Type(t) => Some(t),
-                    _ => None,
-                })?;
-                if let Type::Path(inner_tp) = inner {
-                    if inner_tp.path.is_ident("u8") {
-                        return Some(quote! { ::dots_core::FieldKind::Bytes });
-                    }
-                }
+/// Map the syntactic field type to a `FieldKind` expression.
+///
+/// Recognized primitives produce the matching `FieldKind` variant.
+/// `Vec<u8>` becomes `FieldKind::Bytes`. Anything else is treated as
+/// a nested DOTS struct: we emit `FieldKind::Struct(<T>::DESCRIPTOR)`,
+/// which fails to compile if the type is not in fact `#[derive(DotsStruct)]`.
+fn field_kind_for(ty: &Type) -> TokenStream2 {
+    if let Type::Path(tp) = ty {
+        if let Some(last) = tp.path.segments.last() {
+            let name = last.ident.to_string();
+            let primitive = match name.as_str() {
+                "bool" => Some("Bool"),
+                "u8" => Some("U8"),
+                "u16" => Some("U16"),
+                "u32" => Some("U32"),
+                "u64" => Some("U64"),
+                "i8" => Some("I8"),
+                "i16" => Some("I16"),
+                "i32" => Some("I32"),
+                "i64" => Some("I64"),
+                "f32" => Some("F32"),
+                "f64" => Some("F64"),
+                "String" => Some("String"),
+                _ => None,
+            };
+            if let Some(p) = primitive {
+                let kind_ident = Ident::new(p, last.ident.span());
+                return quote! { ::dots_core::FieldKind::#kind_ident };
             }
-            return None;
+            if name == "Vec" && is_vec_of_u8(&last.arguments) {
+                return quote! { ::dots_core::FieldKind::Bytes };
+            }
+            // `Vec<T>` for non-byte T is not yet supported; falls through
+            // to the struct branch, which will fail to compile with a
+            // clear error if `Vec` doesn't have a `DESCRIPTOR`.
         }
-        _ => return None,
+    }
+    // Treat as nested DOTS struct: pull the descriptor from the type.
+    quote! { ::dots_core::FieldKind::Struct(<#ty>::DESCRIPTOR) }
+}
+
+fn is_vec_of_u8(args: &PathArguments) -> bool {
+    let PathArguments::AngleBracketed(a) = args else {
+        return false;
     };
-    let kind_ident = Ident::new(primitive, last.ident.span());
-    Some(quote! { ::dots_core::FieldKind::#kind_ident })
+    let Some(GenericArgument::Type(Type::Path(inner_tp))) =
+        a.args.iter().find(|x| matches!(x, GenericArgument::Type(_)))
+    else {
+        return false;
+    };
+    inner_tp.path.is_ident("u8")
 }
 
 fn build_flags_expr(c: &ContainerAttrs) -> TokenStream2 {

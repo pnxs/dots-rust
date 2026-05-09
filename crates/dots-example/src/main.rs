@@ -15,8 +15,17 @@
 //!
 //! [`AnyStruct`]: dots_core::AnyStruct
 
-use dots_core::{AnyStruct, StructValue, decode_typed_from_slice, dots, encode_to_vec};
+use dots_core::{AnyStruct, FieldKind, StructValue, decode_typed_from_slice, dots, encode_to_vec};
 use dots_derive::DotsStruct;
+
+#[derive(DotsStruct, Default, Debug)]
+#[dots(name = "Address")]
+struct Address {
+    #[dots(tag = 1)]
+    street: Option<String>,
+    #[dots(tag = 2)]
+    number: Option<u32>,
+}
 
 #[derive(DotsStruct, Default, Debug)]
 #[dots(name = "RoundtripData", cached, persistent)]
@@ -32,6 +41,9 @@ struct RoundtripData {
 
     #[dots(tag = 4)]
     flag: Option<bool>,
+
+    #[dots(tag = 5)]
+    home: Option<Address>,
 }
 
 fn print_summary(label: &str, value: &dyn StructValue) {
@@ -45,11 +57,15 @@ fn print_summary(label: &str, value: &dyn StructValue) {
 }
 
 fn main() {
-    // -- Construction via the global `dots!` macro --
+    // -- Construction via the global `dots!` macro, including a nested struct --
     let from_macro = dots!(RoundtripData {
         id: 42_u32,
         payload: "hello",
         counter: 9000_u64,
+        home: Address {
+            street: Some("Lovelace Lane".into()),
+            number: Some(11_u32),
+        },
     });
     print_summary("from dots! macro", &from_macro);
 
@@ -60,13 +76,17 @@ fn main() {
         .with_flag(true);
     print_summary("from builder", &from_builder);
 
-    // -- Inspect the static descriptor --
+    // -- Inspect the static descriptor (including the nested struct's name) --
     println!();
     println!("descriptor properties:");
     for p in RoundtripData::DESCRIPTOR.properties {
+        let kind_label = match p.kind {
+            FieldKind::Struct(d) => format!("Struct({})", d.name),
+            other => format!("{other:?}"),
+        };
         println!(
-            "  tag {:>2}  {:<10}  offset={:<3}  kind={:?}  key={}",
-            p.tag, p.name, p.offset, p.kind, p.is_key
+            "  tag {:>2}  {:<10}  offset={:<3}  kind={:<14}  key={}",
+            p.tag, p.name, p.offset, kind_label, p.is_key
         );
     }
 

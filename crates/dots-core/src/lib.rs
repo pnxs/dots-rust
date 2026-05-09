@@ -25,7 +25,9 @@ mod value;
 pub use descriptor::{
     FieldKind, PropertyDescriptor, PropertyVtable, StructDescriptor, StructFlags,
 };
-pub use layout::{AnyStruct, DecodeError, EncodeError, decode_typed_from_slice, encode_to_vec};
+pub use layout::{
+    AnyStruct, DecodeError, DotsField, EncodeError, decode_typed_from_slice, encode_to_vec,
+};
 pub use property_set::PropertySet;
 pub use value::StructValue;
 
