@@ -22,6 +22,30 @@ use std::path::PathBuf;
 use dots_transport::HostTransceiver;
 use tokio::net::{TcpListener, UnixListener};
 
+/// Removes a UDS socket file when dropped. Kept alive for the
+/// daemon's lifetime so the socket file disappears on Ctrl-C, panic,
+/// or any other early exit — without relying on the next startup's
+/// best-effort cleanup.
+struct UdsSocketGuard {
+    path: PathBuf,
+}
+
+impl Drop for UdsSocketGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            // ENOENT is fine — someone else (or a panic during bind)
+            // may have already removed it.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "failed to remove UDS socket file on shutdown"
+                );
+            }
+        }
+    }
+}
+
 const DEFAULT_ENDPOINT: &str = "tcp://0.0.0.0:11235";
 const DEFAULT_NAME: &str = "dotsd";
 
@@ -45,6 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let host = HostTransceiver::new(daemon_name.clone());
     let mut serve_handles = Vec::new();
+    // Held for the daemon's lifetime; their Drop impls remove the
+    // bound socket files on any exit path (Ctrl-C, panic, etc.).
+    let mut uds_guards: Vec<UdsSocketGuard> = Vec::new();
     for ep in endpoints {
         match ep {
             Endpoint::Tcp(addr) => {
@@ -66,6 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let listener = UnixListener::bind(&path)?;
                 tracing::info!(name = daemon_name, listen = %path.display(),
                     "UDS endpoint ready");
+                uds_guards.push(UdsSocketGuard { path: path.clone() });
                 serve_handles.push(host.serve_unix(listener));
             }
         }

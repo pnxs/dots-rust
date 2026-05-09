@@ -134,6 +134,27 @@ impl HostTransceiver {
             .unwrap_or(0)
     }
 
+    /// Abort all per-guest tasks and clear internal state. Call this
+    /// before dropping the last `Arc<HostTransceiver>` reference if
+    /// the host is embedded in a longer-running app — otherwise the
+    /// per-guest tokio tasks (which each hold an `Arc<Self>`) will
+    /// keep the host alive until each connection naturally ends.
+    ///
+    /// After `shutdown` returns the host stops accepting traffic and
+    /// fan-out becomes a no-op. Intended for graceful in-process
+    /// teardown; the `dotsd` binary doesn't need this because the
+    /// tokio runtime's own shutdown aborts all spawned tasks.
+    pub fn shutdown(&self) {
+        let mut inner = self.inner.lock().expect("host mutex poisoned");
+        let guest_count = inner.guests.len();
+        for (_, record) in inner.guests.drain() {
+            record.task.abort();
+        }
+        inner.groups.clear();
+        inner.pool.clear();
+        tracing::info!(guest_count, "host shutdown — guest tasks aborted");
+    }
+
     /// Names of all groups that have at least one subscriber.
     pub fn group_names(&self) -> Vec<String> {
         self.inner
@@ -386,21 +407,23 @@ impl HostTransceiver {
             return;
         };
 
-        let total = map.len() as u32;
-        let mut remaining = total;
         // Snapshot — clone the entries so we can drop the lock before
-        // the (lock-free) send loop.
+        // the (lock-free) send loop. `header.from_cache` counts down
+        // from `len-1` to `0` so the receiver knows when the last
+        // entry has arrived.
+        let total = map.len();
         let snapshot: Vec<(DotsHeader, DynamicStruct)> = map
             .values()
-            .map(|e| {
-                remaining = remaining.saturating_sub(1);
+            .enumerate()
+            .map(|(i, e)| {
+                let from_cache = (total - 1 - i) as u32;
                 let header = DotsHeader {
                     type_name: Some(type_name.to_string()),
                     sent_time: e.last_update_time,
                     server_sent_time: Some(now_timepoint()),
                     attributes: Some(e.attributes),
                     sender: e.last_update_sender,
-                    from_cache: Some(remaining),
+                    from_cache: Some(from_cache),
                     remove_obj: Some(false),
                     is_from_myself: Some(false),
                 };
@@ -420,7 +443,14 @@ impl HostTransceiver {
             };
             let mut buf = Vec::with_capacity(64);
             txn.encode_into(&mut buf);
-            let _ = record.outbound_tx.send(buf);
+            if record.outbound_tx.send(buf).is_err() {
+                tracing::debug!(
+                    client_id,
+                    type_name,
+                    "outbound channel closed during cache replay; aborting"
+                );
+                return;
+            }
         }
         drop(inner);
         self.send_cache_info_end(client_id, type_name);
@@ -457,8 +487,15 @@ impl HostTransceiver {
     }
 
     fn remove_guest(&self, client_id: u32) {
-        // Snapshot the guest's name before we drop the record, so we
-        // can publish a final DotsClient(state=Closed) below.
+        // 1. Honor `[cleanup]` flags: any cached entry whose
+        //    `last_update_sender` is this guest must be removed and
+        //    its removal fanned out to subscribers. Mirrors C++
+        //    HostTransceiver::handleTransitionImpl.
+        self.cleanup_entries_for_guest(client_id);
+
+        // 2. Drop the guest from the registry and prune empty
+        //    groups. Snapshot the name so we can publish DotsClient
+        //    after the lock is released.
         let name = {
             let mut inner = self.inner.lock().expect("host mutex poisoned");
             let name = inner
@@ -473,7 +510,84 @@ impl HostTransceiver {
             name
         };
         tracing::debug!(client_id, "guest removed");
+
+        // 3. Publish the final DotsClient state.
         self.publish_dots_client(client_id, name, DotsConnectionState::Closed, false);
+    }
+
+    /// Walk the cache pool for entries owned by `client_id` whose
+    /// type carries the `[cleanup]` flag, drop them from the pool,
+    /// and fan a removal transmission out to existing subscribers.
+    /// Mirrors dots-cpp's "auto-remove instances of cleanup-flagged
+    /// types when their publisher disconnects" semantics.
+    fn cleanup_entries_for_guest(&self, client_id: u32) {
+        let to_publish: Vec<Transmission> = {
+            let mut inner = self.inner.lock().expect("host mutex poisoned");
+
+            // Find which type-names are `[cleanup]` flagged. Collect
+            // names first (avoid holding the registry lock while we
+            // hold inner).
+            let cleanup_types: Vec<String> = inner
+                .pool
+                .keys()
+                .filter(|name| {
+                    matches!(
+                        self.registry.lookup(name),
+                        Some(dots_model::DescriptorEntry::Struct(d))
+                            if d.flags.is_cleanup()
+                    )
+                })
+                .cloned()
+                .collect();
+
+            let mut out = Vec::new();
+            for type_name in cleanup_types {
+                let Some(map) = inner.pool.get_mut(&type_name) else {
+                    continue;
+                };
+                let keys_to_remove: Vec<Vec<u8>> = map
+                    .iter()
+                    .filter(|(_, e)| e.last_update_sender == Some(client_id))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in keys_to_remove {
+                    if let Some(entry) = map.remove(&key) {
+                        let header = DotsHeader {
+                            type_name: Some(type_name.clone()),
+                            sent_time: entry.last_update_time,
+                            server_sent_time: Some(now_timepoint()),
+                            attributes: Some(entry.attributes),
+                            sender: Some(HOST_ID),
+                            remove_obj: Some(true),
+                            is_from_myself: Some(false),
+                            ..Default::default()
+                        };
+                        out.push(Transmission {
+                            header,
+                            payload: entry.payload,
+                        });
+                    }
+                }
+                if map.is_empty() {
+                    inner.pool.remove(&type_name);
+                }
+            }
+            out
+        };
+
+        if !to_publish.is_empty() {
+            tracing::debug!(
+                client_id,
+                count = to_publish.len(),
+                "publishing cleanup removals for departing guest"
+            );
+        }
+        for txn in to_publish {
+            let type_name = txn.header.type_name.clone().unwrap_or_default();
+            let mut buf = Vec::with_capacity(64);
+            txn.encode_into(&mut buf);
+            self.fan_out_bytes(&type_name, &buf, HOST_ID);
+        }
     }
 
     /// Publish a [`DotsClient`] record for this guest's current state.
@@ -662,6 +776,17 @@ fn handle_connected_message(
         handle_echo(host, client_id, txn);
         return;
     }
+    if type_name == "DotsDescriptorRequest" {
+        // Direct reply with all matching descriptors; no fan-out.
+        handle_descriptor_request(host, client_id, txn);
+        return;
+    }
+    if type_name == "DotsClearCache" {
+        // Operates on the broker's pool; the resulting removals are
+        // fanned out via the standard publish-with-remove_obj path.
+        handle_clear_cache(host, txn);
+        return;
+    }
     if type_name == "StructDescriptorData" {
         // Register locally so we can decode subsequent payloads of
         // the new type, then fall through to fan-out — other guests
@@ -737,6 +862,149 @@ fn handle_echo(host: &Arc<HostTransceiver>, client_id: u32, txn: &Transmission) 
     let inner = host.inner.lock().expect("host mutex poisoned");
     if let Some(record) = inner.guests.get(&client_id) {
         let _ = record.outbound_tx.send(buf);
+    }
+}
+
+/// Reply to a `DotsDescriptorRequest`: stream all known non-internal
+/// struct descriptors (filtered by whitelist/blacklist) directly to
+/// the requesting guest, terminated by
+/// `DotsCacheInfo{end_descriptor_request: true}`. Mirrors C++
+/// `HostTransceiver::handleDescriptorRequest`.
+fn handle_descriptor_request(
+    host: &Arc<HostTransceiver>,
+    client_id: u32,
+    txn: &Transmission,
+) {
+    let bytes = txn.payload.encode();
+    let req: dots_model::DotsDescriptorRequest = match decode_typed_from_slice(&bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(client_id, error = %e, "failed to decode DotsDescriptorRequest");
+            return;
+        }
+    };
+    let whitelist = req.whitelist.as_deref().unwrap_or(&[]);
+    let blacklist = req.blacklist.as_deref().unwrap_or(&[]);
+
+    // Snapshot of registered struct descriptors. The registry's
+    // entries map already has the dynamic form for each.
+    let descriptors: Vec<Arc<dots_core::DynamicStructDescriptor>> = host
+        .registry
+        .iter_structs()
+        .into_iter()
+        .filter(|d| !d.flags.is_internal())
+        .filter(|d| whitelist.is_empty() || whitelist.iter().any(|w| w == &d.name))
+        .filter(|d| !blacklist.iter().any(|b| b == &d.name))
+        .collect();
+
+    tracing::debug!(
+        client_id,
+        count = descriptors.len(),
+        "replying to DotsDescriptorRequest"
+    );
+
+    for d in &descriptors {
+        let data = StructDescriptorData::from_dynamic(d);
+        let header = DotsHeader {
+            type_name: Some("StructDescriptorData".into()),
+            attributes: Some(data.valid_set().bits()),
+            sender: Some(HOST_ID),
+            sent_time: Some(now_timepoint()),
+            server_sent_time: Some(now_timepoint()),
+            ..Default::default()
+        };
+        let mut buf = Vec::with_capacity(64);
+        encode_typed_transmission_into(&header, &data, &mut buf);
+        send_to_guest(host, client_id, buf);
+    }
+
+    // Terminate with DotsCacheInfo{end_descriptor_request: true}.
+    let info = DotsCacheInfo {
+        end_descriptor_request: Some(true),
+        ..Default::default()
+    };
+    let header = DotsHeader {
+        type_name: Some("DotsCacheInfo".into()),
+        attributes: Some(info.valid_set().bits()),
+        sender: Some(HOST_ID),
+        sent_time: Some(now_timepoint()),
+        server_sent_time: Some(now_timepoint()),
+        ..Default::default()
+    };
+    let mut buf = Vec::with_capacity(32);
+    encode_typed_transmission_into(&header, &info, &mut buf);
+    send_to_guest(host, client_id, buf);
+}
+
+/// Send pre-encoded bytes to a single guest by client_id. Logs at
+/// debug if the channel is closed (the guest is gone).
+fn send_to_guest(host: &Arc<HostTransceiver>, client_id: u32, bytes: Vec<u8>) {
+    let inner = host.inner.lock().expect("host mutex poisoned");
+    if let Some(record) = inner.guests.get(&client_id) {
+        if record.outbound_tx.send(bytes).is_err() {
+            tracing::debug!(client_id, "outbound channel closed; dropping send");
+        }
+    }
+}
+
+/// Handle `DotsClearCache`: drop the named types' entries from the
+/// host's pool and fan out removal transmissions for each cleared
+/// instance. Mirrors C++ `HostTransceiver::handleClearCache`.
+fn handle_clear_cache(host: &Arc<HostTransceiver>, txn: &Transmission) {
+    let bytes = txn.payload.encode();
+    let req: dots_model::DotsClearCache = match decode_typed_from_slice(&bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to decode DotsClearCache");
+            return;
+        }
+    };
+    let Some(type_names) = req.type_names else {
+        tracing::warn!("DotsClearCache missing type_names");
+        return;
+    };
+
+    let to_publish: Vec<Transmission> = {
+        let mut inner = host.inner.lock().expect("host mutex poisoned");
+        let mut out = Vec::new();
+        for type_name in &type_names {
+            let Some(map) = inner.pool.get_mut(type_name) else {
+                continue;
+            };
+            let drained: Vec<(Vec<u8>, CachedEntry)> = std::mem::take(map).into_iter().collect();
+            inner.pool.remove(type_name);
+            for (_, entry) in drained {
+                let header = DotsHeader {
+                    type_name: Some(type_name.clone()),
+                    sent_time: entry.last_update_time,
+                    server_sent_time: Some(now_timepoint()),
+                    attributes: Some(entry.attributes),
+                    sender: Some(HOST_ID),
+                    remove_obj: Some(true),
+                    is_from_myself: Some(false),
+                    ..Default::default()
+                };
+                out.push(Transmission {
+                    header,
+                    payload: entry.payload,
+                });
+            }
+        }
+        out
+    };
+
+    if !to_publish.is_empty() {
+        tracing::debug!(
+            count = to_publish.len(),
+            ?type_names,
+            "publishing DotsClearCache removals"
+        );
+    }
+    for txn in to_publish {
+        let type_name = txn.header.type_name.clone().unwrap_or_default();
+        let mut buf = Vec::with_capacity(64);
+        txn.encode_into(&mut buf);
+        host.fan_out_bytes(&type_name, &buf, HOST_ID);
     }
 }
 

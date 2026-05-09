@@ -699,6 +699,279 @@ async fn registering_a_struct_pulls_in_nested_enum_descriptors() {
 }
 
 #[tokio::test]
+async fn cleanup_flag_drops_publisher_entries_on_disconnect() {
+    // A type with both `cached` and `cleanup` flags: when its
+    // publisher disconnects, the host should drop matching entries
+    // from the pool and fan out a removal to any subscriber.
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "TempClient", cached, cleanup)]
+    struct TempClient {
+        #[dots(tag = 1, key)]
+        id: Option<u32>,
+        #[dots(tag = 2)]
+        label: Option<String>,
+    }
+
+    let host = HostTransceiver::new("cleanup-host");
+    let registry = registry();
+    registry.register_struct_static(TempClient::DESCRIPTOR);
+    host.registry().register_struct_static(TempClient::DESCRIPTOR);
+
+    // Subscriber: stays connected and watches the pool.
+    let (host_io_obs, guest_io_obs) = tokio::io::duplex(8192);
+    host.accept(host_io_obs);
+    let conn_obs = ConnectionBuilder::new(guest_io_obs, "observer", registry.clone())
+        .preload(false)
+        .publishes::<TempClient>()
+        .connect()
+        .await
+        .unwrap();
+    let (gt_obs, driver_obs) = GuestTransceiver::from_connection(
+        "observer".to_string(),
+        registry.clone(),
+        conn_obs,
+    );
+    let mut sub = gt_obs.subscribe_stream::<TempClient>();
+    let driver_obs_handle = tokio::spawn(driver_obs.run());
+
+    // Publisher: connects, publishes one TempClient, then disconnects.
+    let (host_io_pub, guest_io_pub) = tokio::io::duplex(8192);
+    host.accept(host_io_pub);
+    let conn_pub = ConnectionBuilder::new(guest_io_pub, "publisher", registry.clone())
+        .preload(false)
+        .publishes::<TempClient>()
+        .connect()
+        .await
+        .unwrap();
+    let (gt_pub, driver_pub) = GuestTransceiver::from_connection(
+        "publisher".to_string(),
+        registry.clone(),
+        conn_pub,
+    );
+    let driver_pub_handle = tokio::spawn(driver_pub.run());
+
+    gt_pub
+        .publish(&TempClient {
+            id: Some(7),
+            label: Some("hi".into()),
+        })
+        .unwrap();
+
+    // Observer should receive the create.
+    let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("timed out for create")
+        .expect("sub closed");
+    assert_eq!(event.value.id, Some(7));
+    assert_ne!(event.header.remove_obj, Some(true), "create should not be a remove");
+
+    // Wait for the entry to land in the host pool.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.cache_size("TempClient") == 1 {
+            break;
+        }
+    }
+    assert_eq!(host.cache_size("TempClient"), 1);
+
+    // Publisher disconnects: aborting the driver task drops the
+    // Connection<S>, closes the underlying duplex stream, and the
+    // host sees EOF.
+    driver_pub_handle.abort();
+    drop(gt_pub);
+
+    // Observer should receive a removal event for the publisher's entry.
+    let mut got_removal = false;
+    for _ in 0..30 {
+        if let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(100), sub.recv()).await
+        {
+            if event.header.remove_obj == Some(true) && event.value.id == Some(7) {
+                got_removal = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        got_removal,
+        "observer should have received a [cleanup] removal for the disconnected publisher's entry"
+    );
+
+    // Pool should be empty.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.cache_size("TempClient") == 0 {
+            break;
+        }
+    }
+    assert_eq!(host.cache_size("TempClient"), 0);
+
+    gt_obs.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_obs_handle).await;
+}
+
+#[tokio::test]
+async fn shutdown_aborts_guest_tasks_and_clears_state() {
+    let host = HostTransceiver::new("shutdown-host");
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    // Connect two guests so we have something to clean up.
+    let (host_io_a, _guest_io_a) = tokio::io::duplex(8192);
+    let (host_io_b, _guest_io_b) = tokio::io::duplex(8192);
+    host.accept(host_io_a);
+    host.accept(host_io_b);
+
+    // Give the per-guest tasks a tick to register.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.guest_count() == 2 {
+            break;
+        }
+    }
+    assert_eq!(host.guest_count(), 2);
+
+    // Shutdown should drain everything.
+    host.shutdown();
+    assert_eq!(host.guest_count(), 0);
+    assert!(host.group_names().is_empty());
+    assert_eq!(host.cache_size("Pinger"), 0);
+}
+
+#[tokio::test]
+async fn host_replies_to_descriptor_request_with_known_structs() {
+    use dots_model::{DotsCacheInfo, DotsDescriptorRequest, StructDescriptorData};
+
+    let host = HostTransceiver::new("desc-host");
+    let registry = registry();
+    // Register a non-internal struct on the host so we can ask for it.
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+    let conn = ConnectionBuilder::new(guest_io, "asker", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) =
+        GuestTransceiver::from_connection("asker".to_string(), registry.clone(), conn);
+    let mut sub_descriptors = gt.subscribe_stream::<StructDescriptorData>();
+    let mut sub_cache_info = gt.subscribe_stream::<DotsCacheInfo>();
+    let driver_handle = tokio::spawn(driver.run());
+
+    // Wait for subscriptions to land before sending the request.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("StructDescriptorData") >= 1 {
+            break;
+        }
+    }
+
+    gt.publish(&DotsDescriptorRequest::default()).unwrap();
+
+    // Expect at least one StructDescriptorData (Pinger) and a
+    // DotsCacheInfo{end_descriptor_request:true}.
+    let mut got_pinger_descriptor = false;
+    for _ in 0..30 {
+        if let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(100), sub_descriptors.recv()).await
+        {
+            if event.value.name.as_deref() == Some("Pinger") {
+                got_pinger_descriptor = true;
+                break;
+            }
+        }
+    }
+    assert!(got_pinger_descriptor, "expected Pinger descriptor in reply");
+
+    let mut got_end = false;
+    for _ in 0..30 {
+        if let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(100), sub_cache_info.recv()).await
+        {
+            if event.value.end_descriptor_request == Some(true) {
+                got_end = true;
+                break;
+            }
+        }
+    }
+    assert!(got_end, "expected DotsCacheInfo{{end_descriptor_request: true}}");
+
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+}
+
+#[tokio::test]
+async fn dots_clear_cache_drops_named_types_and_publishes_removals() {
+    use dots_model::DotsClearCache;
+
+    let host = HostTransceiver::new("clear-host");
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    // Publisher: publishes two Pingers.
+    let (host_io_pub, guest_io_pub) = tokio::io::duplex(8192);
+    host.accept(host_io_pub);
+    let conn_pub = ConnectionBuilder::new(guest_io_pub, "publisher", registry.clone())
+        .preload(false)
+        .publishes::<Pinger>()
+        .connect()
+        .await
+        .unwrap();
+    let (gt_pub, driver_pub) = GuestTransceiver::from_connection(
+        "publisher".to_string(),
+        registry.clone(),
+        conn_pub,
+    );
+    let driver_pub_handle = tokio::spawn(driver_pub.run());
+
+    gt_pub
+        .publish(&Pinger {
+            id: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+    gt_pub
+        .publish(&Pinger {
+            id: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.cache_size("Pinger") == 2 {
+            break;
+        }
+    }
+    assert_eq!(host.cache_size("Pinger"), 2);
+
+    // Clearer publishes DotsClearCache for "Pinger".
+    gt_pub
+        .publish(&DotsClearCache {
+            type_names: Some(vec!["Pinger".into()]),
+        })
+        .unwrap();
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.cache_size("Pinger") == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        host.cache_size("Pinger"),
+        0,
+        "DotsClearCache should have dropped all Pinger entries"
+    );
+
+    gt_pub.exit();
+    driver_pub_handle.abort();
+}
+
+#[tokio::test]
 async fn host_does_not_loop_back_publisher_to_itself() {
     let host = HostTransceiver::new("test-host");
     let registry = registry();

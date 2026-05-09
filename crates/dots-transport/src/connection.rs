@@ -15,7 +15,6 @@
 //! TCP, Unix domain sockets, or any in-memory pipe like
 //! [`tokio::io::duplex`] for testing.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -701,11 +700,6 @@ pub(crate) trait DispatchEntry: Send {
     /// entry should be removed (e.g. the subscriber's receiver was
     /// dropped); `Ok(true)` if it should be kept.
     fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError>;
-
-    /// Type-erasure escape hatch (currently unused by the dispatch
-    /// path itself; reserved for future introspection).
-    #[allow(dead_code)]
-    fn as_any(&self) -> &dyn Any;
 }
 
 struct TypedDispatchEntry<T> {
@@ -730,10 +724,6 @@ where
         // Send failure means the receiver was dropped between the
         // is_closed check and the send — same outcome, drop the entry.
         Ok(self.sender.send(event).is_ok())
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

@@ -138,6 +138,34 @@ impl Registry {
         self.entries.read().expect("registry poisoned").is_empty()
     }
 
+    /// Snapshot of all registered struct descriptors. Returns an
+    /// owned `Vec` so callers don't have to hold the registry lock
+    /// while iterating.
+    pub fn iter_structs(&self) -> Vec<Arc<dots_core::DynamicStructDescriptor>> {
+        self.entries
+            .read()
+            .expect("registry poisoned")
+            .values()
+            .filter_map(|e| match e {
+                DescriptorEntry::Struct(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Snapshot of all registered enum descriptors.
+    pub fn iter_enums(&self) -> Vec<Arc<dots_core::DynamicEnumDescriptor>> {
+        self.entries
+            .read()
+            .expect("registry poisoned")
+            .values()
+            .filter_map(|e| match e {
+                DescriptorEntry::Enum(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     // ----- Reverse conversion -----
 
     /// Build a `DynamicStructDescriptor` from its wire-form

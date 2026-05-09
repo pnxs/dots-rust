@@ -11,7 +11,6 @@
 //! as the high-level [`crate::App`] — and lets host-side tests run a
 //! guest in the same process without networking.
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -647,9 +646,6 @@ where
         Ok(true)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// Internal helper: register a stream subscription against a given
@@ -695,8 +691,5 @@ where
             value,
         };
         Ok(self.sender.send(event).is_ok())
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }

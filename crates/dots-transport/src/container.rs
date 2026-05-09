@@ -10,7 +10,6 @@
 //! Drop the returned handle to detach the container from the dispatch
 //! loop.
 
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, Weak};
@@ -302,9 +301,5 @@ where
             },
         );
         Ok(true)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }

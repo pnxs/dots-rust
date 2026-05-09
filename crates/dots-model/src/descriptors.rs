@@ -116,6 +116,17 @@ impl StructPropertyData {
             type_id: None,
         }
     }
+
+    /// Build from a runtime-owned `DynamicPropertyDescriptor`.
+    pub fn from_dynamic(p: &dots_core::DynamicPropertyDescriptor) -> Self {
+        Self {
+            name: Some(p.name.clone()),
+            tag: Some(p.tag),
+            is_key: Some(p.is_key),
+            type_name: Some(dyn_field_kind_type_name(&p.kind)),
+            type_id: None,
+        }
+    }
 }
 
 /// Free-form documentation attached to a struct descriptor.
@@ -172,6 +183,26 @@ impl StructDescriptorData {
             documentation: None,
             // We don't track scope on the Rust side yet — leave it
             // unset on the wire; peers default to their own policy.
+            scope: None,
+            flags: Some(DotsStructFlags::from_static(d.flags)),
+            publisher_id: None,
+        }
+    }
+
+    /// Build from a runtime-owned `DynamicStructDescriptor`. Used by
+    /// the broker's `DotsDescriptorRequest` handler to re-emit a
+    /// previously registered descriptor without needing the original
+    /// `&'static` reference.
+    pub fn from_dynamic(d: &dots_core::DynamicStructDescriptor) -> Self {
+        Self {
+            name: Some(d.name.clone()),
+            properties: Some(
+                d.properties
+                    .iter()
+                    .map(StructPropertyData::from_dynamic)
+                    .collect(),
+            ),
+            documentation: None,
             scope: None,
             flags: Some(DotsStructFlags::from_static(d.flags)),
             publisher_id: None,
@@ -269,5 +300,33 @@ pub fn field_kind_type_name(kind: &FieldKind) -> String {
         FieldKind::Vec(inner) => format!("vector<{}>", field_kind_type_name(inner)),
         FieldKind::Struct(d) => d.name.into(),
         FieldKind::Enum(d) => d.name.into(),
+    }
+}
+
+/// Same as [`field_kind_type_name`] but for the runtime-owned
+/// [`DynamicFieldKind`] (descriptors received over the wire). Used
+/// when the broker re-emits a known struct's descriptor in response
+/// to `DotsDescriptorRequest`.
+pub fn dyn_field_kind_type_name(kind: &dots_core::DynamicFieldKind) -> String {
+    use dots_core::DynamicFieldKind;
+    match kind {
+        DynamicFieldKind::Bool => "bool".into(),
+        DynamicFieldKind::U8 => "uint8".into(),
+        DynamicFieldKind::U16 => "uint16".into(),
+        DynamicFieldKind::U32 => "uint32".into(),
+        DynamicFieldKind::U64 => "uint64".into(),
+        DynamicFieldKind::I8 => "int8".into(),
+        DynamicFieldKind::I16 => "int16".into(),
+        DynamicFieldKind::I32 => "int32".into(),
+        DynamicFieldKind::I64 => "int64".into(),
+        DynamicFieldKind::F32 => "float32".into(),
+        DynamicFieldKind::F64 => "float64".into(),
+        DynamicFieldKind::String => "string".into(),
+        DynamicFieldKind::Bytes => "vector<uint8>".into(),
+        DynamicFieldKind::Timepoint => "timepoint".into(),
+        DynamicFieldKind::Duration => "duration".into(),
+        DynamicFieldKind::Vec(inner) => format!("vector<{}>", dyn_field_kind_type_name(inner)),
+        DynamicFieldKind::Struct(d) => d.name.clone(),
+        DynamicFieldKind::Enum(d) => d.name.clone(),
     }
 }
