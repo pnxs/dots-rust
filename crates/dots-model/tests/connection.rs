@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use dots_core::{DynamicStruct, decode_typed_from_slice, encode_to_vec};
+use dots_core::{DynamicStruct, Timepoint, decode_typed_from_slice, encode_to_vec};
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgError,
     DotsMsgHello, Registry, StructDescriptorData,
@@ -14,8 +14,8 @@ use dots_model::{
 fn dots_header_roundtrip() {
     let original = DotsHeader {
         type_name: Some("MyType".into()),
-        sent_time: Some(1_700_000_000.0),
-        server_sent_time: Some(1_700_000_000.5),
+        sent_time: Some(Timepoint(1_700_000_000.0)),
+        server_sent_time: Some(Timepoint(1_700_000_000.5)),
         attributes: Some(0b0000_0000_0000_1011),
         sender: Some(42),
         from_cache: Some(7),
@@ -162,7 +162,7 @@ fn dots_header_decodes_via_wire_only_path() {
     let original = DotsHeader {
         type_name: Some("Sample".into()),
         sender: Some(123),
-        sent_time: Some(2_500_000_000.0),
+        sent_time: Some(Timepoint(2_500_000_000.0)),
         ..Default::default()
     };
     let typed_bytes = encode_to_vec(&original);

@@ -21,6 +21,7 @@ mod descriptor;
 pub mod dynamic;
 pub mod layout;
 mod property_set;
+mod temporal;
 mod value;
 
 pub use descriptor::{
@@ -37,6 +38,7 @@ pub use layout::{
     encode_key_into, encode_to_vec,
 };
 pub use property_set::PropertySet;
+pub use temporal::{Duration, Timepoint};
 pub use value::StructValue;
 
 /// Re-export of the `minicbor` crate so derived code and downstream users

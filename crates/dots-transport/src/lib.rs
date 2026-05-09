@@ -20,12 +20,13 @@
 //! ```
 
 mod app;
+mod auth;
 mod codec;
 mod connection;
 mod container;
 mod error;
 
-pub use app::{App, AppError, Client, ClientClosed, SubscriptionHandle};
+pub use app::{App, AppError, Client, ClientClosed, SubscriptionHandle, now_timepoint};
 pub use codec::TransmissionCodec;
 pub use connection::{Connection, ConnectionBuilder, ConnectionError, Event, Subscription};
 pub use container::{CloneInfo, Container, ContainerEntry, ContainerHandle, Operation};

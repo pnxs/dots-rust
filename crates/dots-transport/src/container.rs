@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, Weak};
 
-use dots_core::{StructValue, decode_typed_from_slice, encode_key_bytes};
+use dots_core::{StructValue, Timepoint, decode_typed_from_slice, encode_key_bytes};
 use dots_model::Transmission;
 
 use crate::connection::{DispatchEntry, DispatchState};
@@ -25,9 +25,9 @@ use crate::connection::{DispatchEntry, DispatchState};
 #[derive(Debug, Clone, PartialEq)]
 pub struct CloneInfo {
     pub last_operation: Operation,
-    pub last_update_time: Option<f64>,
+    pub last_update_time: Option<Timepoint>,
     pub last_update_sender: Option<u32>,
-    pub created_time: Option<f64>,
+    pub created_time: Option<Timepoint>,
     pub created_sender: Option<u32>,
 }
 

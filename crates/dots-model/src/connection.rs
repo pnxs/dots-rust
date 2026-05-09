@@ -16,6 +16,7 @@
 //! [`dots_core::PropertySet`]) can come later without any wire-format
 //! change.
 
+use dots_core::Timepoint;
 use dots_derive::{DotsEnum, DotsStruct};
 
 /// Per-transmission metadata envelope.
@@ -49,13 +50,12 @@ pub struct DotsHeader {
     /// Name of the payload's type.
     #[dots(tag = 1)]
     pub type_name: Option<String>,
-    /// Originating client's send timestamp — fractional seconds since
-    /// the Unix epoch.
+    /// Originating client's send timestamp.
     #[dots(tag = 2)]
-    pub sent_time: Option<f64>,
-    /// Server's forward timestamp — same encoding as `sent_time`.
+    pub sent_time: Option<Timepoint>,
+    /// Server's forward timestamp.
     #[dots(tag = 7)]
-    pub server_sent_time: Option<f64>,
+    pub server_sent_time: Option<Timepoint>,
     /// Bitmask of which payload properties are valid. Redundant with
     /// the payload's CBOR map (sparse already), but explicit for
     /// peers that prefer to consult a single field.

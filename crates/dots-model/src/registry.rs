@@ -267,6 +267,9 @@ impl Registry {
             "float32" => return Ok(DynamicFieldKind::F32),
             "float64" => return Ok(DynamicFieldKind::F64),
             "string" => return Ok(DynamicFieldKind::String),
+            "timepoint" => return Ok(DynamicFieldKind::Timepoint),
+            "duration" => return Ok(DynamicFieldKind::Duration),
+            "steady_timepoint" => return Ok(DynamicFieldKind::Timepoint),
             _ => {}
         }
 

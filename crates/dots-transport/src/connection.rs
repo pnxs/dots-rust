@@ -141,9 +141,10 @@ where
     /// and cache preload are skipped. For typical clients use
     /// [`ConnectionBuilder`] instead, which handles the full lifecycle.
     ///
-    /// Authentication is not supported yet; if the server's
-    /// [`DotsMsgHello`]`.authentication_required` is `Some(true)`, this
-    /// returns [`ConnectionError::AuthenticationNotSupported`].
+    /// If the broker requires authentication and no secret was
+    /// configured (via [`ConnectionBuilder::with_auth`]), this returns
+    /// [`ConnectionError::AuthenticationNotSupported`]. Use the
+    /// builder to opt in to challenge-response.
     pub async fn establish(
         stream: S,
         client_name: &str,
@@ -176,25 +177,51 @@ where
         &mut self,
         client_name: &str,
         request_preload: bool,
+        auth_secret: Option<&str>,
     ) -> Result<(), ConnectionError> {
+        tracing::debug!(
+            client_name,
+            request_preload,
+            "starting initial handshake"
+        );
         let txn = self.read_next().await?;
         let hello: DotsMsgHello = self.expect_typed(&txn, "DotsMsgHello")?;
-        if hello.authentication_required == Some(true) {
-            return Err(ConnectionError::AuthenticationNotSupported);
-        }
+        tracing::info!(
+            server_name = ?hello.server_name,
+            auth_required = ?hello.authentication_required,
+            "received DotsMsgHello"
+        );
+        let auth_required = hello.authentication_required == Some(true);
+        let auth_challenge = hello.auth_challenge.unwrap_or(0);
         self.server_name = hello.server_name;
 
-        let connect = DotsMsgConnect {
+        let mut connect = DotsMsgConnect {
             client_name: Some(client_name.into()),
             preload_cache: Some(request_preload),
             ..Default::default()
         };
+        if auth_required {
+            let Some(secret) = auth_secret else {
+                return Err(ConnectionError::AuthenticationNotSupported);
+            };
+            let cnonce = crate::auth::generate_cnonce();
+            let response =
+                crate::auth::compute_response(auth_challenge, &cnonce, client_name, secret);
+            tracing::debug!("computed auth challenge response");
+            connect.auth_challenge_response = Some(response);
+            connect.cnonce = Some(cnonce);
+        }
         self.send_typed("DotsMsgConnect", &connect).await?;
+        tracing::debug!(request_preload, "sent DotsMsgConnect");
 
         let txn = self.read_next().await?;
         let response: DotsMsgConnectResponse =
             self.expect_typed(&txn, "DotsMsgConnectResponse")?;
         if response.accepted != Some(true) {
+            tracing::warn!(
+                server_name = ?response.server_name,
+                "connection rejected by broker"
+            );
             return Err(ConnectionError::ConnectionRejected {
                 server_name: response.server_name,
             });
@@ -205,6 +232,11 @@ where
         } else {
             DotsConnectionState::Connected
         };
+        tracing::info!(
+            client_id = ?self.client_id,
+            state = ?self.state,
+            "handshake accepted"
+        );
         Ok(())
     }
 
@@ -225,6 +257,7 @@ where
                 actual: self.state,
             });
         }
+        tracing::debug!("signalling preload_client_finished and draining cache");
 
         let connect = DotsMsgConnect {
             preload_client_finished: Some(true),
@@ -247,12 +280,18 @@ where
                     self.expect_typed(&txn, "DotsMsgConnectResponse")?;
                 if response.preload_finished == Some(true) {
                     self.state = DotsConnectionState::Connected;
+                    tracing::info!("preload finished, connection in Connected state");
                     return Ok(());
                 }
-                // Some other (intermediate?) response; continue.
+                tracing::debug!("intermediate ConnectResponse during preload");
                 continue;
             }
             // Cache event — fan out to subscriptions.
+            tracing::trace!(
+                type_name,
+                from_cache = ?txn.header.from_cache,
+                "preload cache event"
+            );
             self.dispatch_to_subscribers(&txn);
         }
     }
@@ -684,6 +723,9 @@ pub struct ConnectionBuilder<S> {
     registry: Arc<Registry>,
     preload: bool,
     pending: Vec<PendingDescriptor>,
+    /// Shared secret for SHA-256 challenge-response authentication.
+    /// `None` means the client will reject any auth-required Hello.
+    auth_secret: Option<String>,
 }
 
 enum PendingDescriptor {
@@ -702,7 +744,20 @@ where
             registry,
             preload: true,
             pending: Vec::new(),
+            auth_secret: None,
         }
+    }
+
+    /// Configure a shared secret for SHA-256 challenge-response
+    /// authentication. If the broker's `DotsMsgHello` indicates auth is
+    /// required, the client computes the digest as
+    /// `SHA256(SHA256(client_name || "::" || secret) || ":" ||
+    ///  auth_challenge_le || ":" || cnonce)` and sends it in
+    /// `DotsMsgConnect.auth_challenge_response`. Wire-compatible with
+    /// dots-cpp's `LegacyAuthManager`.
+    pub fn with_auth(mut self, secret: impl Into<String>) -> Self {
+        self.auth_secret = Some(secret.into());
+        self
     }
 
     /// Whether to request the broker's cache preload during connect.
@@ -746,8 +801,12 @@ where
         let framed = Framed::new(self.stream, codec);
         let mut conn = Connection::from_framed(framed);
 
-        conn.run_initial_handshake(&self.client_name, self.preload)
-            .await?;
+        conn.run_initial_handshake(
+            &self.client_name,
+            self.preload,
+            self.auth_secret.as_deref(),
+        )
+        .await?;
 
         // After the initial Connect/ConnectResponse, publish each
         // declared type's descriptor data so the broker can route /

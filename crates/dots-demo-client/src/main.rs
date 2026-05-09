@@ -13,6 +13,13 @@
 //! cargo run --bin dots-demo-client                         # default 127.0.0.1:11235
 //! cargo run --bin dots-demo-client -- 127.0.0.1:11235 bob  # second client
 //! ```
+//!
+//! Logging is via `tracing` + `tracing-subscriber`. Override the default
+//! `info` level with `RUST_LOG`, e.g.
+//!
+//! ```text
+//! RUST_LOG=dots_transport=debug cargo run --bin dots-demo-client
+//! ```
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,11 +44,21 @@ const DEFAULT_NAME: &str = "dots-demo-client";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Default log level: info. Override via RUST_LOG env var, e.g.
+    //   RUST_LOG=dots_transport=debug,dots_demo_client=info cargo run ...
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(true)
+        .compact()
+        .init();
+
     let mut args = std::env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| DEFAULT_ADDR.into());
     let name = args.next().unwrap_or_else(|| DEFAULT_NAME.into());
 
-    eprintln!("connecting to {addr} as `{name}` ...");
     let app = App::connect(&addr, &name).await?;
 
     // Container — typed local mirror of the broker's Pinger cache.

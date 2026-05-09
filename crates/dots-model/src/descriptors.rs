@@ -264,6 +264,8 @@ pub fn field_kind_type_name(kind: &FieldKind) -> String {
         FieldKind::F64 => "float64".into(),
         FieldKind::String => "string".into(),
         FieldKind::Bytes => "vector<uint8>".into(),
+        FieldKind::Timepoint => "timepoint".into(),
+        FieldKind::Duration => "duration".into(),
         FieldKind::Vec(inner) => format!("vector<{}>", field_kind_type_name(inner)),
         FieldKind::Struct(d) => d.name.into(),
         FieldKind::Enum(d) => d.name.into(),

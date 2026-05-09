@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use dots_core::{StructValue, encode_to_vec};
+use dots_core::{StructValue, Timepoint, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsHeader, DotsMsgConnectResponse, DotsMsgHello, Registry, Transmission,
@@ -83,7 +83,7 @@ async fn push_pinger(
         type_name: Some("Pinger".into()),
         attributes: Some(pinger.valid_set().bits()),
         sender,
-        sent_time,
+        sent_time: sent_time.map(Timepoint),
         remove_obj: Some(remove),
         ..Default::default()
     };
@@ -156,10 +156,10 @@ async fn container_create_then_update_preserves_created_metadata() {
     assert_eq!(entry.value.message.as_deref(), Some("second"));
     assert_eq!(entry.clone_info.last_operation, Operation::Update);
     assert_eq!(entry.clone_info.last_update_sender, Some(22));
-    assert_eq!(entry.clone_info.last_update_time, Some(200.0));
+    assert_eq!(entry.clone_info.last_update_time, Some(Timepoint(200.0)));
     // created_* preserved from the first publish.
     assert_eq!(entry.clone_info.created_sender, Some(11));
-    assert_eq!(entry.clone_info.created_time, Some(100.0));
+    assert_eq!(entry.clone_info.created_time, Some(Timepoint(100.0)));
 
     drop(conn);
     server.await.unwrap();

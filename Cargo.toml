@@ -26,6 +26,11 @@ tokio = { version = "1", default-features = false }
 tokio-util = { version = "0.7", default-features = false }
 bytes = "1"
 
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+
+sha2 = { version = "0.10", default-features = false }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+
 [workspace.lints.rust]
 # Unsafe is denied workspace-wide; the only opt-in is dots-core's internal
 # `layout` module, which holds the audited raw-memory codec primitives

@@ -33,7 +33,9 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use dots_core::{EnumDescriptor, StructDescriptor, StructValue, decode_typed_from_slice};
+use dots_core::{
+    EnumDescriptor, StructDescriptor, StructValue, Timepoint, decode_typed_from_slice,
+};
 use dots_model::{
     DotsHeader, DotsMember, DotsMemberEvent, EnumDescriptorData, Registry, StructDescriptorData,
     encode_typed_transmission_into,
@@ -172,14 +174,41 @@ impl App {
     /// `preload = true`). Returns an `App` ready for the user to add
     /// subscriptions, then `run()`.
     pub async fn connect(addr: &str, client_name: &str) -> Result<App, AppError> {
+        Self::connect_inner(addr, client_name, None).await
+    }
+
+    /// Same as [`connect`](Self::connect) but supplies a shared secret
+    /// for SHA-256 challenge-response authentication. Use this for
+    /// brokers that have `DotsAuthentication` rules requiring auth.
+    pub async fn connect_with_auth(
+        addr: &str,
+        client_name: &str,
+        secret: &str,
+    ) -> Result<App, AppError> {
+        Self::connect_inner(addr, client_name, Some(secret)).await
+    }
+
+    async fn connect_inner(
+        addr: &str,
+        client_name: &str,
+        secret: Option<&str>,
+    ) -> Result<App, AppError> {
+        tracing::info!(
+            addr,
+            client_name,
+            with_auth = secret.is_some(),
+            "connecting to dotsd"
+        );
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
 
         let registry = Arc::new(dots_model::registry_with_internal_types());
-        let conn = ConnectionBuilder::new(stream, client_name, registry.clone())
-            .preload(true)
-            .connect()
-            .await?;
+        let mut builder =
+            ConnectionBuilder::new(stream, client_name, registry.clone()).preload(true);
+        if let Some(s) = secret {
+            builder = builder.with_auth(s);
+        }
+        let conn = builder.connect().await?;
 
         let dispatch = conn.dispatch_handle();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -301,10 +330,6 @@ impl App {
             .iter()
             .map(|d| d.0)
             .collect();
-        for d in pending_structs {
-            let data = StructDescriptorData::from_static(d);
-            conn.send_typed("StructDescriptorData", &data).await?;
-        }
         let pending_enums: Vec<&'static EnumDescriptor> = self
             .state
             .pending_enums
@@ -313,6 +338,15 @@ impl App {
             .iter()
             .map(|d| d.0)
             .collect();
+        tracing::debug!(
+            structs = pending_structs.len(),
+            enums = pending_enums.len(),
+            "publishing pending type descriptors"
+        );
+        for d in pending_structs {
+            let data = StructDescriptorData::from_static(d);
+            conn.send_typed("StructDescriptorData", &data).await?;
+        }
         for d in pending_enums {
             let data = EnumDescriptorData::from_static(d);
             conn.send_typed("EnumDescriptorData", &data).await?;
@@ -329,24 +363,40 @@ impl App {
         let (framed, dispatch) = conn.into_parts();
         let (mut sink, mut stream) = framed.split();
 
+        tracing::debug!("entering App::run main dispatch loop");
         loop {
             if self.state.exit_flag.load(Ordering::Acquire) {
+                tracing::info!("exit flag set, leaving run loop");
                 break;
             }
             tokio::select! {
                 biased;
                 maybe_in = stream.next() => match maybe_in {
                     Some(Ok(txn)) => {
+                        tracing::trace!(
+                            type_name = ?txn.header.type_name,
+                            sender = ?txn.header.sender,
+                            "dispatching incoming transmission"
+                        );
                         Connection::<TcpStream>::dispatch_external(&dispatch, &txn);
                     }
-                    Some(Err(e)) => return Err(e.into()),
-                    None => break,
+                    Some(Err(e)) => {
+                        tracing::error!(error = %e, "transport error in run loop");
+                        return Err(e.into());
+                    }
+                    None => {
+                        tracing::info!("server closed connection");
+                        break;
+                    }
                 },
                 maybe_out = outbound_rx.recv() => match maybe_out {
                     Some(bytes) => {
                         SinkExt::<Vec<u8>>::send(&mut sink, bytes).await?;
                     }
-                    None => break,
+                    None => {
+                        tracing::debug!("outbound channel closed");
+                        break;
+                    }
                 }
             }
         }
@@ -472,12 +522,24 @@ impl AppState {
             type_name: Some(type_name.into()),
             attributes: Some(value.valid_set().bits()),
             sender: *self.client_id.lock().expect("client_id mutex poisoned"),
+            sent_time: Some(now_timepoint()),
             ..Default::default()
         };
         let mut bytes = Vec::with_capacity(64);
         encode_typed_transmission_into(&header, value, &mut bytes);
         self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
     }
+}
+
+/// Wall-clock-now as a [`Timepoint`]. Lives here (not in dots-core)
+/// because dots-core is `no_std`.
+pub fn now_timepoint() -> Timepoint {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    Timepoint(secs)
 }
 
 // ===== Callback dispatch entry =====

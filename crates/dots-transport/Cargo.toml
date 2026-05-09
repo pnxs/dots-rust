@@ -15,11 +15,15 @@ bytes.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "macros", "net", "rt", "signal"] }
 tokio-util = { workspace = true, features = ["codec"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tracing.workspace = true
+sha2.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 dots-derive.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["codec"] }
+sha2.workspace = true
 
 [lints]
 workspace = true

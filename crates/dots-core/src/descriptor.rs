@@ -37,6 +37,10 @@ pub enum FieldKind {
     F32, F64,
     String,
     Bytes,
+    /// Wall-clock time (`f64` seconds since Unix epoch on the wire).
+    Timepoint,
+    /// Fractional-second duration (`f64` seconds on the wire).
+    Duration,
     /// Homogeneous array of `inner`.
     Vec(&'static FieldKind),
     /// Nested DOTS struct, statically known at compile time.
@@ -52,7 +56,8 @@ impl PartialEq for FieldKind {
             (Bool, Bool) | (U8, U8) | (U16, U16) | (U32, U32) | (U64, U64)
             | (I8, I8) | (I16, I16) | (I32, I32) | (I64, I64)
             | (F32, F32) | (F64, F64)
-            | (String, String) | (Bytes, Bytes) => true,
+            | (String, String) | (Bytes, Bytes)
+            | (Timepoint, Timepoint) | (Duration, Duration) => true,
             (Vec(a), Vec(b)) => core::ptr::eq(*a, *b) || a == b,
             (Struct(a), Struct(b)) => core::ptr::eq(*a, *b),
             (Enum(a), Enum(b)) => core::ptr::eq(*a, *b),

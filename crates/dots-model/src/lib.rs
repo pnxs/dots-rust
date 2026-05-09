@@ -18,6 +18,7 @@
 //!   `DynamicEnumDescriptor` instances.
 
 pub mod connection;
+pub mod daemon;
 pub mod descriptors;
 pub mod framing;
 pub mod registry;
@@ -26,6 +27,9 @@ pub use connection::{
     DotsCacheInfo, DotsClearCache, DotsCloneInformation, DotsConnectionState, DotsDescriptorRequest,
     DotsEcho, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect, DotsMsgConnectResponse,
     DotsMsgError, DotsMsgHello, DotsMt,
+};
+pub use daemon::{
+    DotsCacheStatus, DotsClient, DotsDaemonStatus, DotsResourceUsage, DotsStatistics,
 };
 pub use descriptors::{
     DotsStructFlags, DotsStructScope, EnumDescriptorData, EnumElementDescriptor,
@@ -76,6 +80,13 @@ pub fn register_dots_internal_types(reg: &mut Registry) {
     reg.register_struct_static(StructDescriptorData::DESCRIPTOR);
     reg.register_struct_static(EnumElementDescriptor::DESCRIPTOR);
     reg.register_struct_static(EnumDescriptorData::DESCRIPTOR);
+
+    // Daemon-side records (broker introspection).
+    reg.register_struct_static(daemon::DotsClient::DESCRIPTOR);
+    reg.register_struct_static(daemon::DotsStatistics::DESCRIPTOR);
+    reg.register_struct_static(daemon::DotsCacheStatus::DESCRIPTOR);
+    reg.register_struct_static(daemon::DotsResourceUsage::DESCRIPTOR);
+    reg.register_struct_static(daemon::DotsDaemonStatus::DESCRIPTOR);
 }
 
 /// One-line constructor: a [`Registry`] pre-populated with the DOTS-

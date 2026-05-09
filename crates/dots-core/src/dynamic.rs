@@ -42,6 +42,8 @@ pub enum DynamicFieldKind {
     F32, F64,
     String,
     Bytes,
+    Timepoint,
+    Duration,
     Vec(Box<DynamicFieldKind>),
     Struct(Arc<DynamicStructDescriptor>),
     Enum(Arc<DynamicEnumDescriptor>),
@@ -159,6 +161,8 @@ impl DynamicFieldKind {
             FieldKind::F64 => Self::F64,
             FieldKind::String => Self::String,
             FieldKind::Bytes => Self::Bytes,
+            FieldKind::Timepoint => Self::Timepoint,
+            FieldKind::Duration => Self::Duration,
             FieldKind::Vec(inner) => Self::Vec(Box::new(Self::from_static(inner))),
             FieldKind::Struct(inner) => {
                 Self::Struct(Arc::new(DynamicStructDescriptor::from_static(inner)))
@@ -195,6 +199,10 @@ pub enum DynamicValue {
     /// containing property's `DynamicFieldKind::Enum`, so consumers
     /// look up the element name by walking back to the descriptor.
     Enum(i32),
+    /// Wall-clock timestamp (fractional seconds since Unix epoch).
+    Timepoint(f64),
+    /// Fractional-second duration.
+    Duration(f64),
 }
 
 /// A wire-only struct value: descriptor + sparse property map.
@@ -313,6 +321,7 @@ fn encode_value(value: &DynamicValue, e: &mut CborEncoder<'_>) -> Result<(), Enc
         }
         DynamicValue::Struct(inner) => encode_struct(inner, e),
         DynamicValue::Enum(v) => e.i32(*v).map(|_| ()),
+        DynamicValue::Timepoint(v) | DynamicValue::Duration(v) => e.f64(*v).map(|_| ()),
     }
 }
 
@@ -381,5 +390,7 @@ fn decode_value(
             })))
         }
         DynamicFieldKind::Enum(_) => Ok(DynamicValue::Enum(d.i32()?)),
+        DynamicFieldKind::Timepoint => Ok(DynamicValue::Timepoint(d.f64()?)),
+        DynamicFieldKind::Duration => Ok(DynamicValue::Duration(d.f64()?)),
     }
 }

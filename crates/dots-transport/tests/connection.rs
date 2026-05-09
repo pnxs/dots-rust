@@ -13,7 +13,7 @@ use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
     Registry, Transmission, encode_typed_transmission, registry_with_internal_types,
 };
-use dots_transport::{Connection, ConnectionError, TransmissionCodec};
+use dots_transport::{Connection, ConnectionBuilder, ConnectionError, TransmissionCodec};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio_util::codec::Framed;
@@ -158,6 +158,83 @@ async fn establish_rejects_when_server_demands_auth() {
         Err(ConnectionError::AuthenticationNotSupported) => {}
         other => panic!("expected AuthenticationNotSupported, got {other:?}"),
     }
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn establish_with_auth_secret_completes_handshake() {
+    use sha2::{Digest, Sha256};
+
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let reg = registry();
+    let nonce: u64 = 0x1122_3344_5566_7788;
+    let secret = "shared-secret";
+    let client_name = "auth-client";
+
+    let server_reg = reg.clone();
+    let server = tokio::spawn(async move {
+        let codec = TransmissionCodec::new(server_reg.clone());
+        let mut framed = Framed::new(server_io, codec);
+
+        let hello = DotsMsgHello {
+            server_name: Some("auth-server".into()),
+            auth_challenge: Some(nonce),
+            authentication_required: Some(true),
+        };
+        framed
+            .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
+            .await
+            .unwrap();
+
+        // Receive the client's Connect, recompute the expected digest,
+        // and assert the auth_challenge_response matches.
+        let connect_txn = framed.next().await.unwrap().unwrap();
+        assert_eq!(
+            connect_txn.header.type_name.as_deref(),
+            Some("DotsMsgConnect")
+        );
+        let bytes = connect_txn.payload.encode();
+        let connect: DotsMsgConnect = dots_core::decode_typed_from_slice(&bytes).unwrap();
+        let cnonce = connect.cnonce.clone().expect("cnonce present");
+        let response = connect.auth_challenge_response.clone().expect("response present");
+
+        // Re-derive the expected digest server-side.
+        let mut a1 = Sha256::new();
+        a1.update(client_name.as_bytes());
+        a1.update(b"::");
+        a1.update(secret.as_bytes());
+        let a1 = a1.finalize();
+        let mut h = Sha256::new();
+        h.update(a1);
+        h.update(b":");
+        h.update(nonce.to_le_bytes());
+        h.update(b":");
+        h.update(cnonce.as_bytes());
+        let bytes = h.finalize();
+        let expected: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(response, expected);
+
+        let resp = DotsMsgConnectResponse {
+            server_name: Some("auth-server".into()),
+            client_id: Some(13),
+            accepted: Some(true),
+            preload: Some(false),
+            ..Default::default()
+        };
+        framed
+            .send(dynamic_for(&server_reg, "DotsMsgConnectResponse", &resp))
+            .await
+            .unwrap();
+    });
+
+    let conn = ConnectionBuilder::new(client_io, client_name, reg)
+        .preload(false)
+        .with_auth(secret)
+        .connect()
+        .await
+        .unwrap();
+    assert_eq!(conn.client_id(), Some(13));
+    drop(conn);
     server.await.unwrap();
 }
 
