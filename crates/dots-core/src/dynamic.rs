@@ -24,7 +24,7 @@ use alloc::{
 };
 
 use crate::{
-    FieldKind, PropertySet, StructDescriptor, StructFlags,
+    EnumDescriptor, FieldKind, PropertySet, StructDescriptor, StructFlags,
     layout::{CborDecoder, CborEncoder, DecodeError, EncodeError},
 };
 
@@ -44,6 +44,7 @@ pub enum DynamicFieldKind {
     Bytes,
     Vec(Box<DynamicFieldKind>),
     Struct(Arc<DynamicStructDescriptor>),
+    Enum(Arc<DynamicEnumDescriptor>),
 }
 
 /// Owned property metadata.
@@ -64,6 +65,44 @@ pub struct DynamicStructDescriptor {
     pub name: String,
     pub flags: StructFlags,
     pub properties: Vec<DynamicPropertyDescriptor>,
+}
+
+/// Owned enum element metadata.
+#[derive(Debug, Clone)]
+pub struct DynamicEnumElement {
+    pub name: String,
+    pub tag: u32,
+    pub value: i32,
+}
+
+/// Owned enum metadata.
+#[derive(Debug, Clone)]
+pub struct DynamicEnumDescriptor {
+    pub name: String,
+    pub elements: Vec<DynamicEnumElement>,
+}
+
+impl DynamicEnumDescriptor {
+    /// Look up a variant by its wire `int32` value.
+    pub fn element_by_value(&self, value: i32) -> Option<&DynamicEnumElement> {
+        self.elements.iter().find(|e| e.value == value)
+    }
+
+    /// Project a static enum descriptor into the dynamic shape.
+    pub fn from_static(d: &'static EnumDescriptor) -> Self {
+        Self {
+            name: d.name.to_string(),
+            elements: d
+                .elements
+                .iter()
+                .map(|e| DynamicEnumElement {
+                    name: e.name.to_string(),
+                    tag: e.tag,
+                    value: e.value,
+                })
+                .collect(),
+        }
+    }
 }
 
 impl DynamicStructDescriptor {
@@ -124,6 +163,9 @@ impl DynamicFieldKind {
             FieldKind::Struct(inner) => {
                 Self::Struct(Arc::new(DynamicStructDescriptor::from_static(inner)))
             }
+            FieldKind::Enum(inner) => {
+                Self::Enum(Arc::new(DynamicEnumDescriptor::from_static(inner)))
+            }
         }
     }
 }
@@ -149,6 +191,10 @@ pub enum DynamicValue {
     /// Nested struct value. Boxed to keep `DynamicValue`'s size bounded
     /// independently of `DynamicStruct`'s growth.
     Struct(Box<DynamicStruct>),
+    /// DOTS enum value — the wire `int32`. The descriptor lives in the
+    /// containing property's `DynamicFieldKind::Enum`, so consumers
+    /// look up the element name by walking back to the descriptor.
+    Enum(i32),
 }
 
 /// A wire-only struct value: descriptor + sparse property map.
@@ -247,6 +293,7 @@ fn encode_value(value: &DynamicValue, e: &mut CborEncoder<'_>) -> Result<(), Enc
             Ok(())
         }
         DynamicValue::Struct(inner) => encode_struct(inner, e),
+        DynamicValue::Enum(v) => e.i32(*v).map(|_| ()),
     }
 }
 
@@ -314,5 +361,6 @@ fn decode_value(
                 properties,
             })))
         }
+        DynamicFieldKind::Enum(_) => Ok(DynamicValue::Enum(d.i32()?)),
     }
 }

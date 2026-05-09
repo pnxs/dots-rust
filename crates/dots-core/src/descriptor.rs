@@ -41,6 +41,8 @@ pub enum FieldKind {
     Vec(&'static FieldKind),
     /// Nested DOTS struct, statically known at compile time.
     Struct(&'static StructDescriptor),
+    /// DOTS enum, statically known at compile time.
+    Enum(&'static EnumDescriptor),
 }
 
 impl PartialEq for FieldKind {
@@ -53,6 +55,7 @@ impl PartialEq for FieldKind {
             | (String, String) | (Bytes, Bytes) => true,
             (Vec(a), Vec(b)) => core::ptr::eq(*a, *b) || a == b,
             (Struct(a), Struct(b)) => core::ptr::eq(*a, *b),
+            (Enum(a), Enum(b)) => core::ptr::eq(*a, *b),
             _ => false,
         }
     }
@@ -236,4 +239,51 @@ impl StructDescriptor {
         Layout::from_size_align(self.size, self.align)
             .expect("StructDescriptor size/align came from a real Rust type")
     }
+}
+
+/// Compile-time metadata about a single DOTS enum variant.
+#[derive(Debug, Clone, Copy)]
+pub struct EnumElement {
+    /// Variant name in the source enum.
+    pub name: &'static str,
+    /// DOTS metadata tag for this variant (1-based).
+    pub tag: u32,
+    /// `int32` value transmitted on the wire. By default equal to `tag`,
+    /// but the `.dots` model permits them to differ.
+    pub value: i32,
+}
+
+/// Compile-time metadata about a DOTS enum.
+///
+/// Held as a `&'static EnumDescriptor` constant on each generated enum
+/// (e.g. `MyEnum::DESCRIPTOR`). Enums are encoded on the wire as their
+/// `int32` `value`; the descriptor maps wire values back to variants.
+#[derive(Debug, Clone, Copy)]
+pub struct EnumDescriptor {
+    pub name: &'static str,
+    pub elements: &'static [EnumElement],
+}
+
+impl EnumDescriptor {
+    /// Look up a variant by its wire `int32` value.
+    pub fn element_by_value(&self, value: i32) -> Option<&'static EnumElement> {
+        self.elements.iter().find(|e| e.value == value)
+    }
+
+    /// Look up a variant by metadata tag.
+    pub fn element_by_tag(&self, tag: u32) -> Option<&'static EnumElement> {
+        self.elements.iter().find(|e| e.tag == tag)
+    }
+}
+
+/// Statically-known [`FieldKind`] for a Rust type, supplied by the
+/// `#[derive(DotsStruct)]` and `#[derive(DotsEnum)]` proc-macros.
+///
+/// The parent struct's macro uses `<T as DotsTypeKind>::KIND` as its
+/// fallback for unknown nested types — that single trait covers both
+/// nested DOTS structs (`FieldKind::Struct(...)`) and DOTS enums
+/// (`FieldKind::Enum(...)`) without the parent macro needing to tell
+/// them apart.
+pub trait DotsTypeKind {
+    const KIND: FieldKind;
 }

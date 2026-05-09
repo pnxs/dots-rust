@@ -7,8 +7,8 @@ use dots_core::{
 };
 use dots_derive::DotsStruct;
 use dots_model::{
-    DotsStructFlags, EnumDescriptorData, EnumElementDescriptor, StructDescriptorData,
-    StructPropertyData,
+    DotsStructFlags, DotsStructScope, EnumDescriptorData, EnumElementDescriptor,
+    StructDescriptorData, StructPropertyData,
 };
 
 #[derive(DotsStruct, Default, Debug, PartialEq)]
@@ -193,6 +193,25 @@ fn enum_descriptor_data_roundtrip() {
     let bytes = encode_to_vec(&original);
     let decoded: EnumDescriptorData = decode_typed_from_slice(&bytes).unwrap();
     assert_eq!(original, decoded);
+}
+
+#[test]
+fn dots_struct_scope_roundtrip() {
+    for scope in [
+        DotsStructScope::Program,
+        DotsStructScope::Server,
+        DotsStructScope::Site,
+        DotsStructScope::Global,
+    ] {
+        let original = StructDescriptorData {
+            name: Some("Sample".into()),
+            scope: Some(scope),
+            ..Default::default()
+        };
+        let bytes = encode_to_vec(&original);
+        let decoded: StructDescriptorData = decode_typed_from_slice(&bytes).unwrap();
+        assert_eq!(decoded.scope, Some(scope));
+    }
 }
 
 #[test]

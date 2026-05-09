@@ -3,7 +3,32 @@
 //! Mirrors `external/dots/model/descriptors.dots` from dots-cpp.
 
 use dots_core::{FieldKind, PropertyDescriptor, StructDescriptor, StructFlags};
-use dots_derive::DotsStruct;
+use dots_derive::{DotsEnum, DotsStruct};
+
+/// Scope at which a DOTS struct is valid.
+///
+/// Mirrors `.dots`:
+/// ```text
+/// enum DotsStructScope {
+///     1: program,   // client-internal only
+///     2: server,    // routed only to clients on the same server
+///     3: site,      // routed within the same site
+///     4: global     // no limitation
+/// }
+/// ```
+#[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[dots(name = "DotsStructScope")]
+pub enum DotsStructScope {
+    #[default]
+    #[dots(tag = 1)]
+    Program,
+    #[dots(tag = 2)]
+    Server,
+    #[dots(tag = 3)]
+    Site,
+    #[dots(tag = 4)]
+    Global,
+}
 
 /// Per-flag bool view of `StructFlags`. Wire form for transmitting
 /// struct-level flags between peers.
@@ -111,17 +136,11 @@ pub struct StructDocumentation {
 ///     1: [key] string name;
 ///     2: vector<StructPropertyData> properties;
 ///     3: StructDocumentation documentation;
-///     4: DotsStructScope scope;          // enum — deferred until enum support
+///     4: DotsStructScope scope;
 ///     5: DotsStructFlags flags;
 ///     6: uint32 publisherId;
 /// }
 /// ```
-///
-/// Tag 4 (`scope`) is deliberately omitted in this iteration — DOTS
-/// enums aren't supported yet on the Rust side. CBOR maps are sparse,
-/// so the field is simply absent on the wire; peers that send a scope
-/// have it skipped on decode (forward-compat). Add it back when enum
-/// support lands.
 #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "StructDescriptorData", internal)]
 pub struct StructDescriptorData {
@@ -131,7 +150,8 @@ pub struct StructDescriptorData {
     pub properties: Option<Vec<StructPropertyData>>,
     #[dots(tag = 3)]
     pub documentation: Option<StructDocumentation>,
-    // tag 4: scope — TODO when DOTS enum support lands
+    #[dots(tag = 4)]
+    pub scope: Option<DotsStructScope>,
     #[dots(tag = 5)]
     pub flags: Option<DotsStructFlags>,
     #[dots(tag = 6)]
@@ -150,6 +170,9 @@ impl StructDescriptorData {
             name: Some(d.name.into()),
             properties: Some(d.properties.iter().map(StructPropertyData::from_static).collect()),
             documentation: None,
+            // We don't track scope on the Rust side yet — leave it
+            // unset on the wire; peers default to their own policy.
+            scope: None,
             flags: Some(DotsStructFlags::from_static(d.flags)),
             publisher_id: None,
         }
@@ -222,5 +245,6 @@ pub fn field_kind_type_name(kind: &FieldKind) -> String {
         FieldKind::Bytes => "vector<uint8>".into(),
         FieldKind::Vec(inner) => format!("vector<{}>", field_kind_type_name(inner)),
         FieldKind::Struct(d) => d.name.into(),
+        FieldKind::Enum(d) => d.name.into(),
     }
 }

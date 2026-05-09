@@ -34,14 +34,35 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
-    Data, DataStruct, DeriveInput, Field, Fields, GenericArgument, Ident, LitInt, LitStr,
-    PathArguments, Type, parse_macro_input, spanned::Spanned,
+    Data, DataEnum, DataStruct, DeriveInput, Field, Fields, GenericArgument, Ident, LitInt,
+    LitStr, PathArguments, Type, Variant, parse_macro_input, spanned::Spanned,
 };
 
 #[proc_macro_derive(DotsStruct, attributes(dots))]
 pub fn derive_dots_struct(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match expand(input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Derive a DOTS enum.
+///
+/// Each variant must be unit-style (no payload) and tagged with
+/// `#[dots(tag = N)]`. The wire `int32` value defaults to `tag` but
+/// can be overridden with `#[dots(tag = N, value = M)]`.
+///
+/// # Emitted code
+///
+/// 1. `T::DESCRIPTOR` static `&'static EnumDescriptor`.
+/// 2. `impl DotsTypeKind for T` exposing `FieldKind::Enum(Self::DESCRIPTOR)`.
+/// 3. `impl DotsField for T` that encodes/decodes the wire `int32`,
+///    matching variants by value.
+#[proc_macro_derive(DotsEnum, attributes(dots))]
+pub fn derive_dots_enum(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match expand_enum(input) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -252,6 +273,14 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             fn data_ptr(&self) -> *const u8 {
                 (self as *const Self).cast::<u8>()
             }
+        }
+
+        // `DotsTypeKind` lets the parent struct's macro look up this
+        // type's `FieldKind` without needing to know whether it's a
+        // struct or an enum.
+        impl ::dots_core::DotsTypeKind for #struct_ident {
+            const KIND: ::dots_core::FieldKind =
+                ::dots_core::FieldKind::Struct(Self::DESCRIPTOR);
         }
 
         // `DotsField` lets this struct appear as a nested field inside
@@ -535,8 +564,12 @@ fn field_kind_for(ty: &Type) -> TokenStream2 {
             }
         }
     }
-    // Treat as nested DOTS struct: pull the descriptor from the type.
-    quote! { ::dots_core::FieldKind::Struct(<#ty>::DESCRIPTOR) }
+    // Treat as a user-defined DOTS type: defer to the type's
+    // `DotsTypeKind::KIND`. That trait is implemented by both
+    // `#[derive(DotsStruct)]` and `#[derive(DotsEnum)]`, so this single
+    // fallback covers both nested structs and enums. Compile error
+    // points at the type if it isn't a derived DOTS type.
+    quote! { <#ty as ::dots_core::DotsTypeKind>::KIND }
 }
 
 fn is_vec_of_u8(args: &PathArguments) -> bool {
@@ -567,4 +600,240 @@ fn build_flags_expr(c: &ContainerAttrs) -> TokenStream2 {
             .local(#local)
             .substruct_only(#substruct_only)
     }
+}
+
+// ===== DotsEnum =====
+
+#[derive(Default)]
+struct EnumContainerAttrs {
+    name: Option<String>,
+}
+
+#[derive(Default)]
+struct EnumVariantAttrs {
+    tag: Option<u32>,
+    value: Option<i32>,
+}
+
+struct DotsEnumVariant<'a> {
+    ident: &'a Ident,
+    tag: u32,
+    value: i32,
+}
+
+fn expand_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
+    let enum_ident = &input.ident;
+
+    if !input.generics.params.is_empty() {
+        return Err(syn::Error::new(
+            input.generics.span(),
+            "DotsEnum does not support generic enums",
+        ));
+    }
+
+    let container = parse_enum_container_attrs(&input.attrs)?;
+    let wire_name = container.name.unwrap_or_else(|| enum_ident.to_string());
+
+    let data_enum = match input.data {
+        Data::Enum(de) => de,
+        Data::Struct(s) => {
+            return Err(syn::Error::new(
+                s.struct_token.span,
+                "DotsEnum can only be derived for enums",
+            ));
+        }
+        Data::Union(u) => {
+            return Err(syn::Error::new(
+                u.union_token.span(),
+                "DotsEnum can only be derived for enums",
+            ));
+        }
+    };
+
+    let variants = collect_enum_variants(&data_enum)?;
+
+    // Detect duplicate tags / values.
+    for (i, a) in variants.iter().enumerate() {
+        for b in &variants[i + 1..] {
+            if a.tag == b.tag {
+                return Err(syn::Error::new(
+                    b.ident.span(),
+                    format!("duplicate tag {} (also used by `{}`)", b.tag, a.ident),
+                ));
+            }
+            if a.value == b.value {
+                return Err(syn::Error::new(
+                    b.ident.span(),
+                    format!(
+                        "duplicate enum value {} (also used by `{}`)",
+                        b.value, a.ident
+                    ),
+                ));
+            }
+        }
+    }
+
+    let element_inits = variants.iter().map(|v| {
+        let name = v.ident.to_string();
+        let tag = v.tag;
+        let value = v.value;
+        quote! {
+            ::dots_core::EnumElement {
+                name: #name,
+                tag: #tag,
+                value: #value,
+            }
+        }
+    });
+
+    let encode_arms = variants.iter().map(|v| {
+        let ident = v.ident;
+        let value = v.value;
+        quote! { Self::#ident => #value }
+    });
+
+    let decode_arms = variants.iter().map(|v| {
+        let ident = v.ident;
+        let value = v.value;
+        quote! { #value => ::core::result::Result::Ok(Self::#ident) }
+    });
+
+    let descriptor_const_ident = Ident::new(
+        &format!(
+            "_DOTS_ENUM_DESCRIPTOR_{}",
+            enum_ident.to_string().to_uppercase()
+        ),
+        enum_ident.span(),
+    );
+
+    let output = quote! {
+        #[doc(hidden)]
+        const _: () = {
+            static #descriptor_const_ident: ::dots_core::EnumDescriptor =
+                ::dots_core::EnumDescriptor {
+                    name: #wire_name,
+                    elements: &[
+                        #( #element_inits ),*
+                    ],
+                };
+
+            impl #enum_ident {
+                #[doc = "Static descriptor for this DOTS enum."]
+                pub const DESCRIPTOR: &'static ::dots_core::EnumDescriptor =
+                    &#descriptor_const_ident;
+            }
+        };
+
+        impl ::dots_core::DotsTypeKind for #enum_ident {
+            const KIND: ::dots_core::FieldKind =
+                ::dots_core::FieldKind::Enum(Self::DESCRIPTOR);
+        }
+
+        impl ::dots_core::DotsField for #enum_ident {
+            #[inline]
+            fn dots_encode(
+                &self,
+                e: &mut ::dots_core::layout::CborEncoder<'_>,
+            ) -> ::core::result::Result<(), ::dots_core::EncodeError> {
+                let v: i32 = match self {
+                    #( #encode_arms ),*
+                };
+                e.i32(v)?;
+                ::core::result::Result::Ok(())
+            }
+
+            #[inline]
+            fn dots_decode(
+                d: &mut ::dots_core::layout::CborDecoder<'_>,
+            ) -> ::core::result::Result<Self, ::dots_core::DecodeError> {
+                let v: i32 = d.i32()?;
+                match v {
+                    #( #decode_arms ),*,
+                    _ => ::core::result::Result::Err(
+                        ::dots_core::DecodeError::message(
+                            "unknown DOTS enum value"
+                        ),
+                    ),
+                }
+            }
+        }
+    };
+
+    Ok(output)
+}
+
+fn collect_enum_variants(de: &DataEnum) -> syn::Result<Vec<DotsEnumVariant<'_>>> {
+    let mut out = Vec::with_capacity(de.variants.len());
+    for v in &de.variants {
+        out.push(parse_enum_variant(v)?);
+    }
+    Ok(out)
+}
+
+fn parse_enum_variant(v: &Variant) -> syn::Result<DotsEnumVariant<'_>> {
+    if !matches!(v.fields, Fields::Unit) {
+        return Err(syn::Error::new(
+            v.span(),
+            "DotsEnum variants must be unit-style (no payload)",
+        ));
+    }
+    let attrs = parse_enum_variant_attrs(&v.attrs)?;
+    let tag = attrs.tag.ok_or_else(|| {
+        syn::Error::new(v.span(), "variant is missing `#[dots(tag = N)]` attribute")
+    })?;
+    if tag == 0 {
+        return Err(syn::Error::new(
+            v.span(),
+            "DOTS enum tags are 1-based; tag must be > 0",
+        ));
+    }
+    // Default the wire `int32` value to the tag — matches the .dots
+    // convention for `1: variant_name` declarations.
+    let value = attrs.value.unwrap_or(tag as i32);
+    Ok(DotsEnumVariant {
+        ident: &v.ident,
+        tag,
+        value,
+    })
+}
+
+fn parse_enum_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<EnumContainerAttrs> {
+    let mut out = EnumContainerAttrs::default();
+    for attr in attrs {
+        if !attr.path().is_ident("dots") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("name") {
+                let lit: LitStr = meta.value()?.parse()?;
+                out.name = Some(lit.value());
+            } else {
+                return Err(meta.error("unknown #[dots(...)] container attribute on enum"));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(out)
+}
+
+fn parse_enum_variant_attrs(attrs: &[syn::Attribute]) -> syn::Result<EnumVariantAttrs> {
+    let mut out = EnumVariantAttrs::default();
+    for attr in attrs {
+        if !attr.path().is_ident("dots") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("tag") {
+                let lit: LitInt = meta.value()?.parse()?;
+                out.tag = Some(lit.base10_parse::<u32>()?);
+            } else if meta.path.is_ident("value") {
+                let lit: LitInt = meta.value()?.parse()?;
+                out.value = Some(lit.base10_parse::<i32>()?);
+            } else {
+                return Err(meta.error("unknown #[dots(...)] attribute on enum variant"));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(out)
 }

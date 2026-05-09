@@ -20,6 +20,6 @@
 pub mod descriptors;
 
 pub use descriptors::{
-    DotsStructFlags, EnumDescriptorData, EnumElementDescriptor, StructDescriptorData,
-    StructDocumentation, StructPropertyData,
+    DotsStructFlags, DotsStructScope, EnumDescriptorData, EnumElementDescriptor,
+    StructDescriptorData, StructDocumentation, StructPropertyData,
 };
