@@ -339,17 +339,21 @@ async fn builder_publishes_struct_and_enum_descriptors_in_order() {
             .await
             .unwrap();
 
-        // Expect Pinger struct, then Color enum, in declaration order.
+        // Expect enums first, then structs: the broker resolves
+        // nested type references via the registry as it parses each
+        // StructDescriptorData, so any enum referenced as a struct
+        // field must already be registered. Same constraint as
+        // dots-cpp's descriptor exchange.
         let txn = framed.next().await.unwrap().unwrap();
         assert_eq!(
             txn.header.type_name.as_deref(),
-            Some("StructDescriptorData")
+            Some("EnumDescriptorData")
         );
 
         let txn = framed.next().await.unwrap().unwrap();
         assert_eq!(
             txn.header.type_name.as_deref(),
-            Some("EnumDescriptorData")
+            Some("StructDescriptorData")
         );
     });
 

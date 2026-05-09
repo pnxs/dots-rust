@@ -250,14 +250,12 @@ impl GuestTransceiver {
 
     /// Pre-register an enum type's descriptor so it gets shipped to
     /// the broker before preload finishes. Auto-registration covers
-    /// any enum embedded in a subscribed/published struct's fields,
-    /// but standalone enums must be registered explicitly.
+    /// any enum embedded in a subscribed/published struct's fields
+    /// (recursively, including through nested structs and `Vec`),
+    /// so this only needs to be called for standalone enums that
+    /// never appear as a struct field.
     pub fn register_enum(&self, descriptor: &'static EnumDescriptor) {
-        self.pending_enums
-            .lock()
-            .expect("pending mutex poisoned")
-            .insert(DescriptorPtr(descriptor));
-        self.registry.register_enum_static(descriptor);
+        self.register_enum_descriptor_internal(descriptor);
     }
 
     /// Publish a typed value. Synchronous — bytes are pushed onto the
@@ -305,15 +303,62 @@ impl GuestTransceiver {
     }
 
     fn register_struct_descriptor(&self, descriptor: &'static StructDescriptor) {
-        // Two registrations: (a) queue the descriptor for publishing
-        // to the broker before preload finishes, and (b) tell the
-        // codec's runtime registry about T so incoming transmissions
-        // of this type can be decoded.
-        self.pending_structs
+        // (a) Queue the descriptor for publishing to the broker before
+        // preload finishes. `pending_structs` is a HashSet so the
+        // recursive walk below silently dedupes against types we've
+        // already seen.
+        let inserted = self
+            .pending_structs
             .lock()
             .expect("pending mutex poisoned")
             .insert(DescriptorPtr(descriptor));
+        // (b) Tell the codec's runtime registry about this type so
+        // incoming transmissions of it can be decoded.
         self.registry.register_struct_static(descriptor);
+
+        // (c) Walk the descriptor's properties for nested types: any
+        // embedded struct or enum descriptor needs to travel to the
+        // broker too, so peers reading those fields by name (e.g. a
+        // C++ guest with no compiled-in copy of the user enum) can
+        // resolve them. Skip if we've already registered this struct,
+        // since its children will already have been walked and we
+        // could otherwise loop on cyclic references.
+        if !inserted {
+            return;
+        }
+        for prop in descriptor.properties {
+            self.register_field_kind_descriptors(&prop.kind);
+        }
+    }
+
+    /// Recursively follow a [`FieldKind`] to register any nested
+    /// struct or enum descriptors it transitively references. Vec
+    /// types unwrap to their inner kind; primitives and strings have
+    /// nothing to register.
+    fn register_field_kind_descriptors(&self, kind: &dots_core::FieldKind) {
+        use dots_core::FieldKind;
+        match kind {
+            FieldKind::Struct(d) => {
+                // Recurse via register_struct_descriptor so nested
+                // structs get their own properties walked too.
+                self.register_struct_descriptor(d);
+            }
+            FieldKind::Enum(e) => {
+                self.register_enum_descriptor_internal(e);
+            }
+            FieldKind::Vec(inner) => {
+                self.register_field_kind_descriptors(inner);
+            }
+            _ => {}
+        }
+    }
+
+    fn register_enum_descriptor_internal(&self, descriptor: &'static EnumDescriptor) {
+        self.pending_enums
+            .lock()
+            .expect("pending mutex poisoned")
+            .insert(DescriptorPtr(descriptor));
+        self.registry.register_enum_static(descriptor);
     }
 
     /// Increment the per-group subscriber count, publishing
@@ -432,13 +477,19 @@ where
             enums = pending_enums.len(),
             "publishing pending type descriptors"
         );
-        for d in pending_structs {
-            let data = StructDescriptorData::from_static(d);
-            conn.send_typed("StructDescriptorData", &data).await?;
-        }
+        // Publish enums BEFORE structs. The broker's
+        // `build_dynamic_struct` resolves nested type references
+        // through its registry as it parses each `StructDescriptorData`,
+        // so any enum referenced as a struct field must already be
+        // registered there. Same constraint as dots-cpp's descriptor
+        // exchange — declaration order is part of the contract.
         for d in pending_enums {
             let data = EnumDescriptorData::from_static(d);
             conn.send_typed("EnumDescriptorData", &data).await?;
+        }
+        for d in pending_structs {
+            let data = StructDescriptorData::from_static(d);
+            conn.send_typed("StructDescriptorData", &data).await?;
         }
 
         // Phase 2: finish preload (cache events flow through dispatch

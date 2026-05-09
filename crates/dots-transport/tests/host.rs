@@ -636,6 +636,69 @@ async fn host_serve_unix_routes_pinger_round_trip() {
 }
 
 #[tokio::test]
+async fn registering_a_struct_pulls_in_nested_enum_descriptors() {
+    use dots_derive::{DotsEnum, DotsStruct};
+
+    #[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
+    #[dots(name = "Mood")]
+    enum Mood {
+        #[default]
+        #[dots(tag = 1)]
+        Happy,
+        #[dots(tag = 2)]
+        Sad,
+    }
+
+    #[derive(DotsStruct, Default, Debug, Clone, PartialEq)]
+    #[dots(name = "Greeter")]
+    struct Greeter {
+        #[dots(tag = 1, key)]
+        id: Option<u32>,
+        #[dots(tag = 2)]
+        mood: Option<Mood>,
+    }
+
+    let host = HostTransceiver::new("nested-host");
+    let registry = registry();
+
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+    let conn = ConnectionBuilder::new(guest_io, "guest", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) =
+        GuestTransceiver::from_connection("guest".to_string(), registry.clone(), conn);
+    // User subscribes only to `Greeter`. The `Mood` enum, embedded in
+    // a Greeter field, must auto-register without an explicit
+    // `register_enum` call.
+    let _sub = gt.subscribe_stream::<Greeter>();
+    let driver_handle = tokio::spawn(driver.run());
+
+    // Wait for descriptor publishing + the join to land.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.registry().lookup("Greeter").is_some()
+            && host.registry().lookup("Mood").is_some()
+        {
+            break;
+        }
+    }
+    assert!(
+        host.registry().lookup("Greeter").is_some(),
+        "Greeter struct should be in host registry"
+    );
+    assert!(
+        host.registry().lookup("Mood").is_some(),
+        "nested Mood enum should have been auto-registered alongside Greeter"
+    );
+
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+}
+
+#[tokio::test]
 async fn host_does_not_loop_back_publisher_to_itself() {
     let host = HostTransceiver::new("test-host");
     let registry = registry();

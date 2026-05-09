@@ -857,16 +857,21 @@ where
         // route subscriptions for them. We do this regardless of
         // preload — even non-preload clients still need to register
         // their types before publishing values.
+        //
+        // Send enums BEFORE structs: the broker's
+        // `build_dynamic_struct` resolves nested type references via
+        // its registry as it parses each struct descriptor, so any
+        // enum referenced as a struct field must already be there.
         for pending in &self.pending {
-            match pending {
-                PendingDescriptor::Struct(d) => {
-                    let data = StructDescriptorData::from_static(d);
-                    conn.send_typed("StructDescriptorData", &data).await?;
-                }
-                PendingDescriptor::Enum(d) => {
-                    let data = EnumDescriptorData::from_static(d);
-                    conn.send_typed("EnumDescriptorData", &data).await?;
-                }
+            if let PendingDescriptor::Enum(d) = pending {
+                let data = EnumDescriptorData::from_static(d);
+                conn.send_typed("EnumDescriptorData", &data).await?;
+            }
+        }
+        for pending in &self.pending {
+            if let PendingDescriptor::Struct(d) = pending {
+                let data = StructDescriptorData::from_static(d);
+                conn.send_typed("StructDescriptorData", &data).await?;
             }
         }
 
