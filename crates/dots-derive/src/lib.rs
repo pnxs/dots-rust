@@ -7,6 +7,28 @@
 //! `#[dots(tag = N)]` (and optionally `#[dots(tag = N, key)]`).
 //! The struct itself may carry `#[dots(name = "WireName", cached, ...)]`
 //! to override the wire name and set struct-level flags.
+//!
+//! # What's emitted
+//!
+//! For each derived struct, the macro produces:
+//!
+//! 1. A `&'static StructDescriptor` constant exposed as `T::DESCRIPTOR`,
+//!    carrying the type's `(size, align)`, per-property `(offset, kind, vtable)`,
+//!    and struct-level flags.
+//! 2. Per-property [`PropertyVtable`] statics whose function pointers point at
+//!    monomorphizations of the generic `dots_core::layout::opt_*` helpers.
+//!    These are how the descriptor-driven codec encodes/decodes values
+//!    without knowing the concrete `T` at the call site.
+//! 3. Accessor methods (`fn field() -> Option<&T>`, `fn has_field()`,
+//!    `fn with_field(value)`, `fn clear_field()`).
+//! 4. A `StructValue` impl exposing the descriptor, valid set, type
+//!    erasure, and a layout-compatible `data_ptr` for the codec.
+//!
+//! No `minicbor::Encode`/`Decode` impls are produced for the struct
+//! itself — encoding goes through the descriptor's vtable thunks so
+//! the same code path serves typed structs and dynamic `AnyStruct`.
+//!
+//! [`PropertyVtable`]: dots_core::PropertyVtable
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -47,11 +69,11 @@ struct DotsField<'a> {
     inner_ty: &'a Type,
     tag: u32,
     is_key: bool,
+    kind: TokenStream2,
 }
 
 fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let struct_ident = &input.ident;
-    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     if !input.generics.params.is_empty() {
         return Err(syn::Error::new(
@@ -96,17 +118,24 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     }
 
+    // Per-property vtable statics + descriptor entries.
+    let property_decls = fields.iter().map(|f| property_decl(struct_ident, f));
+
     let property_descriptors = fields.iter().map(|f| {
         let name = f.ident.to_string();
         let tag = f.tag;
         let is_key = f.is_key;
-        let type_name = type_to_display_string(f.inner_ty);
+        let kind = &f.kind;
+        let vtable_ident = vtable_ident(f.ident);
+        let field_ident = f.ident;
         quote! {
             ::dots_core::PropertyDescriptor {
                 name: #name,
                 tag: #tag,
                 is_key: #is_key,
-                type_name: #type_name,
+                offset: ::core::mem::offset_of!(#struct_ident, #field_ident),
+                kind: #kind,
+                vtable: &#vtable_ident,
             }
         }
     });
@@ -161,63 +190,46 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     });
 
-    let encode_arms = fields.iter().map(|f| {
-        let ident = f.ident;
-        let tag = f.tag;
-        quote! {
-            if let ::core::option::Option::Some(__v) = &self.#ident {
-                __e.u32(#tag)?;
-                <_ as ::dots_core::minicbor::Encode<()>>::encode(__v, __e, __ctx)?;
-            }
-        }
-    });
-
-    let decode_arms = fields.iter().map(|f| {
-        let ident = f.ident;
-        let tag = f.tag;
-        let inner_ty = f.inner_ty;
-        quote! {
-            #tag => {
-                __out.#ident = ::core::option::Option::Some(
-                    <#inner_ty as ::dots_core::minicbor::Decode<'_b, ()>>::decode(__d, __ctx)?,
-                );
-            }
-        }
-    });
-
     let descriptor_const_ident = Ident::new(
-        &format!("_DOTS_DESCRIPTOR_{}", struct_ident.to_string().to_uppercase()),
+        &format!(
+            "_DOTS_DESCRIPTOR_{}",
+            struct_ident.to_string().to_uppercase()
+        ),
         struct_ident.span(),
     );
 
     let output = quote! {
-        // Hidden module-level constant so the descriptor lives at 'static lifetime
-        // even when nothing else references it.
+        // Hidden module-level block so per-property vtables and the
+        // descriptor live at 'static lifetime even when nothing else
+        // references the type. Each `#property_decls` introduces a
+        // `static __DOTS_VTABLE_<field>: PropertyVtable = ...;`.
         #[doc(hidden)]
         const _: () = {
+            #( #property_decls )*
+
             static #descriptor_const_ident: ::dots_core::StructDescriptor =
                 ::dots_core::StructDescriptor {
                     name: #wire_name,
                     flags: #flags_expr,
+                    size: ::core::mem::size_of::<#struct_ident>(),
+                    align: ::core::mem::align_of::<#struct_ident>(),
                     properties: &[
                         #( #property_descriptors ),*
                     ],
                 };
 
-            impl #impl_generics #struct_ident #ty_generics #where_clause {
+            impl #struct_ident {
                 #[doc = "Static descriptor for this DOTS struct."]
                 pub const DESCRIPTOR: &'static ::dots_core::StructDescriptor =
                     &#descriptor_const_ident;
             }
         };
 
-        impl #impl_generics #struct_ident #ty_generics #where_clause {
+        impl #struct_ident {
             #( #accessors )*
         }
 
-        impl #impl_generics ::dots_core::StructValue for #struct_ident #ty_generics
-            #where_clause
-        {
+        impl ::dots_core::StructValue for #struct_ident {
             #[inline]
             fn descriptor(&self) -> &'static ::dots_core::StructDescriptor {
                 Self::DESCRIPTOR
@@ -235,56 +247,39 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             fn as_any(&self) -> &dyn ::core::any::Any {
                 self
             }
-        }
 
-        impl #impl_generics ::dots_core::minicbor::Encode<()> for #struct_ident #ty_generics
-            #where_clause
-        {
-            fn encode<__W>(
-                &self,
-                __e: &mut ::dots_core::minicbor::Encoder<__W>,
-                __ctx: &mut (),
-            ) -> ::core::result::Result<
-                (),
-                ::dots_core::minicbor::encode::Error<__W::Error>,
-            >
-            where
-                __W: ::dots_core::minicbor::encode::Write,
-            {
-                let __valid = <Self as ::dots_core::StructValue>::valid_set(self);
-                __e.map(__valid.len() as u64)?;
-                #( #encode_arms )*
-                ::core::result::Result::Ok(())
-            }
-        }
-
-        impl<'_b> #impl_generics ::dots_core::minicbor::Decode<'_b, ()> for #struct_ident #ty_generics
-            #where_clause
-        {
-            fn decode(
-                __d: &mut ::dots_core::minicbor::Decoder<'_b>,
-                __ctx: &mut (),
-            ) -> ::core::result::Result<Self, ::dots_core::minicbor::decode::Error> {
-                #[allow(unused_mut)]
-                let mut __out = <Self as ::core::default::Default>::default();
-                let __len = __d.map()?.ok_or_else(|| {
-                    ::dots_core::minicbor::decode::Error::message(
-                        "indefinite-length maps are not supported in DOTS structs",
-                    )
-                })?;
-                for _ in 0..__len {
-                    let __tag = __d.u32()?;
-                    match __tag {
-                        #( #decode_arms )*
-                        _ => __d.skip()?,
-                    }
-                }
-                ::core::result::Result::Ok(__out)
+            #[inline]
+            fn data_ptr(&self) -> *const u8 {
+                (self as *const Self).cast::<u8>()
             }
         }
     };
 
     Ok(output)
+}
+
+/// Emit a `static` `PropertyVtable` for a single property, with
+/// fn-pointer fields pointing at monomorphizations of the generic
+/// `opt_*` helpers from `dots_core::layout`.
+fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
+    let inner_ty = f.inner_ty;
+    let vtable_ident = vtable_ident(f.ident);
+    quote! {
+        static #vtable_ident: ::dots_core::PropertyVtable = ::dots_core::PropertyVtable {
+            layout: ::core::alloc::Layout::new::<::core::option::Option<#inner_ty>>(),
+            is_set: ::dots_core::layout::opt_is_set::<#inner_ty>,
+            encode_value: ::dots_core::layout::opt_encode::<#inner_ty>,
+            decode_value: ::dots_core::layout::opt_decode::<#inner_ty>,
+            drop_in_place: ::dots_core::layout::opt_drop::<#inner_ty>,
+        };
+    }
+}
+
+fn vtable_ident(field_ident: &Ident) -> Ident {
+    Ident::new(
+        &format!("__DOTS_VTABLE_{}", field_ident.to_string().to_uppercase()),
+        field_ident.span(),
+    )
 }
 
 fn collect_fields(data: &DataStruct) -> syn::Result<Vec<DotsField<'_>>> {
@@ -326,10 +321,7 @@ fn parse_field(field: &Field) -> syn::Result<DotsField<'_>> {
 
     let attrs = parse_field_attrs(&field.attrs)?;
     let tag = attrs.tag.ok_or_else(|| {
-        syn::Error::new(
-            field.span(),
-            "field is missing `#[dots(tag = N)]` attribute",
-        )
+        syn::Error::new(field.span(), "field is missing `#[dots(tag = N)]` attribute")
     })?;
 
     if tag == 0 {
@@ -345,11 +337,20 @@ fn parse_field(field: &Field) -> syn::Result<DotsField<'_>> {
         ));
     }
 
+    let kind = field_kind_for(inner_ty).ok_or_else(|| {
+        syn::Error::new(
+            inner_ty.span(),
+            "DotsStruct field type is not a recognized primitive — supported in this iteration: \
+             bool, u8/u16/u32/u64, i8/i16/i32/i64, f32/f64, String, Vec<u8>",
+        )
+    })?;
+
     Ok(DotsField {
         ident,
         inner_ty,
         tag,
         is_key: attrs.is_key,
+        kind,
     })
 }
 
@@ -405,7 +406,7 @@ fn parse_field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
     Ok(out)
 }
 
-/// Extract `T` from `Option<T>`, syntactically. Accepts both the bare
+/// Extract `T` from `Option<T>` syntactically. Accepts both the bare
 /// `Option<...>` and fully-qualified `::core::option::Option<...>` /
 /// `std::option::Option<...>` forms.
 fn option_inner_type(ty: &Type) -> Option<&Type> {
@@ -430,8 +431,46 @@ fn option_inner_type(ty: &Type) -> Option<&Type> {
     Some(inner)
 }
 
-fn type_to_display_string(ty: &Type) -> String {
-    quote!(#ty).to_string().split_whitespace().collect()
+/// Map the syntactic field type to a `FieldKind` expression, or `None`
+/// for unsupported types (which become a compile error in `parse_field`).
+fn field_kind_for(ty: &Type) -> Option<TokenStream2> {
+    let Type::Path(tp) = ty else {
+        return None;
+    };
+    let last = tp.path.segments.last()?;
+    let name = last.ident.to_string();
+    let primitive = match name.as_str() {
+        "bool" => "Bool",
+        "u8" => "U8",
+        "u16" => "U16",
+        "u32" => "U32",
+        "u64" => "U64",
+        "i8" => "I8",
+        "i16" => "I16",
+        "i32" => "I32",
+        "i64" => "I64",
+        "f32" => "F32",
+        "f64" => "F64",
+        "String" => "String",
+        "Vec" => {
+            // Treat Vec<u8> as Bytes; reject other Vec<T> for now.
+            if let PathArguments::AngleBracketed(args) = &last.arguments {
+                let inner = args.args.iter().find_map(|a| match a {
+                    GenericArgument::Type(t) => Some(t),
+                    _ => None,
+                })?;
+                if let Type::Path(inner_tp) = inner {
+                    if inner_tp.path.is_ident("u8") {
+                        return Some(quote! { ::dots_core::FieldKind::Bytes });
+                    }
+                }
+            }
+            return None;
+        }
+        _ => return None,
+    };
+    let kind_ident = Ident::new(primitive, last.ident.span());
+    Some(quote! { ::dots_core::FieldKind::#kind_ident })
 }
 
 fn build_flags_expr(c: &ContainerAttrs) -> TokenStream2 {

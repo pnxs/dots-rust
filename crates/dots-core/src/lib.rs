@@ -2,18 +2,30 @@
 //!
 //! Re-exports the types used by `dots-derive`-generated code and consumers
 //! of derived DOTS structs.
+//!
+//! The codec is *descriptor-driven*: encoding and decoding walk the
+//! `StructDescriptor`'s property list and dispatch through per-property
+//! [`PropertyVtable`] thunks. The same code path serves typed structs
+//! (produced by `#[derive(DotsStruct)]`) and dynamic [`AnyStruct`]
+//! instances allocated from a descriptor alone — wire bytes are
+//! identical because the descriptor *is* the format.
+//!
+//! [`PropertyVtable`]: descriptor::PropertyVtable
+//! [`AnyStruct`]: layout::AnyStruct
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
-mod codec;
 mod descriptor;
+pub mod layout;
 mod property_set;
 mod value;
 
-pub use codec::{DecodeError, EncodeError, decode_from_slice, encode_into_vec, encode_to_vec};
-pub use descriptor::{PropertyDescriptor, StructDescriptor, StructFlags};
+pub use descriptor::{
+    FieldKind, PropertyDescriptor, PropertyVtable, StructDescriptor, StructFlags,
+};
+pub use layout::{AnyStruct, DecodeError, EncodeError, decode_typed_from_slice, encode_to_vec};
 pub use property_set::PropertySet;
 pub use value::StructValue;
 

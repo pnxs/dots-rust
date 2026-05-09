@@ -20,4 +20,7 @@ quote = "1"
 syn = { version = "2", features = ["full"] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Unsafe is denied workspace-wide; the only opt-in is dots-core's internal
+# `layout` module, which holds the audited raw-memory codec primitives
+# behind `#![allow(unsafe_code)]`. Every other crate stays unsafe-free.
+unsafe_code = "deny"

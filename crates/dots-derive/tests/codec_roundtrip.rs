@@ -1,9 +1,11 @@
 //! End-to-end CBOR codec tests for `#[derive(DotsStruct)]` output.
 //!
 //! These exercise the wire format (sparse CBOR map keyed by property tag)
-//! and the round-trip encode → decode → equality contract.
+//! and the round-trip encode → decode → equality contract — both the
+//! typed path and the dynamic `AnyStruct` path. The two paths must
+//! produce byte-identical wire output for the same logical value.
 
-use dots_core::{StructValue, decode_from_slice, encode_to_vec};
+use dots_core::{AnyStruct, StructValue, decode_typed_from_slice, encode_to_vec};
 use dots_derive::DotsStruct;
 
 #[derive(DotsStruct, Default, Debug, PartialEq)]
@@ -22,7 +24,7 @@ struct Sample {
 }
 
 #[test]
-fn roundtrip_all_fields_set() {
+fn typed_roundtrip_all_fields_set() {
     let original = Sample {
         id: Some(42),
         payload: Some("hello".into()),
@@ -31,12 +33,12 @@ fn roundtrip_all_fields_set() {
         ratio: Some(1.25),
     };
     let bytes = encode_to_vec(&original);
-    let decoded: Sample = decode_from_slice(&bytes).expect("decode succeeds");
+    let decoded: Sample = decode_typed_from_slice(&bytes).expect("decode succeeds");
     assert_eq!(original, decoded);
 }
 
 #[test]
-fn roundtrip_partial_object() {
+fn typed_roundtrip_partial_object() {
     let original = Sample {
         id: Some(7),
         payload: None,
@@ -45,25 +47,24 @@ fn roundtrip_partial_object() {
         ratio: None,
     };
     let bytes = encode_to_vec(&original);
-    let decoded: Sample = decode_from_slice(&bytes).expect("decode succeeds");
+    let decoded: Sample = decode_typed_from_slice(&bytes).expect("decode succeeds");
     assert_eq!(original, decoded);
     assert_eq!(decoded.valid_set().len(), 2);
 }
 
 #[test]
-fn roundtrip_empty_object() {
+fn typed_roundtrip_empty_object() {
     let original = Sample::default();
     let bytes = encode_to_vec(&original);
     // Empty CBOR map is a single byte: 0xa0.
     assert_eq!(bytes, [0xa0]);
-    let decoded: Sample = decode_from_slice(&bytes).expect("decode succeeds");
+    let decoded: Sample = decode_typed_from_slice(&bytes).expect("decode succeeds");
     assert_eq!(original, decoded);
     assert!(decoded.valid_set().is_empty());
 }
 
 #[test]
 fn wire_format_is_sparse_map_keyed_by_tag() {
-    // id=42, no other fields -> map of length 1 with key 1, value 42
     let s = Sample {
         id: Some(42),
         ..Default::default()
@@ -77,30 +78,62 @@ fn wire_format_is_sparse_map_keyed_by_tag() {
 
 #[test]
 fn unknown_tags_are_skipped_for_forward_compat() {
-    // Hand-craft bytes representing a map with id=1 plus a property at tag 99
-    // that the current Sample type does not know about. Decode must skip it.
-    //
-    // 0xa2          = map of 2 pairs
-    // 0x01 0x01     = tag 1 -> 1
-    // 0x18 0x63     = tag 99
-    // 0x65 'e''x''t''r''a' = text string "extra"
+    // Hand-craft bytes with id=1 plus a property at tag 99 that the
+    // current Sample type does not know about. Decode must skip it.
     let bytes = [
         0xa2, 0x01, 0x01, 0x18, 0x63, 0x65, b'e', b'x', b't', b'r', b'a',
     ];
-    let decoded: Sample = decode_from_slice(&bytes).expect("decode skips unknown tag");
+    let decoded: Sample = decode_typed_from_slice(&bytes).expect("decode skips unknown tag");
     assert_eq!(decoded.id, Some(1));
     assert!(decoded.payload.is_none());
 }
 
 #[test]
-fn map_size_matches_valid_set_len() {
-    let s = Sample {
-        id: Some(1),
+fn dynamic_decode_yields_same_logical_value() {
+    let original = Sample {
+        id: Some(11),
+        payload: Some("dyn".into()),
         flag: Some(false),
         ..Default::default()
     };
-    let bytes = encode_to_vec(&s);
-    // First byte encodes the map size; for sizes 0..=23 it's 0xa0 + size.
-    assert_eq!(bytes[0], 0xa0 | 2);
-    assert_eq!(s.valid_set().len(), 2);
+    let typed_bytes = encode_to_vec(&original);
+
+    let any = AnyStruct::decode_from_slice(Sample::DESCRIPTOR, &typed_bytes)
+        .expect("dynamic decode must succeed");
+    assert_eq!(StructValue::descriptor(&any).name, "Sample");
+    assert_eq!(any.valid_set(), original.valid_set());
+}
+
+#[test]
+fn typed_and_dynamic_paths_produce_identical_bytes() {
+    let original = Sample {
+        id: Some(123),
+        payload: Some("identical".into()),
+        counter: Some(456),
+        flag: Some(true),
+        ratio: Some(-3.5),
+    };
+
+    let typed_bytes = encode_to_vec(&original);
+    let any = AnyStruct::decode_from_slice(Sample::DESCRIPTOR, &typed_bytes)
+        .expect("decode succeeds");
+    let dynamic_bytes = encode_to_vec(&any);
+
+    // The descriptor-driven codec is the single source of truth for
+    // wire format, so the two paths must agree byte-for-byte.
+    assert_eq!(typed_bytes, dynamic_bytes);
+}
+
+#[test]
+fn dynamic_anystruct_zeroinit_decodes_safely() {
+    // Decode bytes that touch only some properties; verify the
+    // AnyStruct's all-fields-None starting state plus per-tag writes
+    // don't trip Drop or leak when the value goes out of scope.
+    let bytes = encode_to_vec(&Sample {
+        payload: Some("only payload".into()),
+        ..Default::default()
+    });
+    let any = AnyStruct::decode_from_slice(Sample::DESCRIPTOR, &bytes).expect("decode succeeds");
+    assert_eq!(any.valid_set().len(), 1);
+    drop(any);
 }
