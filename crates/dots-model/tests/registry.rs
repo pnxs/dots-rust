@@ -69,11 +69,8 @@ fn registry_from_wire() -> Registry {
     let mut reg = Registry::new();
 
     // Dependency order: enum first, then nested struct, then top-level.
-    let severity_data =
-        EnumDescriptorData::from_static_placeholder(); // helper below
-    reg.register_enum_dynamic(Arc::new(
-        reg.build_dynamic_enum(&severity_data).unwrap(),
-    ));
+    let severity_data = EnumDescriptorData::from_static(Severity::DESCRIPTOR);
+    reg.register_enum_dynamic(Arc::new(reg.build_dynamic_enum(&severity_data).unwrap()));
 
     let address_data = StructDescriptorData::from_static(Address::DESCRIPTOR);
     let address_dyn = reg.build_dynamic_struct(&address_data).unwrap();
@@ -88,32 +85,6 @@ fn registry_from_wire() -> Registry {
     reg.register_struct_dynamic(Arc::new(log_entry_dyn));
 
     reg
-}
-
-/// Helper: there's no `EnumDescriptorData::from_static` yet (would
-/// belong with the enum forward conversion), so we build one inline
-/// from the Severity descriptor.
-trait FromStaticEnumDescriptor {
-    fn from_static_placeholder() -> EnumDescriptorData;
-}
-impl FromStaticEnumDescriptor for EnumDescriptorData {
-    fn from_static_placeholder() -> EnumDescriptorData {
-        let d = Severity::DESCRIPTOR;
-        EnumDescriptorData {
-            name: Some(d.name.into()),
-            elements: Some(
-                d.elements
-                    .iter()
-                    .map(|e| dots_model::EnumElementDescriptor {
-                        enum_value: Some(e.value),
-                        name: Some(e.name.into()),
-                        tag: Some(e.tag),
-                    })
-                    .collect(),
-            ),
-            publisher_id: None,
-        }
-    }
 }
 
 // ----- Tests -----
@@ -256,7 +227,7 @@ fn registering_static_then_looking_up_works() {
 #[test]
 fn enum_descriptor_data_reverse_conversion() {
     let reg = Registry::new();
-    let data = EnumDescriptorData::from_static_placeholder();
+    let data = EnumDescriptorData::from_static(Severity::DESCRIPTOR);
     let dyn_desc = reg.build_dynamic_enum(&data).unwrap();
     assert_eq!(dyn_desc.name, "Severity");
     assert_eq!(dyn_desc.elements.len(), 3);
@@ -286,7 +257,7 @@ fn struct_descriptor_data_with_nested_dynamic_struct_in_registry() {
     // Now register a hypothetical struct that uses Address by name.
     // Use LogEntry's actual descriptor for ergonomic test data — just
     // need Severity registered too.
-    let severity_data = EnumDescriptorData::from_static_placeholder();
+    let severity_data = EnumDescriptorData::from_static(Severity::DESCRIPTOR);
     reg.register_enum_dynamic(Arc::new(reg.build_dynamic_enum(&severity_data).unwrap()));
 
     let log_entry_data = StructDescriptorData::from_static(LogEntry::DESCRIPTOR);

@@ -2,7 +2,7 @@
 //!
 //! Mirrors `external/dots/model/descriptors.dots` from dots-cpp.
 
-use dots_core::{FieldKind, PropertyDescriptor, StructDescriptor, StructFlags};
+use dots_core::{EnumDescriptor, FieldKind, PropertyDescriptor, StructDescriptor, StructFlags};
 use dots_derive::{DotsEnum, DotsStruct};
 
 /// Scope at which a DOTS struct is valid.
@@ -221,6 +221,27 @@ pub struct EnumDescriptorData {
     // tag 3 deprecated in the .dots source — skipped here too.
     #[dots(tag = 4)]
     pub publisher_id: Option<u32>,
+}
+
+impl EnumDescriptorData {
+    /// Build from a static `EnumDescriptor`. Symmetric with
+    /// `StructDescriptorData::from_static`.
+    pub fn from_static(d: &'static EnumDescriptor) -> Self {
+        Self {
+            name: Some(d.name.into()),
+            elements: Some(
+                d.elements
+                    .iter()
+                    .map(|e| EnumElementDescriptor {
+                        enum_value: Some(e.value),
+                        name: Some(e.name.into()),
+                        tag: Some(e.tag),
+                    })
+                    .collect(),
+            ),
+            publisher_id: None,
+        }
+    }
 }
 
 /// Map a [`FieldKind`] to its DOTS wire-level type-name string.

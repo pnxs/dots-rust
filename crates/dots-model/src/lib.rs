@@ -6,20 +6,25 @@
 //! `#[derive(DotsStruct)]`. Each tag matches the `.dots` source so wire
 //! bytes are cross-language compatible with C++ DOTS peers.
 //!
-//! Types implemented in this iteration:
+//! Modules:
 //!
-//! - [`StructDescriptorData`] / [`StructPropertyData`] / [`StructDocumentation`]
-//!   / [`DotsStructFlags`] — describe a DOTS struct type.
-//! - [`EnumDescriptorData`] / [`EnumElementDescriptor`] — describe a
-//!   DOTS enum type.
-//!
-//! Future iterations will add `DotsStructScope` (needs enum support),
-//! `DotsHeader` and the `DotsMsgHello`/`DotsMsgConnect` handshake
-//! triplet, etc.
+//! - [`descriptors`] — wire form of DOTS struct and enum metadata
+//!   ([`StructDescriptorData`], [`EnumDescriptorData`], etc.).
+//! - [`connection`] — per-transmission [`DotsHeader`] and the handshake
+//!   messages ([`DotsMsgHello`], [`DotsMsgConnect`],
+//!   [`DotsMsgConnectResponse`]) plus the [`DotsConnectionState`] enum.
+//! - [`registry`] — name-keyed [`Registry`] for resolving wire-form
+//!   descriptors back into owned `DynamicStructDescriptor` /
+//!   `DynamicEnumDescriptor` instances.
 
+pub mod connection;
 pub mod descriptors;
 pub mod registry;
 
+pub use connection::{
+    DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgError,
+    DotsMsgHello,
+};
 pub use descriptors::{
     DotsStructFlags, DotsStructScope, EnumDescriptorData, EnumElementDescriptor,
     StructDescriptorData, StructDocumentation, StructPropertyData,
