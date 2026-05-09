@@ -21,10 +21,12 @@
 
 mod codec;
 mod connection;
+mod container;
 mod error;
 
 pub use codec::TransmissionCodec;
 pub use connection::{Connection, ConnectionBuilder, ConnectionError, Event, Subscription};
+pub use container::{CloneInfo, Container, ContainerEntry, Operation};
 pub use error::TransportError;
 
 // Re-export the framing layer's public types so callers don't need to

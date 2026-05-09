@@ -87,35 +87,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         conn.state(),
     );
 
-    // Phase 2: subscribe before draining the cache, so cached
-    // Pingers (from previous demo runs that published with cached=true)
-    // are dispatched into our subscription.
+    // Phase 2: build a Pinger Container (typed local mirror of the
+    // broker's cache for this type) and a Subscription (event stream).
+    // Both must be in place before the cache is drained — the
+    // Container fills automatically as cached transmissions arrive.
+    let pingers = conn.container::<Pinger>();
     let mut pinger_sub = conn.subscribe::<Pinger>();
     let our_id = conn.client_id().unwrap_or(0);
 
-    // Phase 3: drain the cache. Each cached Pinger flows through the
-    // subscription with header.from_cache > 0.
+    // Phase 3: drain the cache. Cached transmissions flow through the
+    // dispatch loop — both into the container (state) and the
+    // subscription (event stream).
     eprintln!("draining cache ...");
     if let Err(e) = conn.finish_preload().await {
         return handshake_failed(e);
     }
     eprintln!("preload complete; state={:?}", conn.state());
 
-    // Pull any cache events that already arrived. They're queued in
-    // the subscription's channel — drain non-blocking.
-    let mut cache_count = 0;
-    while let Ok(event) = pinger_sub.try_recv() {
-        cache_count += 1;
-        println!(
-            "★ cached Pinger:  id={:?}  message={:?}  remaining={:?}",
-            event.value.id, event.value.message, event.header.from_cache
-        );
-    }
-    if cache_count == 0 {
-        eprintln!("(no cached Pingers — fresh broker or first publisher)");
-    } else {
-        eprintln!("({cache_count} cached Pinger(s) replayed)");
-    }
+    // Inspect the post-preload container state.
+    pingers.with_entries(|map| {
+        if map.is_empty() {
+            eprintln!("(no cached Pingers — fresh broker or first publisher)");
+            return;
+        }
+        eprintln!("({} cached Pinger(s) in local container)", map.len());
+        for entry in map.values() {
+            println!(
+                "★ cached Pinger:  id={:?}  message={:?}  seq={:?}  created_by={:?}",
+                entry.value.id,
+                entry.value.message,
+                entry.value.sequence,
+                entry.clone_info.created_sender,
+            );
+        }
+    });
+    // Drain any subscription events that piled up during preload too,
+    // so the steady-state loop starts with an empty channel.
+    while pinger_sub.try_recv().is_ok() {}
 
     // Publish a Pinger every second.
     let mut publish_timer = tokio::time::interval(Duration::from_secs(1));
@@ -146,11 +154,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             event = pinger_sub.recv() => {
                 match event {
-                    Some(ev) => println!(
-                        "✦ Pinger event:  id={:?}  message={:?}  seq={:?}  sender={:?}{}",
-                        ev.value.id, ev.value.message, ev.value.sequence, ev.header.sender,
-                        if ev.header.is_from_myself == Some(true) { "  (from me)" } else { "" },
-                    ),
+                    Some(ev) => {
+                        let total = pingers.len();
+                        println!(
+                            "✦ Pinger event:  id={:?}  message={:?}  seq={:?}  sender={:?}  container_len={total}{}",
+                            ev.value.id, ev.value.message, ev.value.sequence, ev.header.sender,
+                            if ev.header.is_from_myself == Some(true) { "  (from me)" } else { "" },
+                        );
+                    }
                     None => {
                         eprintln!("subscription channel closed.");
                         break;

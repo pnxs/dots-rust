@@ -192,6 +192,45 @@ pub fn encode_into_encoder(
     }
 }
 
+/// Encode the value's *key* properties — those marked `#[dots(key)]` —
+/// as a CBOR array, returning the bytes. Suitable as a `BTreeMap` /
+/// `HashMap` key for indexing instances by their primary key.
+///
+/// Properties are encoded in declaration order. A key property whose
+/// `Option<T>` is `None` writes a CBOR `null`, so partial-key values
+/// stay distinguishable from values where the key is set to a
+/// default-encoded zero.
+pub fn encode_key_bytes(value: &dyn StructValue) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_key_into(value, &mut buf);
+    buf
+}
+
+/// Append the key-properties CBOR array to an existing buffer.
+pub fn encode_key_into(value: &dyn StructValue, buf: &mut Vec<u8>) {
+    let descriptor = value.descriptor();
+    let base = value.data_ptr();
+    let mut encoder = minicbor::Encoder::new(buf);
+    let key_count = descriptor.key_properties().count() as u64;
+    encoder
+        .array(key_count)
+        .expect("Vec<u8> writes are infallible");
+    for prop in descriptor.key_properties() {
+        // SAFETY: `prop.offset` is in-range for `descriptor`'s layout
+        // by descriptor construction; `value.data_ptr()` points at a
+        // buffer of that layout for `&self`'s lifetime.
+        unsafe {
+            let p = base.add(prop.offset);
+            if (prop.vtable.is_set)(p) {
+                (prop.vtable.encode_value)(p, &mut encoder)
+                    .expect("Vec<u8> writes are infallible");
+            } else {
+                encoder.null().expect("Vec<u8> writes are infallible");
+            }
+        }
+    }
+}
+
 /// Walk the descriptor and emit each set property to the encoder.
 ///
 /// # Safety

@@ -405,17 +405,11 @@ where
             _phantom: PhantomData,
         };
         let type_name = T::type_descriptor().name.to_string();
-        let id = {
-            let mut state = self.dispatch.lock().expect("dispatch mutex poisoned");
-            state.next_id += 1;
-            let id = state.next_id;
-            state
-                .entries
-                .entry(type_name.clone())
-                .or_default()
-                .push((id, Box::new(entry)));
-            id
-        };
+        let id = self
+            .dispatch
+            .lock()
+            .expect("dispatch mutex poisoned")
+            .register(type_name.clone(), Box::new(entry));
         Subscription {
             rx,
             type_name,
@@ -423,6 +417,21 @@ where
             dispatch: Arc::downgrade(&self.dispatch),
             _phantom: PhantomData,
         }
+    }
+
+    /// Build a typed local cache mirror for `T`. The returned
+    /// [`Container<T>`] receives the same dispatched transmissions as
+    /// any [`Subscription<T>`] and updates its keyed map in place —
+    /// `create` / `update` / `remove` semantics are derived from
+    /// `header.remove_obj` and prior contents.
+    ///
+    /// Like [`subscribe`](Self::subscribe), takes `&self` so it can
+    /// be called from within `select!` arms holding `&mut self`.
+    pub fn container<T>(&self) -> crate::Container<T>
+    where
+        T: StructValue + Default + Send + 'static,
+    {
+        crate::container::make_container(&self.dispatch)
     }
 
     /// Current connection state. Becomes [`DotsConnectionState::Connected`]
@@ -499,13 +508,10 @@ impl<T: Unpin> Stream for Subscription<T> {
 impl<T> Drop for Subscription<T> {
     fn drop(&mut self) {
         if let Some(dispatch) = self.dispatch.upgrade() {
-            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
-            if let Some(entries) = state.entries.get_mut(&self.type_name) {
-                entries.retain(|(id, _)| *id != self.id);
-                if entries.is_empty() {
-                    state.entries.remove(&self.type_name);
-                }
-            }
+            dispatch
+                .lock()
+                .expect("dispatch mutex poisoned")
+                .unregister(&self.type_name, self.id);
         }
     }
 }
@@ -517,9 +523,34 @@ type DispatchEntries = Vec<(u64, Box<dyn DispatchEntry>)>;
 /// Type-erased dispatch table: map from wire `type_name` to the list of
 /// active subscribers for that type.
 #[derive(Default)]
-struct DispatchState {
-    next_id: u64,
-    entries: HashMap<String, DispatchEntries>,
+pub(crate) struct DispatchState {
+    pub(crate) next_id: u64,
+    pub(crate) entries: HashMap<String, DispatchEntries>,
+}
+
+impl DispatchState {
+    /// Insert a new entry under `type_name`, allocating a fresh id.
+    /// Returns the id so the caller can remove it later.
+    pub(crate) fn register(
+        &mut self,
+        type_name: String,
+        entry: Box<dyn DispatchEntry>,
+    ) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.entries.entry(type_name).or_default().push((id, entry));
+        id
+    }
+
+    /// Remove an entry by `(type_name, id)`. No-op if it isn't present.
+    pub(crate) fn unregister(&mut self, type_name: &str, id: u64) {
+        if let Some(entries) = self.entries.get_mut(type_name) {
+            entries.retain(|(eid, _)| *eid != id);
+            if entries.is_empty() {
+                self.entries.remove(type_name);
+            }
+        }
+    }
 }
 
 impl core::fmt::Debug for DispatchState {
@@ -530,14 +561,15 @@ impl core::fmt::Debug for DispatchState {
     }
 }
 
-/// Object-safe view of a single typed subscriber. The connection's
-/// dispatch loop calls [`dispatch`](DispatchEntry::dispatch) for each
-/// matching transmission; the impl decodes the payload as its `T` and
-/// pushes the resulting [`Event<T>`] onto the subscriber's channel.
-trait DispatchEntry: Send {
+/// Object-safe view of a single typed dispatch entry. The connection's
+/// read loop calls [`dispatch`](DispatchEntry::dispatch) for each
+/// matching transmission; impls decode the payload and route it to
+/// either a subscriber's channel ([`TypedDispatchEntry`]) or a
+/// container's local mirror.
+pub(crate) trait DispatchEntry: Send {
     /// Decode and forward the transmission. Returns `Ok(false)` if the
-    /// subscriber's receiver has been dropped (so the entry should be
-    /// removed); `Ok(true)` if the entry should be kept.
+    /// entry should be removed (e.g. the subscriber's receiver was
+    /// dropped); `Ok(true)` if it should be kept.
     fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError>;
 
     /// Type-erasure escape hatch (currently unused by the dispatch
