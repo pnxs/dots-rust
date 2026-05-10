@@ -1073,3 +1073,78 @@ async fn dynamic_subscribe_receives_event_with_runtime_descriptor() {
     gt.exit();
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
 }
+
+#[tokio::test]
+async fn dynamic_publish_routes_through_broker_to_typed_subscriber() {
+    use dots_core::{DynamicStructDescriptor, DynamicStruct, DynamicValue, PropertySet};
+
+    let host = HostTransceiver::new("dyn-pub-host");
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    // Subscriber: typed Pinger.
+    let (host_io_sub, guest_io_sub) = tokio::io::duplex(8192);
+    host.accept(host_io_sub);
+    let conn_sub = ConnectionBuilder::new(guest_io_sub, "sub", registry.clone())
+        .preload(false)
+        .publishes::<Pinger>()
+        .connect()
+        .await
+        .unwrap();
+    let (gt_sub, driver_sub) =
+        GuestTransceiver::from_connection("sub".to_string(), registry.clone(), conn_sub);
+    let mut sub = gt_sub.subscribe_stream::<Pinger>();
+    let driver_sub_handle = tokio::spawn(driver_sub.run());
+
+    // Wait for subscriber to join.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("Pinger") >= 1 {
+            break;
+        }
+    }
+    assert_eq!(host.group_size("Pinger"), 1);
+
+    // Publisher: dynamic — knows Pinger only as a runtime descriptor.
+    let pub_registry = Arc::new(registry_with_internal_types());
+    let (host_io_pub, guest_io_pub) = tokio::io::duplex(8192);
+    host.accept(host_io_pub);
+    let conn_pub = ConnectionBuilder::new(guest_io_pub, "dyn-pub", pub_registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt_pub, driver_pub) =
+        GuestTransceiver::from_connection("dyn-pub".to_string(), pub_registry.clone(), conn_pub);
+    let driver_pub_handle = tokio::spawn(driver_pub.run());
+
+    let descriptor = Arc::new(DynamicStructDescriptor::from_static(Pinger::DESCRIPTOR));
+    pub_registry.register_struct_dynamic(descriptor.clone());
+
+    // Build a DynamicStruct populated with id, message, sequence.
+    let valid = PropertySet::EMPTY.with_tag(1).with_tag(2).with_tag(3);
+    let value = DynamicStruct {
+        descriptor,
+        valid,
+        properties: vec![
+            (1, DynamicValue::U32(11)),
+            (2, DynamicValue::String("from-dyn".into())),
+            (3, DynamicValue::U64(77)),
+        ],
+    };
+    gt_pub.publish_dynamic(&value).unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("timed out waiting for typed subscriber")
+        .expect("subscription closed");
+    assert_eq!(event.value.id, Some(11));
+    assert_eq!(event.value.message.as_deref(), Some("from-dyn"));
+    assert_eq!(event.value.sequence, Some(77));
+
+    gt_sub.exit();
+    gt_pub.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_sub_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_pub_handle).await;
+}

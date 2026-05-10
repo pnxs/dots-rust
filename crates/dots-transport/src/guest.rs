@@ -22,7 +22,8 @@ use dots_core::{
 };
 use dots_model::{
     DotsHeader, DotsMember, DotsMemberEvent, EnumDescriptorData, Registry, StructDescriptorData,
-    Transmission, encode_typed_transmission_into, encode_typed_transmission_with_mask_into,
+    Transmission, encode_dynamic_transmission_into, encode_typed_transmission_into,
+    encode_typed_transmission_with_mask_into,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -333,6 +334,30 @@ impl GuestTransceiver {
         };
         let mut bytes = Vec::with_capacity(64);
         encode_typed_transmission_with_mask_into(&header, value, mask, &mut bytes);
+        self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
+    }
+
+    /// Publish a runtime-described value. The wire `type_name` and
+    /// `attributes` come from `value.descriptor.name` and
+    /// `value.valid` respectively. Used by dynamic clients that
+    /// construct a [`DynamicStruct`] from a runtime descriptor (often
+    /// learned from the broker via `StructDescriptorData`).
+    ///
+    /// Note: the descriptor is *not* re-published to the broker here.
+    /// If the descriptor was learned from the broker, the broker
+    /// already knows it; if the caller built it locally, they must
+    /// publish a `StructDescriptorData` for it themselves before any
+    /// peer can decode the payload.
+    pub fn publish_dynamic(&self, value: &DynamicStruct) -> Result<(), ClientClosed> {
+        let header = DotsHeader {
+            type_name: Some(value.descriptor.name.clone().into()),
+            attributes: Some(value.valid.bits()),
+            sender: self.client_id(),
+            sent_time: Some(now_timepoint()),
+            ..Default::default()
+        };
+        let mut bytes = Vec::with_capacity(64);
+        encode_dynamic_transmission_into(&header, value, &mut bytes);
         self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
     }
 

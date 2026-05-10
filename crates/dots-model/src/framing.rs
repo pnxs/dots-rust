@@ -180,6 +180,22 @@ impl Transmission {
     }
 }
 
+/// Append a frame whose payload is a [`DynamicStruct`] to an existing
+/// buffer. Companion to [`encode_typed_transmission_into`] for the
+/// runtime-described publish path — used by dynamic clients that
+/// don't have a compiled-in `T`.
+pub fn encode_dynamic_transmission_into(
+    header: &DotsHeader,
+    payload: &DynamicStruct,
+    out: &mut Vec<u8>,
+) {
+    let frame_start = out.len();
+    out.extend_from_slice(&[SIZE_PREFIX_MARKER, 0, 0, 0, 0]);
+    encode_into_vec(header, out);
+    payload.encode_into(out);
+    patch_size_prefix(out, frame_start);
+}
+
 /// Patch the 4-byte big-endian size field of a frame whose 5-byte
 /// prefix begins at `frame_start` in `buf`.
 fn patch_size_prefix(buf: &mut [u8], frame_start: usize) {

@@ -334,6 +334,12 @@ impl App {
         self.transceiver.remove(value)
     }
 
+    /// Publish a runtime-described value — see
+    /// [`GuestTransceiver::publish_dynamic`].
+    pub fn publish_dynamic(&self, value: &DynamicStruct) -> Result<(), ClientClosed> {
+        self.transceiver.publish_dynamic(value)
+    }
+
     pub fn exit(&self) {
         self.transceiver.exit()
     }
