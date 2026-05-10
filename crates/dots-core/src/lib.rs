@@ -39,7 +39,7 @@ pub use layout::{
 };
 pub use property_set::PropertySet;
 pub use temporal::{Duration, Timepoint};
-pub use value::StructValue;
+pub use value::{Publishable, StructValue};
 
 /// Re-export of the `minicbor` crate so derived code and downstream users
 /// reference a single, version-aligned copy. Prefer importing

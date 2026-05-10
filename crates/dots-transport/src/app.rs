@@ -28,7 +28,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use dots_core::{EnumDescriptor, StructValue};
+use dots_core::{EnumDescriptor, Publishable, StructValue};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
@@ -297,7 +297,7 @@ impl App {
 
     pub fn publish<T>(&self, value: &T) -> Result<(), ClientClosed>
     where
-        T: StructValue,
+        T: StructValue + Publishable,
     {
         self.transceiver.publish(value)
     }
@@ -305,7 +305,7 @@ impl App {
     /// Publish a removal — see [`GuestTransceiver::remove`].
     pub fn remove<T>(&self, value: &T) -> Result<(), ClientClosed>
     where
-        T: StructValue,
+        T: StructValue + Publishable,
     {
         self.transceiver.remove(value)
     }

@@ -154,13 +154,20 @@ Working:
 - `DotsClient` lifecycle publishes; `DotsMember(Join/Leave)` ref-counted
 - `Container<T>` typed local cache mirror
 - Auto-registration of nested struct + enum descriptors
+- Compile-time substruct-only enforcement: `#[dots(substruct_only)]`
+  types don't implement `Publishable`, so passing them to
+  `publish` / `remove` is rejected at the call site
+
+Performance: the broker matches or beats `dots-cpp` on the shared
+producer/subscriber benchmark — currently ~5% under the C++ baseline at
+single-subscriber, ~26% under at 16 subscribers (per-guest drainer task,
+sync producer path).
 
 Known gaps:
 
 - Server-side authentication: host always replies `auth_required=false`;
   the verification path and `DotsAuthentication` rule store aren't wired
 - `DotsDaemonStatus` periodic publish (broker observability)
-- Substruct-only enforcement at publish time
 - WebSocket transport
 - Producer/consumer split example (the demo client mixes both roles)
 

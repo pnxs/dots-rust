@@ -34,3 +34,20 @@ pub trait StructValue: Any {
     /// `descriptor().properties` are relative to this base.
     fn data_ptr(&self) -> *const u8;
 }
+
+/// Marker for DOTS structs that are allowed to be published as
+/// top-level instances.
+///
+/// `#[derive(DotsStruct)]` emits this impl automatically *unless* the
+/// struct carries `#[dots(substruct_only)]` (or `[substruct_only]` in a
+/// `.dots` file). Callers of [`publish`] / [`remove`] are therefore
+/// statically prevented from sending a substruct-only type — the
+/// compiler reports a missing `Publishable` bound at the call site.
+///
+/// Dynamic values (`AnyStruct`) deliberately do not implement this
+/// trait; if dynamic publishing is needed later it should go through a
+/// runtime-checked helper that consults `descriptor().flags`.
+///
+/// [`publish`]: https://docs.rs/dots-transport
+/// [`remove`]: https://docs.rs/dots-transport
+pub trait Publishable: StructValue {}

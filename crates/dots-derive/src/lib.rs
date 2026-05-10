@@ -219,6 +219,17 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         struct_ident.span(),
     );
 
+    // Marker impl that gates `publish` / `remove`. Substruct-only
+    // structs are nested-only by definition, so they don't get one
+    // and the compile error fires at the publish call site.
+    let publishable_impl = if container.substruct_only {
+        quote! {}
+    } else {
+        quote! {
+            impl ::dots_core::Publishable for #struct_ident {}
+        }
+    };
+
     let output = quote! {
         // Hidden module-level block so per-property vtables and the
         // descriptor live at 'static lifetime even when nothing else
@@ -279,6 +290,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 (self as *const Self).cast::<u8>()
             }
         }
+
+        #publishable_impl
 
         // `DotsTypeKind` lets the parent struct's macro look up this
         // type's `FieldKind` without needing to know whether it's a

@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
 use bytes::BufMut;
-use dots_core::{EnumDescriptor, StructDescriptor, StructValue, decode_typed_from_slice};
+use dots_core::{
+    EnumDescriptor, Publishable, StructDescriptor, StructValue, decode_typed_from_slice,
+};
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
     EnumDescriptorData, Registry, StructDescriptorData, Transmission,
@@ -384,7 +386,7 @@ where
     /// own descriptor name is what should appear in the header.
     pub async fn publish<T>(&mut self, value: &T) -> Result<(), ConnectionError>
     where
-        T: StructValue,
+        T: StructValue + Publishable,
     {
         let type_name = value.descriptor().name;
         self.send_typed(type_name, value).await

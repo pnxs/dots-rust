@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::Mutex as AsyncMutex;
 
-use dots_core::{DynamicStruct, PropertySet, StructValue, decode_typed_from_slice, key_set};
+use dots_core::{
+    DynamicStruct, PropertySet, Publishable, StructValue, decode_typed_from_slice, key_set,
+};
 use dots_model::{
     DotsCacheInfo, DotsConnectionState, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect,
     DotsMsgConnectResponse, DotsMsgHello, EnumDescriptorData, RawTransmission, Registry,
@@ -574,7 +576,7 @@ impl HostTransceiver {
     /// drainer tasks.
     pub fn publish<T>(&self, value: &T)
     where
-        T: StructValue,
+        T: StructValue + Publishable,
     {
         let type_name = value.descriptor().name;
         let header = DotsHeader {
@@ -598,7 +600,7 @@ impl HostTransceiver {
     /// from the host's cache pool.
     pub fn remove<T>(&self, value: &T)
     where
-        T: StructValue,
+        T: StructValue + Publishable,
     {
         let type_name = value.descriptor().name;
         let mask = key_set(value);

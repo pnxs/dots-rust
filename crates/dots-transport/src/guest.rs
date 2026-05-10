@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use dots_core::{
-    EnumDescriptor, StructDescriptor, StructValue, Timepoint, decode_typed_from_slice, key_set,
+    EnumDescriptor, Publishable, StructDescriptor, StructValue, Timepoint, decode_typed_from_slice,
+    key_set,
 };
 use dots_model::{
     DotsHeader, DotsMember, DotsMemberEvent, EnumDescriptorData, Registry, StructDescriptorData,
@@ -267,9 +268,13 @@ impl GuestTransceiver {
 
     /// Publish a typed value. Synchronous — bytes are pushed onto the
     /// outbound channel and sent by the [`GuestDriver::run`] loop.
+    ///
+    /// Substruct-only types (`#[dots(substruct_only)]`) intentionally
+    /// don't implement [`Publishable`], so this fails to compile at
+    /// the call site rather than producing a runtime error.
     pub fn publish<T>(&self, value: &T) -> Result<(), ClientClosed>
     where
-        T: StructValue,
+        T: StructValue + Publishable,
     {
         self.register_struct_descriptor(T::type_descriptor());
         self.publish_typed(value)
@@ -283,7 +288,7 @@ impl GuestTransceiver {
     /// Mirrors C++ `transceiver.remove(instance)`.
     pub fn remove<T>(&self, value: &T) -> Result<(), ClientClosed>
     where
-        T: StructValue,
+        T: StructValue + Publishable,
     {
         self.register_struct_descriptor(T::type_descriptor());
         let mask = key_set(value);
