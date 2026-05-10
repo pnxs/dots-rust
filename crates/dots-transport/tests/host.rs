@@ -1148,3 +1148,110 @@ async fn dynamic_publish_routes_through_broker_to_typed_subscriber() {
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_sub_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_pub_handle).await;
 }
+
+#[tokio::test]
+async fn subscribe_new_struct_type_catches_up_on_existing_descriptors() {
+    use dots_core::DynamicStructDescriptor;
+    use std::sync::Mutex;
+
+    // The guest's registry already has Pinger registered before
+    // subscribe_new_struct_type is called — sync catch-up should
+    // invoke the handler for it immediately.
+    let host = HostTransceiver::new("nt-host");
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+
+    let conn = ConnectionBuilder::new(guest_io, "nt-guest", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) =
+        GuestTransceiver::from_connection("nt-guest".to_string(), registry.clone(), conn);
+    let driver_handle = tokio::spawn(driver.run());
+
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+    let _handle = gt.subscribe_new_struct_type(move |desc: &Arc<DynamicStructDescriptor>| {
+        captured_clone.lock().unwrap().push(desc.name.clone());
+    });
+
+    let names = captured.lock().unwrap().clone();
+    assert!(
+        names.iter().any(|n| n == "Pinger"),
+        "catch-up should have invoked handler for Pinger; got {names:?}"
+    );
+
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+}
+
+#[tokio::test]
+async fn subscribe_new_struct_type_fires_for_wire_descriptor_arrivals() {
+    use dots_core::DynamicStructDescriptor;
+    use dots_model::StructDescriptorData;
+    use std::sync::Mutex;
+
+    let host = HostTransceiver::new("nt-wire-host");
+    let registry = registry();
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+    let conn = ConnectionBuilder::new(guest_io, "nt-wire-guest", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) =
+        GuestTransceiver::from_connection("nt-wire-guest".to_string(), registry.clone(), conn);
+    let driver_handle = tokio::spawn(driver.run());
+
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+    let _handle = gt.subscribe_new_struct_type(move |desc: &Arc<DynamicStructDescriptor>| {
+        captured_clone.lock().unwrap().push(desc.name.clone());
+    });
+    // Catch-up sees the DOTS-internal types but not Pinger — the
+    // guest hasn't learned about Pinger yet.
+    assert!(
+        !captured.lock().unwrap().iter().any(|n| n == "Pinger"),
+        "Pinger should not be in catch-up — guest hasn't seen it yet"
+    );
+
+    // Wait for the guest's DotsMember(Join, "StructDescriptorData")
+    // to land at the broker — without this, the host's publish below
+    // might race the join and not get routed.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("StructDescriptorData") >= 1 {
+            break;
+        }
+    }
+    assert!(host.group_size("StructDescriptorData") >= 1);
+
+    // Host publishes Pinger's descriptor data — the broker will
+    // route it to every guest subscribed to StructDescriptorData
+    // (which our subscribe_new_struct_type just installed).
+    host.publish(&StructDescriptorData::from_static(Pinger::DESCRIPTOR));
+
+    let mut names: Vec<String> = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        names = captured.lock().unwrap().clone();
+        if names.iter().any(|n| n == "Pinger") {
+            break;
+        }
+    }
+    assert!(
+        names.iter().any(|n| n == "Pinger"),
+        "wire arrival should fire handler for Pinger; got {names:?}"
+    );
+    // Registry should now know Pinger.
+    assert!(registry.lookup("Pinger").is_some());
+
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+}

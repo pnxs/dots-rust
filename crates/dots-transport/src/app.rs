@@ -296,6 +296,15 @@ impl App {
         self.transceiver.subscribe_dynamic(descriptor, handler)
     }
 
+    /// Subscribe to type-system events — see
+    /// [`GuestTransceiver::subscribe_new_struct_type`].
+    pub fn subscribe_new_struct_type<F>(&self, handler: F) -> SubscriptionHandle
+    where
+        F: FnMut(&Arc<DynamicStructDescriptor>) + Send + 'static,
+    {
+        self.transceiver.subscribe_new_struct_type(handler)
+    }
+
     pub fn container<T>(&self) -> Container<T>
     where
         T: StructValue + Default + Send + 'static,

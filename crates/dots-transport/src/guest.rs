@@ -232,6 +232,54 @@ impl GuestTransceiver {
         sub
     }
 
+    /// Subscribe to type-system events: every `StructDescriptorData`
+    /// arriving on the wire is converted to a [`DynamicStructDescriptor`],
+    /// registered with the codec registry, and passed to `handler`.
+    /// Additionally, `handler` is invoked synchronously for each
+    /// currently-registered struct descriptor before this returns
+    /// (catch-up replay), so a fresh subscriber sees what's already
+    /// known plus everything that arrives afterwards.
+    ///
+    /// Mirrors dots-cpp's `subscribe<StructDescriptor>` /
+    /// `DynamicTypeReceiver` pattern. Combine with
+    /// [`subscribe_dynamic`](Self::subscribe_dynamic) and
+    /// [`publish_dynamic`](Self::publish_dynamic) for a fully
+    /// dynamic client.
+    pub fn subscribe_new_struct_type<F>(self: &Arc<Self>, handler: F) -> SubscriptionHandle
+    where
+        F: FnMut(&Arc<DynamicStructDescriptor>) + Send + 'static,
+    {
+        let handler = Arc::new(Mutex::new(handler));
+
+        {
+            let mut h = handler.lock().expect("handler mutex poisoned");
+            for desc in self.registry.iter_structs() {
+                h(&desc);
+            }
+        }
+
+        let registry = self.registry.clone();
+        let handler_for_wire = handler.clone();
+        self.subscribe::<StructDescriptorData>(move |event| {
+            match registry.build_dynamic_struct(&event.value) {
+                Ok(desc) => {
+                    let arc = Arc::new(desc);
+                    registry.register_struct_dynamic(arc.clone());
+                    if let Ok(mut h) = handler_for_wire.lock() {
+                        h(&arc);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        type_name = ?event.value.name,
+                        "could not build dynamic descriptor from wire StructDescriptorData",
+                    );
+                }
+            }
+        })
+    }
+
     /// Subscribe to a runtime-described type. The handler receives an
     /// [`Event<DynamicStruct>`] for every transmission whose
     /// `header.type_name` matches `descriptor.name`.
