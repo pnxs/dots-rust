@@ -416,11 +416,13 @@ fn deallocate(ptr: NonNull<u8>, layout: Layout) {
 // `DotsField` abstracts over "any type that can occupy a DOTS struct
 // field". The per-property thunks dispatch through it.
 //
-// We do *not* use a blanket impl over `T: minicbor::Encode + Decode`,
-// because that would force `Vec<u8>` to encode as a CBOR array (minicbor's
-// default for `Vec<T>`) rather than as a CBOR byte string. The wire-format
-// compatibility with C++ DOTS requires byte-string for `Vec<u8>`, so we
-// write explicit per-leaf-type impls below.
+// We do *not* use a blanket impl over `T: minicbor::Encode + Decode`
+// because some leaf types need wire-format choices that diverge from
+// minicbor's defaults — so each is given an explicit impl below. The
+// `Vec<u8>` case in particular: it follows the same `opt_encode_vec`
+// path as every other `Vec<T>`, producing a CBOR array of u8 (matching
+// dots-cpp's `CborSerializer::visitVectorBeginDerived`, which has no
+// byte-string special case for `vector_t<uint8_t>`).
 //
 // `#[derive(DotsStruct)]` adds one more impl family on top: every derived
 // struct gets a manual `DotsField` impl that delegates to the descriptor-
@@ -462,22 +464,6 @@ impl_dots_field_via_minicbor!(
     f32, f64,
     alloc::string::String,
 );
-
-/// `Vec<u8>` is a special case: minicbor's default `Vec<T>` impl encodes
-/// as a CBOR array, but DOTS uses CBOR byte strings for raw bytes
-/// (cross-language compatibility with C++ DOTS). Manual impl writes
-/// `bytes` / reads `bytes` directly.
-impl DotsField for Vec<u8> {
-    #[inline]
-    fn dots_encode(&self, e: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
-        e.bytes(self)?;
-        Ok(())
-    }
-    #[inline]
-    fn dots_decode(d: &mut CborDecoder<'_>) -> Result<Self, DecodeError> {
-        Ok(d.bytes()?.to_vec())
-    }
-}
 
 /// Safe wrapper used by the manual `DotsField` impl that the proc-macro
 /// emits for derived DOTS structs. Encodes via the descriptor-driven path.
@@ -599,10 +585,9 @@ pub unsafe fn opt_drop<T>(ptr: *mut u8) {
 
 // ===== Vec<T> thunk family =====
 //
-// For `Option<Vec<X>>` fields where `X` is not `u8`, the proc-macro
+// For every `Option<Vec<X>>` field — including `Vec<u8>` — the proc-macro
 // reaches for these helpers instead of `opt_encode`/`opt_decode`. The
-// wire format is a CBOR array of `X` (whereas `Vec<u8>` stays on the
-// byte-string path through the regular `opt_*` thunks).
+// wire format is a CBOR array of `X`, matching dots-cpp.
 //
 // `is_set` and `drop_in_place` simply use `opt_is_set::<Vec<X>>` and
 // `opt_drop::<Vec<X>>` — `Vec<X>` is a normal owned type for those

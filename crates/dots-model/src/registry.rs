@@ -277,8 +277,15 @@ impl Registry {
     ///
     /// Recognized:
     /// - Primitives: `bool`, `uint8..64`, `int8..64`, `float32`, `float64`, `string`
-    /// - Bytes: `vector<uint8>` (treated specially to preserve byte-string wire format)
-    /// - Arrays: `vector<X>` for any inner type X
+    /// - Arrays: `vector<X>` for any inner type X (including `vector<uint8>`,
+    ///   which is a CBOR array of u8 — *not* a byte string. dots-cpp's
+    ///   `CborSerializer::visitVectorBeginDerived` always emits major-type-4
+    ///   for `vector_t<T>`, with no special case for byte vectors.)
+    /// - `.dots`-source aliases used by dots-cpp peers: `property_set`
+    ///   (u32 on the wire — `PropertySet::value_t` is `uint32_t` in
+    ///   dots-cpp) and `uuid` (16-byte CBOR byte string —
+    ///   `dots::serialization::CborWriter::write(std::array<uint8_t,N>)`
+    ///   emits major-type-2).
     /// - Named types: looked up in the registry; struct or enum entries match.
     pub fn parse_type_name(&self, raw: &str) -> Result<DynamicFieldKind, RegistryError> {
         let s = raw.trim();
@@ -298,13 +305,18 @@ impl Registry {
             "timepoint" => return Ok(DynamicFieldKind::Timepoint),
             "duration" => return Ok(DynamicFieldKind::Duration),
             "steady_timepoint" => return Ok(DynamicFieldKind::Timepoint),
+            // `.dots` source-level aliases. dots-cpp emits these names
+            // verbatim in `StructDescriptorData.properties[].type_name`;
+            // dots-rust's own codegen rewrites them to `uint64` /
+            // `vector<uint8>` so we never see them on the wire from a
+            // Rust peer — but we must still accept them from a dots-cpp
+            // peer publishing its descriptors.
+            "property_set" => return Ok(DynamicFieldKind::U32),
+            "uuid" => return Ok(DynamicFieldKind::Bytes),
             _ => {}
         }
 
         if let Some(inner) = strip_vector(s) {
-            if inner.trim() == "uint8" {
-                return Ok(DynamicFieldKind::Bytes);
-            }
             let inner_kind = self.parse_type_name(inner)?;
             return Ok(DynamicFieldKind::Vec(Box::new(inner_kind)));
         }
@@ -348,12 +360,16 @@ mod tests {
     }
 
     #[test]
-    fn vector_of_uint8_is_bytes() {
+    fn vector_of_uint8_is_array_not_bytestring() {
+        // dots-cpp's CborSerializer encodes every `vector_t<T>` as a
+        // CBOR array — including `vector<uint8>`. Mapping to `Vec(U8)`
+        // matches that wire format. (Byte-string is reserved for
+        // `uuid`, which dots-cpp emits as `std::array<uint8_t, 16>`.)
         let r = Registry::new();
-        assert!(matches!(
-            r.parse_type_name("vector<uint8>"),
-            Ok(DynamicFieldKind::Bytes)
-        ));
+        match r.parse_type_name("vector<uint8>").unwrap() {
+            DynamicFieldKind::Vec(inner) => assert!(matches!(*inner, DynamicFieldKind::U8)),
+            other => panic!("expected Vec(U8), got {other:?}"),
+        }
     }
 
     #[test]

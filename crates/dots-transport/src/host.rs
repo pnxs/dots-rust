@@ -113,7 +113,7 @@ impl GuestWriter {
         Arc::new(Self {
             handle,
             state: Mutex::new(WriteState {
-                queue: bytes::BytesMut::with_capacity(2048),
+                queue: bytes::BytesMut::with_capacity(64*1024),
                 overflow: false,
                 closed: false,
             }),
@@ -1108,10 +1108,32 @@ fn handle_connected_message(
         register_incoming_struct(host, raw);
     } else if type_name == "EnumDescriptorData" {
         register_incoming_enum(host, raw);
+    } else if type_name == "DotsMsgError" {
+        // dots-cpp sends `DotsMsgError{ .errorCode = 0 }` from its
+        // Connection destructor as part of graceful shutdown
+        // (`Connection.cpp:60`), so code 0 is *not* an error — it's a
+        // clean-close marker. Non-zero codes are real protocol errors;
+        // either way the peer will close the socket and our reader
+        // loop sees EOF.
+        match decode_typed_from_slice::<dots_model::DotsMsgError>(&raw.payload) {
+            Ok(err) if err.error_code == Some(0) => tracing::debug!(
+                client_id,
+                "guest signalled graceful close via DotsMsgError(0)",
+            ),
+            Ok(err) => tracing::warn!(
+                client_id,
+                error_code = ?err.error_code,
+                error_text = ?err.error_text,
+                "guest reported protocol error",
+            ),
+            Err(e) => tracing::warn!(
+                client_id, error = %e, "received malformed DotsMsgError",
+            ),
+        }
+        return;
     } else if type_name == "DotsMsgConnect"
         || type_name == "DotsMsgConnectResponse"
         || type_name == "DotsMsgHello"
-        || type_name == "DotsMsgError"
     {
         // Handshake messages outside the handshake — log and drop.
         tracing::warn!(client_id, type_name, "stray handshake message after preload");

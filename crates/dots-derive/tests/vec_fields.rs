@@ -1,9 +1,9 @@
 //! `Vec<T>` field support.
 //!
-//! `Vec<u8>` stays on the CBOR byte-string path (single tagged byte
-//! string on the wire) for cross-language compatibility with C++ DOTS.
-//! `Vec<X>` for any other `X` encodes as a CBOR array, with each
-//! element going through its own `DotsField::dots_encode`.
+//! Every `Vec<X>` — including `Vec<u8>` — encodes as a CBOR array,
+//! with each element going through its own `DotsField::dots_encode`.
+//! Matches dots-cpp, whose `CborSerializer::visitVectorBeginDerived`
+//! has no byte-string special case for `vector_t<uint8_t>`.
 //!
 //! Element types covered:
 //! - primitives (`u32`)
@@ -28,7 +28,7 @@ struct Catalog {
     #[dots(tag = 1, key)]
     id: Option<u32>,
     #[dots(tag = 2)]
-    raw: Option<Vec<u8>>,           // bytes path
+    raw: Option<Vec<u8>>,           // array of u8 (matches dots-cpp)
     #[dots(tag = 3)]
     counters: Option<Vec<u32>>,     // array of primitives
     #[dots(tag = 4)]
@@ -40,7 +40,10 @@ struct Catalog {
 #[test]
 fn field_kinds_route_correctly() {
     let p = |tag| Catalog::DESCRIPTOR.property(tag).unwrap();
-    assert!(matches!(p(2).kind, FieldKind::Bytes));
+    match p(2).kind {
+        FieldKind::Vec(inner) => assert!(matches!(inner, FieldKind::U8)),
+        other => panic!("raw: expected Vec(U8), got {other:?}"),
+    }
     match p(3).kind {
         FieldKind::Vec(inner) => assert!(matches!(inner, FieldKind::U32)),
         other => panic!("counters: expected Vec(U32), got {other:?}"),
@@ -104,20 +107,21 @@ fn vec_of_nested_structs_roundtrip() {
 }
 
 #[test]
-fn vec_u8_uses_byte_string_wire_format() {
-    // Bytes-only field — verify the CBOR header indicates a byte string,
-    // not an array. CBOR byte string (length 3) is 0x43 0x?? 0x?? 0x??.
+fn vec_u8_uses_array_wire_format() {
+    // dots-cpp encodes `vector<uint8>` as a CBOR array of u8 (each
+    // element a single-byte CBOR uint), not a byte string. Verify
+    // dots-rust does the same.
     let s = Catalog {
         raw: Some(vec![1, 2, 3]),
         ..Default::default()
     };
     let bytes = encode_to_vec(&s);
-    // Find the value bytes after the tag header. Map(1) + tag(2) prefix
-    // is `0xa1 0x02`.
+    // Map(1) + tag(2) prefix is `0xa1 0x02`.
     assert_eq!(&bytes[..2], &[0xa1, 0x02]);
-    // Then the byte-string header for length 3 is 0x43.
-    assert_eq!(bytes[2], 0x43);
-    assert_eq!(&bytes[3..], &[1, 2, 3]);
+    // Array header for length 3 is `0x83`.
+    assert_eq!(bytes[2], 0x83);
+    // Three u8 values 1, 2, 3 each fit in single-byte CBOR uint.
+    assert_eq!(&bytes[3..], &[0x01, 0x02, 0x03]);
 }
 
 #[test]

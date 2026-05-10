@@ -317,11 +317,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// fn-pointer fields pointing at monomorphizations of the generic
 /// `opt_*` helpers from `dots_core::layout`.
 ///
-/// `Option<Vec<X>>` fields where `X != u8` route through the
-/// `opt_*_vec<X>` helpers (CBOR array). `Option<Vec<u8>>` and all
-/// other field types stay on the regular `opt_*<T>` helpers, which
-/// dispatch through `T: DotsField` (byte-string for `Vec<u8>` via
-/// the manual minicbor delegate).
+/// `Option<Vec<X>>` fields route through the `opt_*_vec<X>` helpers
+/// (CBOR array). All other field types stay on the regular `opt_*<T>`
+/// helpers, which dispatch through `T: DotsField`. `Vec<u8>` follows
+/// the same array path as every other vector — matching dots-cpp's
+/// `CborSerializer`, which has no byte-string special case.
 fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
     let inner_ty = f.inner_ty;
     let vtable_ident = vtable_ident(f.ident);
@@ -350,7 +350,7 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
     }
 }
 
-/// If `ty` is `Vec<X>` for some `X != u8`, return `&X`. Otherwise `None`.
+/// If `ty` is `Vec<X>` for any `X`, return `&X`. Otherwise `None`.
 fn vec_element_type(ty: &Type) -> Option<&Type> {
     let Type::Path(tp) = ty else {
         return None;
@@ -362,16 +362,10 @@ fn vec_element_type(ty: &Type) -> Option<&Type> {
     let PathArguments::AngleBracketed(args) = &last.arguments else {
         return None;
     };
-    let inner = args.args.iter().find_map(|a| match a {
+    args.args.iter().find_map(|a| match a {
         GenericArgument::Type(t) => Some(t),
         _ => None,
-    })?;
-    if let Type::Path(inner_tp) = inner {
-        if inner_tp.path.is_ident("u8") {
-            return None;
-        }
-    }
-    Some(inner)
+    })
 }
 
 fn vtable_ident(field_ident: &Ident) -> Ident {
@@ -527,11 +521,12 @@ fn option_inner_type(ty: &Type) -> Option<&Type> {
 /// Map the syntactic field type to a `FieldKind` expression.
 ///
 /// Recognized primitives produce the matching `FieldKind` variant.
-/// `Vec<u8>` becomes `FieldKind::Bytes`. `Vec<X>` for non-byte `X`
-/// becomes `FieldKind::Vec(&<inner kind>)` (recursive). Anything else
-/// is treated as a nested DOTS struct: we emit
-/// `FieldKind::Struct(<T>::DESCRIPTOR)`, which fails to compile if the
-/// type is not in fact `#[derive(DotsStruct)]`.
+/// `Vec<X>` for any `X` (including `u8`) becomes
+/// `FieldKind::Vec(&<inner kind>)` — the wire format is a CBOR array,
+/// matching dots-cpp's `CborSerializer::visitVectorBeginDerived`.
+/// Anything else is treated as a nested DOTS struct: we emit
+/// `<T as DotsTypeKind>::KIND`, which fails to compile if the type is
+/// not in fact `#[derive(DotsStruct)]` / `#[derive(DotsEnum)]`.
 fn field_kind_for(ty: &Type) -> TokenStream2 {
     if let Type::Path(tp) = ty {
         if let Some(last) = tp.path.segments.last() {
@@ -556,12 +551,9 @@ fn field_kind_for(ty: &Type) -> TokenStream2 {
                 return quote! { ::dots_core::FieldKind::#kind_ident };
             }
             if name == "Vec" {
-                if is_vec_of_u8(&last.arguments) {
-                    return quote! { ::dots_core::FieldKind::Bytes };
-                }
-                // `Vec<X>` for non-byte X — recurse on inner type and
-                // wrap in `FieldKind::Vec(&inner)`. Rvalue static
-                // promotion lifts the inner literal to `'static`.
+                // `Vec<X>` — recurse on inner type and wrap in
+                // `FieldKind::Vec(&inner)`. Rvalue static promotion
+                // lifts the inner literal to `'static`.
                 if let Some(inner) = vec_element_type(ty) {
                     let inner_kind = field_kind_for(inner);
                     return quote! { ::dots_core::FieldKind::Vec(&#inner_kind) };
@@ -575,18 +567,6 @@ fn field_kind_for(ty: &Type) -> TokenStream2 {
     // fallback covers both nested structs and enums. Compile error
     // points at the type if it isn't a derived DOTS type.
     quote! { <#ty as ::dots_core::DotsTypeKind>::KIND }
-}
-
-fn is_vec_of_u8(args: &PathArguments) -> bool {
-    let PathArguments::AngleBracketed(a) = args else {
-        return false;
-    };
-    let Some(GenericArgument::Type(Type::Path(inner_tp))) =
-        a.args.iter().find(|x| matches!(x, GenericArgument::Type(_)))
-    else {
-        return false;
-    };
-    inner_tp.path.is_ident("u8")
 }
 
 fn build_flags_expr(c: &ContainerAttrs) -> TokenStream2 {

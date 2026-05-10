@@ -294,7 +294,10 @@ pub fn field_kind_type_name(kind: &FieldKind) -> String {
         FieldKind::F32 => "float32".into(),
         FieldKind::F64 => "float64".into(),
         FieldKind::String => "string".into(),
-        FieldKind::Bytes => "vector<uint8>".into(),
+        // `Bytes` represents a CBOR byte-string, which in DOTS only
+        // appears for `uuid` (a fixed 16-byte array). `vector<uint8>`
+        // routes through `Vec(U8)` instead, matching dots-cpp.
+        FieldKind::Bytes => "uuid".into(),
         FieldKind::Timepoint => "timepoint".into(),
         FieldKind::Duration => "duration".into(),
         FieldKind::Vec(inner) => format!("vector<{}>", field_kind_type_name(inner)),
@@ -322,7 +325,7 @@ pub fn dyn_field_kind_type_name(kind: &dots_core::DynamicFieldKind) -> String {
         DynamicFieldKind::F32 => "float32".into(),
         DynamicFieldKind::F64 => "float64".into(),
         DynamicFieldKind::String => "string".into(),
-        DynamicFieldKind::Bytes => "vector<uint8>".into(),
+        DynamicFieldKind::Bytes => "uuid".into(),
         DynamicFieldKind::Timepoint => "timepoint".into(),
         DynamicFieldKind::Duration => "duration".into(),
         DynamicFieldKind::Vec(inner) => format!("vector<{}>", dyn_field_kind_type_name(inner)),

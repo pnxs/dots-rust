@@ -93,9 +93,10 @@ fn vec_of_primitives_cross_roundtrip() {
 
 #[test]
 fn vec_of_bytes_cross_roundtrip() {
-    // Verifies the byte-string vs array distinction is preserved by
-    // the dynamic codec — Bytes decodes as DynamicValue::Bytes, which
-    // re-encodes as a CBOR byte string (not an array of u8).
+    // `Vec<u8>` encodes as a CBOR array of u8 (matching dots-cpp), so
+    // the dynamic decoder yields `DynamicValue::Vec` of `U8` items —
+    // not `DynamicValue::Bytes`. (Bytes is reserved for `uuid`, the
+    // only DOTS type that uses a CBOR byte string on the wire.)
     let original = Wire {
         id: Some(2),
         raw: Some(vec![0xde, 0xad, 0xbe, 0xef]),
@@ -112,7 +113,16 @@ fn vec_of_bytes_cross_roundtrip() {
         .iter()
         .find(|(t, _)| *t == 4)
         .unwrap();
-    assert!(matches!(raw, DynamicValue::Bytes(_)));
+    match raw {
+        DynamicValue::Vec(items) => {
+            assert_eq!(items.len(), 4);
+            assert!(matches!(items[0], DynamicValue::U8(0xde)));
+            assert!(matches!(items[1], DynamicValue::U8(0xad)));
+            assert!(matches!(items[2], DynamicValue::U8(0xbe)));
+            assert!(matches!(items[3], DynamicValue::U8(0xef)));
+        }
+        other => panic!("expected Vec, got {other:?}"),
+    }
 }
 
 #[test]
