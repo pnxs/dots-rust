@@ -996,3 +996,80 @@ async fn gt_exit_promptly_wakes_the_driver_on_a_quiet_connection() {
         .expect("driver should exit promptly when exit() is called");
     assert!(exit_result.is_ok(), "driver task ended cleanly");
 }
+
+#[tokio::test]
+async fn dynamic_subscribe_receives_event_with_runtime_descriptor() {
+    use std::sync::Mutex;
+    use dots_core::{DynamicStructDescriptor, DynamicValue};
+
+    let host = HostTransceiver::new("dyn-host");
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+
+    // Guest connects without compiling-in `Pinger` (we register
+    // a DynamicStructDescriptor built from the static one to simulate
+    // a guest that learned the type at runtime).
+    let guest_registry = Arc::new(registry_with_internal_types());
+    let conn = ConnectionBuilder::new(guest_io, "dyn-guest", guest_registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) = GuestTransceiver::from_connection(
+        "dyn-guest".to_string(),
+        guest_registry.clone(),
+        conn,
+    );
+    let driver_handle = tokio::spawn(driver.run());
+
+    let descriptor = Arc::new(DynamicStructDescriptor::from_static(Pinger::DESCRIPTOR));
+    let captured: Arc<Mutex<Vec<(u32, DynamicValue)>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+    let _handle = gt.subscribe_dynamic(descriptor, move |event| {
+        captured_clone
+            .lock()
+            .unwrap()
+            .extend(event.value.properties.iter().cloned());
+    });
+
+    // Wait for the join to land.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("Pinger") >= 1 {
+            break;
+        }
+    }
+    assert_eq!(host.group_size("Pinger"), 1);
+
+    host.publish(&Pinger {
+        id: Some(7),
+        message: Some("dynamic".into()),
+        sequence: Some(123),
+    });
+
+    // Spin until the handler captured the properties.
+    let mut props = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        props = captured.lock().unwrap().clone();
+        if !props.is_empty() {
+            break;
+        }
+    }
+    assert!(!props.is_empty(), "dynamic handler should have fired");
+
+    // Check the properties carry the right values via DynamicValue.
+    let id = props.iter().find(|(t, _)| *t == 1).map(|(_, v)| v).unwrap();
+    let msg = props.iter().find(|(t, _)| *t == 2).map(|(_, v)| v).unwrap();
+    let seq = props.iter().find(|(t, _)| *t == 3).map(|(_, v)| v).unwrap();
+    assert!(matches!(id, DynamicValue::U32(7)));
+    assert!(matches!(msg, DynamicValue::String(s) if s == "dynamic"));
+    assert!(matches!(seq, DynamicValue::U64(123)));
+
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+}

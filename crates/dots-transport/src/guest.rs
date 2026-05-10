@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use dots_core::{
-    EnumDescriptor, PropertySet, Publishable, StructDescriptor, StructValue, Timepoint,
-    decode_typed_from_slice, key_set,
+    DynamicStruct, DynamicStructDescriptor, EnumDescriptor, PropertySet, Publishable,
+    StructDescriptor, StructValue, Timepoint, decode_typed_from_slice, key_set,
 };
 use dots_model::{
     DotsHeader, DotsMember, DotsMemberEvent, EnumDescriptorData, Registry, StructDescriptorData,
@@ -229,6 +229,31 @@ impl GuestTransceiver {
         let mut sub = connection_subscribe::<T>(&self.dispatch);
         sub.set_leaver(self.make_leaver(group));
         sub
+    }
+
+    /// Subscribe to a runtime-described type. The handler receives an
+    /// [`Event<DynamicStruct>`] for every transmission whose
+    /// `header.type_name` matches `descriptor.name`.
+    ///
+    /// Used by dynamic clients (no compiled-in type) — typically the
+    /// descriptor was learned from the broker by subscribing to
+    /// `StructDescriptorData` and converting via
+    /// [`Registry::build_dynamic_struct`](dots_model::Registry::build_dynamic_struct).
+    /// Registers the descriptor with the codec registry so the read
+    /// loop can decode incoming wire bytes; joins the type group so
+    /// the broker routes (and replays cache for) this type.
+    pub fn subscribe_dynamic(
+        self: &Arc<Self>,
+        descriptor: Arc<DynamicStructDescriptor>,
+        handler: impl FnMut(&Event<DynamicStruct>) + Send + 'static,
+    ) -> SubscriptionHandle {
+        let type_name = descriptor.name.clone();
+        self.registry.register_struct_dynamic(descriptor);
+        self.join_group(&type_name);
+        let leaver = self.make_leaver(&type_name);
+        let mut handle = register_dynamic_callback(&self.dispatch, type_name, handler);
+        handle.set_leaver(leaver);
+        handle
     }
 
     /// Build a typed [`Container<T>`] for `T`.
@@ -700,6 +725,48 @@ where
         Ok(true)
     }
 
+}
+
+fn register_dynamic_callback<F>(
+    dispatch: &Arc<Mutex<DispatchState>>,
+    type_name: String,
+    handler: F,
+) -> SubscriptionHandle
+where
+    F: FnMut(&Event<DynamicStruct>) + Send + 'static,
+{
+    let entry = DynamicCallbackDispatchEntry { handler };
+    let id = dispatch
+        .lock()
+        .expect("dispatch mutex poisoned")
+        .register(type_name.clone(), Box::new(entry));
+    SubscriptionHandle {
+        type_name,
+        id,
+        dispatch: Arc::downgrade(dispatch),
+        leaver: None,
+    }
+}
+
+struct DynamicCallbackDispatchEntry<F> {
+    handler: F,
+}
+
+impl<F> DispatchEntry for DynamicCallbackDispatchEntry<F>
+where
+    F: FnMut(&Event<DynamicStruct>) + Send + 'static,
+{
+    fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError> {
+        // The codec already decoded the wire bytes into a
+        // `DynamicStruct` against the registry's descriptor for this
+        // type, so no further decode work is needed here.
+        let event = Event {
+            header: txn.header.clone(),
+            value: txn.payload.clone(),
+        };
+        (self.handler)(&event);
+        Ok(true)
+    }
 }
 
 /// Internal helper: register a stream subscription against a given

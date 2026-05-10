@@ -28,7 +28,9 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use dots_core::{EnumDescriptor, PropertySet, Publishable, StructValue};
+use dots_core::{
+    DynamicStruct, DynamicStructDescriptor, EnumDescriptor, PropertySet, Publishable, StructValue,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
@@ -282,6 +284,16 @@ impl App {
         T: StructValue + Default + Send + 'static,
     {
         self.transceiver.subscribe_stream::<T>()
+    }
+
+    /// Subscribe to a runtime-described type — see
+    /// [`GuestTransceiver::subscribe_dynamic`].
+    pub fn subscribe_dynamic(
+        &self,
+        descriptor: Arc<DynamicStructDescriptor>,
+        handler: impl FnMut(&Event<DynamicStruct>) + Send + 'static,
+    ) -> SubscriptionHandle {
+        self.transceiver.subscribe_dynamic(descriptor, handler)
     }
 
     pub fn container<T>(&self) -> Container<T>
