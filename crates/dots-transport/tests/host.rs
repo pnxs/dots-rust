@@ -159,8 +159,7 @@ async fn host_publish_reaches_subscribed_guest() {
         id: Some(99),
         message: Some("from host".into()),
         sequence: Some(42),
-    })
-    .await;
+    });
 
     let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
         .await
@@ -620,8 +619,7 @@ async fn host_serve_unix_routes_pinger_round_trip() {
         id: Some(1),
         message: Some("hi over uds".into()),
         sequence: Some(7),
-    })
-    .await;
+    });
     let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
         .await
         .expect("timed out")
