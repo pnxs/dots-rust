@@ -5,9 +5,9 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 rust-version = "1.85"
-license = "MIT OR Apache-2.0"
-authors = ["Thomas Schätzlein <ts@aibiot.de>"]
-repository = "https://github.com/thomas-schaetzlein/dots-rust"
+license = "LGPL-3.0"
+authors = ["Thomas Schätzlein <thomas@pnxs.de>"]
+repository = "https://github.com/pnxs/dots-rust"
 
 [workspace.dependencies]
 dots-core = { path = "crates/dots-core", version = "0.1.0" }
@@ -30,11 +30,16 @@ smallvec = "1"
 
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 
-sha2 = { version = "0.10", default-features = false }
-rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+sha2 = { version = "0.11", default-features = false }
+rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "thread_rng"] }
 
 [workspace.lints.rust]
 # Unsafe is denied workspace-wide; the only opt-in is dots-core's internal
 # `layout` module, which holds the audited raw-memory codec primitives
 # behind `#![allow(unsafe_code)]`. Every other crate stays unsafe-free.
 unsafe_code = "deny"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

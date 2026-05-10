@@ -173,4 +173,4 @@ Known gaps:
 
 ## License
 
-MIT OR Apache-2.0, matching the workspace `Cargo.toml`.
+LGPL-3.0
