@@ -465,6 +465,29 @@ impl_dots_field_via_minicbor!(
     alloc::string::String,
 );
 
+/// Fixed-size byte arrays — the wire format for DOTS `uuid` (16 bytes)
+/// and any other `.dots` `uuid`-shaped alias. Encoded as a CBOR
+/// ByteString, matching dots-cpp's
+/// `CborWriter::write(std::array<uint8_t, N>)`.
+impl<const N: usize> DotsField for [u8; N] {
+    #[inline]
+    fn dots_encode(&self, e: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
+        e.bytes(self)?;
+        Ok(())
+    }
+    #[inline]
+    fn dots_decode(d: &mut CborDecoder<'_>) -> Result<Self, DecodeError> {
+        let bytes = d.bytes()?;
+        bytes.try_into().map_err(|_| {
+            minicbor::decode::Error::message("uuid byte-string length mismatch")
+        })
+    }
+}
+
+impl<const N: usize> crate::DotsTypeKind for [u8; N] {
+    const KIND: crate::FieldKind = crate::FieldKind::Bytes;
+}
+
 /// Safe wrapper used by the manual `DotsField` impl that the proc-macro
 /// emits for derived DOTS structs. Encodes via the descriptor-driven path.
 pub fn encode_struct_value(

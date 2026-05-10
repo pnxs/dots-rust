@@ -503,6 +503,7 @@ impl HostTransceiver {
                     _uds_guard: None,
                 })
             }
+            #[cfg(unix)]
             crate::Endpoint::Uds(path) => {
                 // Best-effort cleanup of a stale socket file from a
                 // previous run. `bind` would otherwise fail with
@@ -517,6 +518,11 @@ impl HostTransceiver {
                     _uds_guard: Some(UdsSocketGuard { path }),
                 })
             }
+            #[cfg(not(unix))]
+            crate::Endpoint::Uds(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Unix domain sockets are only supported on Unix platforms",
+            )),
         }
     }
 
@@ -1333,12 +1339,10 @@ fn handle_clear_cache(host: &Arc<HostTransceiver>, raw: &RawTransmission) {
         let mut inner = host.inner.lock().expect("host mutex poisoned");
         let mut out = Vec::new();
         for type_name in &type_names {
-            let Some(map) = inner.pool.get_mut(type_name) else {
+            let Some(map) = inner.pool.remove(type_name) else {
                 continue;
             };
-            let drained: Vec<(Vec<u8>, CachedEntry)> = std::mem::take(map).into_iter().collect();
-            inner.pool.remove(type_name);
-            for (_, entry) in drained {
+            for (_, entry) in map {
                 let header = DotsHeader {
                     type_name: Some(type_name.clone()),
                     sent_time: entry.last_update_time,
