@@ -437,3 +437,200 @@ fn decode_value(
         DynamicFieldKind::Duration => Ok(DynamicValue::Duration(d.f64()?)),
     }
 }
+
+// ===== Display formatting =====
+//
+// Human-readable output for trace/inspection tools (mirrors the role
+// of dots-cpp's StringSerializer for *printing*, but is NOT
+// byte-compatible with it — that's a separate, larger piece of work).
+// Format intent: `TypeName{ field: value, field: value }`, with
+// strings debug-quoted, byte arrays as hex, and enum values resolved
+// to variant names where the descriptor is reachable.
+
+impl core::fmt::Display for DynamicValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DynamicValue::Bool(v) => write!(f, "{v}"),
+            DynamicValue::U8(v) => write!(f, "{v}"),
+            DynamicValue::U16(v) => write!(f, "{v}"),
+            DynamicValue::U32(v) => write!(f, "{v}"),
+            DynamicValue::U64(v) => write!(f, "{v}"),
+            DynamicValue::I8(v) => write!(f, "{v}"),
+            DynamicValue::I16(v) => write!(f, "{v}"),
+            DynamicValue::I32(v) => write!(f, "{v}"),
+            DynamicValue::I64(v) => write!(f, "{v}"),
+            DynamicValue::F32(v) => write!(f, "{v}"),
+            DynamicValue::F64(v) => write!(f, "{v}"),
+            DynamicValue::String(s) => write!(f, "{s:?}"),
+            DynamicValue::Bytes(b) => {
+                f.write_str("0x")?;
+                for byte in b {
+                    write!(f, "{byte:02x}")?;
+                }
+                Ok(())
+            }
+            DynamicValue::Vec(items) => {
+                f.write_str("[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    core::fmt::Display::fmt(item, f)?;
+                }
+                f.write_str("]")
+            }
+            DynamicValue::Struct(s) => core::fmt::Display::fmt(s.as_ref(), f),
+            // Bare Display can't see the property's enum descriptor —
+            // [`DynamicStruct`]'s impl resolves variant names where it
+            // can. For standalone values we fall back to the int.
+            DynamicValue::Enum(v) => write!(f, "{v}"),
+            DynamicValue::Timepoint(s) => write!(f, "{s}"),
+            DynamicValue::Duration(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl core::fmt::Display for DynamicStruct {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.descriptor.name)?;
+        f.write_str("{")?;
+        let mut first = true;
+        for prop in &self.descriptor.properties {
+            if !self.valid.has(prop.tag) {
+                continue;
+            }
+            if first {
+                f.write_str(" ")?;
+            } else {
+                f.write_str(", ")?;
+            }
+            first = false;
+            f.write_str(&prop.name)?;
+            f.write_str(": ")?;
+
+            let value = self
+                .properties
+                .iter()
+                .find(|(t, _)| *t == prop.tag)
+                .map(|(_, v)| v);
+
+            match (value, &prop.kind) {
+                (Some(DynamicValue::Enum(int_val)), DynamicFieldKind::Enum(enum_desc)) => {
+                    match enum_desc.element_by_value(*int_val) {
+                        Some(elem) => f.write_str(&elem.name)?,
+                        None => write!(f, "{int_val}")?,
+                    }
+                }
+                (Some(v), _) => core::fmt::Display::fmt(v, f)?,
+                (None, _) => f.write_str("?")?,
+            }
+        }
+        if !first {
+            f.write_str(" ")?;
+        }
+        f.write_str("}")
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use alloc::format;
+
+    fn pinger_descriptor() -> Arc<DynamicStructDescriptor> {
+        Arc::new(DynamicStructDescriptor {
+            name: "Pinger".into(),
+            flags: StructFlags::NONE,
+            properties: alloc::vec![
+                DynamicPropertyDescriptor {
+                    name: "id".into(),
+                    tag: 1,
+                    is_key: true,
+                    kind: DynamicFieldKind::U32,
+                },
+                DynamicPropertyDescriptor {
+                    name: "message".into(),
+                    tag: 2,
+                    is_key: false,
+                    kind: DynamicFieldKind::String,
+                },
+                DynamicPropertyDescriptor {
+                    name: "sequence".into(),
+                    tag: 3,
+                    is_key: false,
+                    kind: DynamicFieldKind::U64,
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn display_shows_set_properties_in_descriptor_order() {
+        let desc = pinger_descriptor();
+        let value = DynamicStruct {
+            descriptor: desc,
+            valid: PropertySet::EMPTY.with_tag(1).with_tag(2).with_tag(3),
+            properties: alloc::vec![
+                (1, DynamicValue::U32(7)),
+                (2, DynamicValue::String("hello".into())),
+                (3, DynamicValue::U64(42)),
+            ],
+        };
+        assert_eq!(
+            format!("{value}"),
+            r#"Pinger{ id: 7, message: "hello", sequence: 42 }"#
+        );
+    }
+
+    #[test]
+    fn display_omits_unset_properties() {
+        let desc = pinger_descriptor();
+        let value = DynamicStruct {
+            descriptor: desc,
+            valid: PropertySet::EMPTY.with_tag(1).with_tag(3),
+            properties: alloc::vec![
+                (1, DynamicValue::U32(99)),
+                (3, DynamicValue::U64(1)),
+            ],
+        };
+        assert_eq!(format!("{value}"), "Pinger{ id: 99, sequence: 1 }");
+    }
+
+    #[test]
+    fn display_resolves_enum_variant_names() {
+        let enum_desc = Arc::new(DynamicEnumDescriptor {
+            name: "Mood".into(),
+            elements: alloc::vec![
+                DynamicEnumElement { name: "Happy".into(), tag: 1, value: 1 },
+                DynamicEnumElement { name: "Grumpy".into(), tag: 2, value: 7 },
+            ],
+        });
+        let desc = Arc::new(DynamicStructDescriptor {
+            name: "Person".into(),
+            flags: StructFlags::NONE,
+            properties: alloc::vec![DynamicPropertyDescriptor {
+                name: "mood".into(),
+                tag: 1,
+                is_key: false,
+                kind: DynamicFieldKind::Enum(enum_desc),
+            }],
+        });
+        let value = DynamicStruct {
+            descriptor: desc,
+            valid: PropertySet::EMPTY.with_tag(1),
+            properties: alloc::vec![(1, DynamicValue::Enum(7))],
+        };
+        assert_eq!(format!("{value}"), "Person{ mood: Grumpy }");
+    }
+
+    #[test]
+    fn display_handles_empty_struct() {
+        let desc = pinger_descriptor();
+        let value = DynamicStruct {
+            descriptor: desc,
+            valid: PropertySet::EMPTY,
+            properties: alloc::vec![],
+        };
+        assert_eq!(format!("{value}"), "Pinger{}");
+    }
+}
