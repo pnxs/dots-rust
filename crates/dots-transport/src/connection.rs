@@ -440,16 +440,7 @@ where
     }
 
     fn dispatch_to_subscribers(&self, txn: &Transmission) {
-        let Some(type_name) = txn.header.type_name.as_deref() else {
-            return;
-        };
-        let mut state = self.dispatch.lock().expect("dispatch mutex poisoned");
-        if let Some(entries) = state.entries.get_mut(type_name) {
-            // Decode failure is per-event — keep the subscription so a
-            // malformed transmission doesn't kill an otherwise-healthy
-            // subscriber.
-            entries.retain_mut(|(_, entry)| entry.dispatch(txn).unwrap_or(true));
-        }
+        dispatch_external(&self.dispatch, txn);
     }
 
     /// Subscribe to typed events for `T`.
@@ -554,14 +545,48 @@ where
         dispatch: &Arc<Mutex<DispatchState>>,
         txn: &Transmission,
     ) {
-        let Some(type_name) = txn.header.type_name.as_deref() else {
-            return;
-        };
-        let mut state = dispatch.lock().expect("dispatch mutex poisoned");
-        if let Some(entries) = state.entries.get_mut(type_name) {
-            entries.retain_mut(|(_, entry)| entry.dispatch(txn).unwrap_or(true));
-        }
+        dispatch_external(dispatch, txn);
     }
+}
+
+/// Dispatch a transmission to all subscribers of its `type_name`,
+/// **without** holding the dispatch mutex while handlers run.
+///
+/// Why the gymnastics: handlers may register or drop subscriptions
+/// (e.g. `subscribe_all_types` installs a `subscribe_dynamic` from
+/// inside a `subscribe_new_struct_type` callback). Both operations
+/// need the dispatch mutex; if we kept it locked across the handler
+/// call we'd deadlock. The take-out-put-back pattern lets handlers
+/// freely lock dispatch.
+///
+/// New subscribers registered during a dispatch don't see this
+/// transmission (they're put back behind the entries we just
+/// processed and only see future events). Subscribers that
+/// `drop()` themselves from inside a handler run their unregister
+/// while we hold no lock — but their type's entries vec is
+/// momentarily missing from state, so the unregister silently
+/// no-ops. The retain_mut return value is the canonical way to
+/// drop self-from-dispatch and is unaffected.
+fn dispatch_external(dispatch: &Arc<Mutex<DispatchState>>, txn: &Transmission) {
+    let Some(type_name) = txn.header.type_name.as_deref() else {
+        return;
+    };
+
+    let taken = {
+        let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+        state.entries.remove(type_name)
+    };
+    let Some(mut entries) = taken else {
+        return;
+    };
+
+    entries.retain_mut(|(_, entry)| entry.dispatch(txn).unwrap_or(true));
+
+    let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+    let slot = state.entries.entry(type_name.to_string()).or_default();
+    let added_during_dispatch = std::mem::take(slot);
+    *slot = entries;
+    slot.extend(added_during_dispatch);
 }
 
 // ===== Pub/sub: Event, Subscription, dispatch =====
