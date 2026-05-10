@@ -860,7 +860,7 @@ fn handle_connected_message(
         payload: txn.payload.clone(),
     };
     outgoing.encode_into(&mut buf);
-    host.fan_out_bytes(type_name, &buf, client_id);
+    host.fan_out_bytes(type_name, &buf, 0);
 }
 
 /// Reply to a `DotsEcho` request: copy the payload, set `request =
