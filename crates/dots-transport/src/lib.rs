@@ -36,7 +36,9 @@ pub use container::{CloneInfo, Container, ContainerEntry, ContainerHandle, Opera
 pub use endpoint::{Endpoint, EndpointError, parse_endpoint};
 pub use dots_core::PropertySet;
 pub use error::TransportError;
-pub use guest::{GuestDriver, GuestError, GuestTransceiver, SubscriptionHandle};
+pub use guest::{
+    AllTypesSubscription, GuestDriver, GuestError, GuestTransceiver, SubscriptionHandle,
+};
 pub use host::{EndpointHandle, HOST_ID, HostTransceiver};
 
 // Re-export the framing layer's public types so callers don't need to

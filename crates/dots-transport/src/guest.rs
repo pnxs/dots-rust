@@ -232,6 +232,49 @@ impl GuestTransceiver {
         sub
     }
 
+    /// Subscribe to *every* DOTS type — known now or learned later —
+    /// with a single handler. Composes
+    /// [`subscribe_new_struct_type`](Self::subscribe_new_struct_type) and
+    /// [`subscribe_dynamic`](Self::subscribe_dynamic): for each
+    /// descriptor in the registry (now or arriving via the wire), a
+    /// dynamic subscription is installed that funnels its events into
+    /// `handler`. Returns an [`AllTypesSubscription`] whose drop tears
+    /// down the new-type observer plus every per-type dynamic sub it
+    /// installed.
+    ///
+    /// Intended for tracing / inspection tools (mirrors dots-cli
+    /// `trace`). Note: this also subscribes to internal DOTS types
+    /// (DotsClient, DotsMember, DotsHeader, …) — that's deliberate
+    /// for full visibility.
+    pub fn subscribe_all_types<F>(self: &Arc<Self>, handler: F) -> AllTypesSubscription
+    where
+        F: FnMut(&Event<DynamicStruct>) + Send + 'static,
+    {
+        let handler = Arc::new(Mutex::new(handler));
+        let dynamic_handles: Arc<Mutex<Vec<SubscriptionHandle>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        let dynamic_handles_clone = dynamic_handles.clone();
+        let handler_clone = handler.clone();
+        let self_arc = self.clone();
+        let new_type_handle = self.subscribe_new_struct_type(move |descriptor| {
+            let h = handler_clone.clone();
+            let sub = self_arc.subscribe_dynamic(descriptor.clone(), move |event| {
+                if let Ok(mut h) = h.lock() {
+                    h(event);
+                }
+            });
+            if let Ok(mut handles) = dynamic_handles_clone.lock() {
+                handles.push(sub);
+            }
+        });
+
+        AllTypesSubscription {
+            _new_type_handle: new_type_handle,
+            _dynamic_handles: dynamic_handles,
+        }
+    }
+
     /// Subscribe to type-system events: every `StructDescriptorData`
     /// arriving on the wire is converted to a [`DynamicStructDescriptor`],
     /// registered with the codec registry, and passed to `handler`.
@@ -819,6 +862,16 @@ where
         dispatch: Arc::downgrade(dispatch),
         leaver: None,
     }
+}
+
+/// Composite handle returned by
+/// [`GuestTransceiver::subscribe_all_types`]. Owns the
+/// [`SubscriptionHandle`] for the type-system observer plus the
+/// per-type dynamic subscriptions it installs; dropping it tears
+/// every part down at once.
+pub struct AllTypesSubscription {
+    _new_type_handle: SubscriptionHandle,
+    _dynamic_handles: Arc<Mutex<Vec<SubscriptionHandle>>>,
 }
 
 struct DynamicCallbackDispatchEntry<F> {

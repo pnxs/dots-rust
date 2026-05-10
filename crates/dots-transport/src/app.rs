@@ -305,6 +305,15 @@ impl App {
         self.transceiver.subscribe_new_struct_type(handler)
     }
 
+    /// Subscribe to every DOTS type with a single handler — see
+    /// [`GuestTransceiver::subscribe_all_types`].
+    pub fn subscribe_all_types<F>(&self, handler: F) -> crate::AllTypesSubscription
+    where
+        F: FnMut(&Event<DynamicStruct>) + Send + 'static,
+    {
+        self.transceiver.subscribe_all_types(handler)
+    }
+
     pub fn container<T>(&self) -> Container<T>
     where
         T: StructValue + Default + Send + 'static,

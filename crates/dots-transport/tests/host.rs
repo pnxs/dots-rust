@@ -1255,3 +1255,91 @@ async fn subscribe_new_struct_type_fires_for_wire_descriptor_arrivals() {
     gt.exit();
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
 }
+
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+#[dots(name = "Bonk")]
+struct Bonk {
+    #[dots(tag = 1, key)]
+    id: Option<u32>,
+    #[dots(tag = 2)]
+    label: Option<String>,
+}
+
+#[tokio::test]
+async fn subscribe_all_types_funnels_events_for_distinct_types() {
+    use std::sync::Mutex;
+
+    let host = HostTransceiver::new("all-types-host");
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    registry.register_struct_static(Bonk::DESCRIPTOR);
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+    host.registry().register_struct_static(Bonk::DESCRIPTOR);
+
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+    let conn = ConnectionBuilder::new(guest_io, "trace-guest", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) =
+        GuestTransceiver::from_connection("trace-guest".to_string(), registry.clone(), conn);
+    let driver_handle = tokio::spawn(driver.run());
+
+    // Capture (type_name, sender) for each event.
+    let captured: Arc<Mutex<Vec<(String, Option<u32>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+    let _all = gt.subscribe_all_types(move |event| {
+        let type_name = event.value.descriptor.name.clone();
+        captured_clone
+            .lock()
+            .unwrap()
+            .push((type_name, event.header.sender));
+    });
+
+    // Wait for the catch-up's auto-installed dynamic subs to land at
+    // the host (we know the sub for "Pinger" creates a join, so wait
+    // for that group to populate).
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("Pinger") >= 1 && host.group_size("Bonk") >= 1 {
+            break;
+        }
+    }
+    assert!(host.group_size("Pinger") >= 1);
+    assert!(host.group_size("Bonk") >= 1);
+
+    host.publish(&Pinger {
+        id: Some(7),
+        message: Some("hi".into()),
+        sequence: Some(1),
+    });
+    host.publish(&Bonk {
+        id: Some(2),
+        label: Some("tagged".into()),
+    });
+
+    // Wait until both types have at least one captured event.
+    let mut events: Vec<(String, Option<u32>)> = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        events = captured.lock().unwrap().clone();
+        if events.iter().any(|(t, _)| t == "Pinger")
+            && events.iter().any(|(t, _)| t == "Bonk")
+        {
+            break;
+        }
+    }
+    assert!(
+        events.iter().any(|(t, _)| t == "Pinger"),
+        "expected Pinger event; got {events:?}"
+    );
+    assert!(
+        events.iter().any(|(t, _)| t == "Bonk"),
+        "expected Bonk event; got {events:?}"
+    );
+
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+}
