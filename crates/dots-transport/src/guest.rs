@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use dots_core::{
-    EnumDescriptor, Publishable, StructDescriptor, StructValue, Timepoint, decode_typed_from_slice,
-    key_set,
+    EnumDescriptor, PropertySet, Publishable, StructDescriptor, StructValue, Timepoint,
+    decode_typed_from_slice, key_set,
 };
 use dots_model::{
     DotsHeader, DotsMember, DotsMemberEvent, EnumDescriptorData, Registry, StructDescriptorData,
@@ -278,6 +278,37 @@ impl GuestTransceiver {
     {
         self.register_struct_descriptor(T::type_descriptor());
         self.publish_typed(value)
+    }
+
+    /// Publish a typed value, restricting the wire payload to the
+    /// properties named in `included` (plus the type's keys, which
+    /// are always sent so receivers can identify the instance).
+    ///
+    /// Mirrors C++ `publish(instance, includedProperties, remove=false)`:
+    /// only properties that are *both* set on `value` *and* included
+    /// in the union of `included | key_set(value)` make it onto the
+    /// wire. Useful for partial updates where some non-key fields
+    /// are populated locally but should not be propagated yet.
+    pub fn publish_with_mask<T>(
+        &self,
+        value: &T,
+        included: PropertySet,
+    ) -> Result<(), ClientClosed>
+    where
+        T: StructValue + Publishable,
+    {
+        self.register_struct_descriptor(T::type_descriptor());
+        let mask = (included | key_set(value)) & value.valid_set();
+        let header = DotsHeader {
+            type_name: Some(value.descriptor().name.into()),
+            attributes: Some(mask.bits()),
+            sender: self.client_id(),
+            sent_time: Some(now_timepoint()),
+            ..Default::default()
+        };
+        let mut bytes = Vec::with_capacity(64);
+        encode_typed_transmission_with_mask_into(&header, value, mask, &mut bytes);
+        self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
     }
 
     /// Publish a removal: tells the broker to drop the cached

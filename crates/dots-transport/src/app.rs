@@ -28,7 +28,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use dots_core::{EnumDescriptor, Publishable, StructValue};
+use dots_core::{EnumDescriptor, PropertySet, Publishable, StructValue};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
@@ -300,6 +300,18 @@ impl App {
         T: StructValue + Publishable,
     {
         self.transceiver.publish(value)
+    }
+
+    /// Publish a partial update — see [`GuestTransceiver::publish_with_mask`].
+    pub fn publish_with_mask<T>(
+        &self,
+        value: &T,
+        included: PropertySet,
+    ) -> Result<(), ClientClosed>
+    where
+        T: StructValue + Publishable,
+    {
+        self.transceiver.publish_with_mask(value, included)
     }
 
     /// Publish a removal — see [`GuestTransceiver::remove`].

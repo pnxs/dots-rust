@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use dots_core::{StructValue, decode_typed_from_slice, encode_to_vec};
+use dots_core::{PropertySet, StructValue, decode_typed_from_slice, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsHeader, DotsMsgConnectResponse, DotsMsgHello, Registry, Transmission,
@@ -362,4 +362,46 @@ async fn publish_then_server_echoes_then_subscription_receives() {
 
     drop(conn);
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn publish_with_mask_drops_excluded_properties_keeps_keys() {
+    // Pinger has tag 1 (key, id), tag 2 (message), tag 3 (sequence).
+    // Publish a fully-populated Pinger but mask down to tag 3 only;
+    // expect the wire payload to carry tags 1 (key, auto-included)
+    // and 3, and to omit tag 2.
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let reg = registry();
+
+    let server_reg = reg.clone();
+    let server = tokio::spawn(async move {
+        let codec = TransmissionCodec::new(server_reg.clone());
+        let mut framed = Framed::new(server_io, codec);
+        run_handshake_server(&mut framed, &server_reg).await;
+        let txn = framed.next().await.unwrap().unwrap();
+        let bytes = txn.payload.encode();
+        let decoded: Pinger = decode_typed_from_slice(&bytes).unwrap();
+        (txn.header, decoded)
+    });
+
+    let mut conn = Connection::establish(client_io, "mask-client", reg).await.unwrap();
+    let pinger = Pinger {
+        id: Some(42),
+        message: Some("dropped".into()),
+        sequence: Some(99),
+    };
+    let mask = PropertySet::EMPTY.with_tag(3);
+    conn.publish_with_mask(&pinger, mask).await.unwrap();
+
+    drop(conn);
+    let (header, decoded) = server.await.unwrap();
+
+    // Only id (key, tag 1) and sequence (tag 3) — message (tag 2) is gone.
+    assert_eq!(decoded.id, Some(42));
+    assert_eq!(decoded.message, None);
+    assert_eq!(decoded.sequence, Some(99));
+
+    // Header attributes mask should match: bit 1 (key) | bit 3 (sequence).
+    let expected_bits = PropertySet::EMPTY.with_tag(1).with_tag(3).bits();
+    assert_eq!(header.attributes, Some(expected_bits));
 }

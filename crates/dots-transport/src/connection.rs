@@ -23,12 +23,13 @@ use std::task::{Context, Poll};
 
 use bytes::BufMut;
 use dots_core::{
-    EnumDescriptor, Publishable, StructDescriptor, StructValue, decode_typed_from_slice,
+    EnumDescriptor, PropertySet, Publishable, StructDescriptor, StructValue, decode_typed_from_slice,
+    key_set,
 };
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
     EnumDescriptorData, Registry, StructDescriptorData, Transmission,
-    encode_typed_transmission_into,
+    encode_typed_transmission_into, encode_typed_transmission_with_mask_into,
 };
 use futures_util::{SinkExt, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -390,6 +391,38 @@ where
     {
         let type_name = value.descriptor().name;
         self.send_typed(type_name, value).await
+    }
+
+    /// Publish a typed value with a property mask. See
+    /// [`GuestTransceiver::publish_with_mask`](crate::GuestTransceiver::publish_with_mask)
+    /// for the masking semantics.
+    pub async fn publish_with_mask<T>(
+        &mut self,
+        value: &T,
+        included: PropertySet,
+    ) -> Result<(), ConnectionError>
+    where
+        T: StructValue + Publishable,
+    {
+        let type_name = value.descriptor().name;
+        let mask = (included | key_set(value)) & value.valid_set();
+        let header = DotsHeader {
+            type_name: Some(type_name.into()),
+            attributes: Some(mask.bits()),
+            sender: self.client_id,
+            ..Default::default()
+        };
+        self.scratch.clear();
+        encode_typed_transmission_with_mask_into(&header, value, mask, &mut self.scratch);
+
+        let buf = self.framed.write_buffer_mut();
+        buf.reserve(self.scratch.len());
+        buf.put_slice(&self.scratch);
+
+        SinkExt::<Transmission>::flush(&mut self.framed)
+            .await
+            .map_err(ConnectionError::Transport)?;
+        Ok(())
     }
 
     /// Receive the next transmission, or `None` on stream close.

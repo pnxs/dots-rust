@@ -594,6 +594,31 @@ impl HostTransceiver {
         self.fan_out_bytes(type_name, &bytes, /*exclude*/ HOST_ID);
     }
 
+    /// Publish a partial update from the host. Same masking rules as
+    /// [`GuestTransceiver::publish_with_mask`](crate::GuestTransceiver::publish_with_mask):
+    /// only properties that are both set on `value` and present in
+    /// `included | key_set(value)` are emitted.
+    pub fn publish_with_mask<T>(&self, value: &T, included: PropertySet)
+    where
+        T: StructValue + Publishable,
+    {
+        let type_name = value.descriptor().name;
+        let mask = (included | key_set(value)) & value.valid_set();
+        let header = DotsHeader {
+            type_name: Some(type_name.into()),
+            attributes: Some(mask.bits()),
+            sender: Some(HOST_ID),
+            sent_time: Some(now_timepoint()),
+            server_sent_time: Some(now_timepoint()),
+            ..Default::default()
+        };
+        self.cache_merge_typed(type_name, &header, value, Some(mask));
+
+        let mut bytes = Vec::with_capacity(64);
+        encode_typed_transmission_with_mask_into(&header, value, mask, &mut bytes);
+        self.fan_out_bytes(type_name, &bytes, /*exclude*/ HOST_ID);
+    }
+
     /// Publish a removal from the host. Routes to every guest
     /// subscribed to `T`'s type-name group, with `header.remove_obj
     /// = true` and only key fields in the payload. Drops the entry
