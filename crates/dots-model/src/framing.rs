@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use dots_core::{
     DecodeError, DynamicStruct, DynamicStructDescriptor, PropertySet, StructValue,
     decode_typed_from_decoder, encode_into_vec, encode_into_vec_with_mask,
@@ -280,5 +281,82 @@ fn lookup_struct(
         ))),
         None => Err(FramingError::UnknownType(name.into())),
     }
+}
+
+// ===== RawTransmission: header decoded, payload kept as raw bytes =====
+
+/// Inbound transmission with the header eagerly decoded and the
+/// payload retained as raw `Bytes`.
+///
+/// This is the broker's preferred form on the receive side: routing,
+/// cache lookup, and is_from_myself stamping all consult `header`,
+/// while fan-out forwards `payload` verbatim — eliminating the
+/// per-message `DynamicStruct` decode/clone/re-encode round-trip
+/// that [`Transmission`] forces when the broker only needs to rewrite
+/// the header.
+///
+/// `payload` is a refcounted slice of the inbound buffer (no copy).
+/// The internal-type dispatch and the cache-update path can still
+/// materialise a [`DynamicStruct`] on demand via
+/// [`RawTransmission::decode_payload`].
+#[derive(Debug, Clone)]
+pub struct RawTransmission {
+    pub header: DotsHeader,
+    /// Raw CBOR bytes of the payload struct (no size prefix, no header).
+    pub payload: Bytes,
+}
+
+impl RawTransmission {
+    /// Decode a complete v2 frame into a `RawTransmission`.
+    ///
+    /// `frame` must contain exactly one full frame (5-byte prefix +
+    /// header + payload). The codec is responsible for length-checking
+    /// against the size prefix and slicing out one frame's worth of
+    /// bytes before calling this. If the buffer is short, returns
+    /// [`FramingError::NeedMoreData`] so callers that pass partial
+    /// buffers still get a useful diagnostic.
+    pub fn decode(frame: Bytes) -> Result<Self, FramingError> {
+        let body_size = parse_size_prefix(&frame)? as usize;
+        let total = SIZE_PREFIX_LEN + body_size;
+        if frame.len() < total {
+            return Err(FramingError::NeedMoreData {
+                have: frame.len(),
+                need: total,
+            });
+        }
+        let body = &frame[SIZE_PREFIX_LEN..total];
+        let mut decoder = dots_core::minicbor::Decoder::new(body);
+        let header: DotsHeader = decode_typed_from_decoder(&mut decoder)?;
+        let payload_start_in_body = decoder.position();
+        let payload_start = SIZE_PREFIX_LEN + payload_start_in_body;
+        let payload = frame.slice(payload_start..total);
+        Ok(Self { header, payload })
+    }
+
+    /// Decode the payload bytes into a [`DynamicStruct`] using the type
+    /// named in `header.type_name`. Materialises only on demand — the
+    /// hot fan-out path doesn't need this.
+    pub fn decode_payload(&self, registry: &Registry) -> Result<DynamicStruct, FramingError> {
+        let type_name = self
+            .header
+            .type_name
+            .as_deref()
+            .ok_or(FramingError::HeaderMissingTypeName)?;
+        let descriptor = lookup_struct(registry, type_name)?;
+        Ok(DynamicStruct::decode(descriptor, &self.payload)?)
+    }
+}
+
+/// Append a v2 frame with `new_header` and the given raw payload bytes
+/// to `out`. Mirrors [`encode_typed_transmission_into`] but takes the
+/// payload pre-encoded — used by the broker to rewrite a transmission's
+/// header (sender, server_sent_time) while reusing the original
+/// payload bytes verbatim.
+pub fn encode_frame_with_header(header: &DotsHeader, payload_bytes: &[u8], out: &mut Vec<u8>) {
+    let frame_start = out.len();
+    out.extend_from_slice(&[SIZE_PREFIX_MARKER, 0, 0, 0, 0]);
+    encode_into_vec(header, out);
+    out.extend_from_slice(payload_bytes);
+    patch_size_prefix(out, frame_start);
 }
 

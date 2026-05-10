@@ -4,10 +4,12 @@ use std::sync::Arc;
 
 use dots_core::encode_to_vec;
 use dots_derive::DotsStruct;
+use bytes::Bytes;
 use dots_model::{
-    DotsHeader, FramingError, MAX_BODY_SIZE, Registry, SIZE_PREFIX_LEN, SIZE_PREFIX_MARKER,
-    StructDescriptorData, Transmission, decode_typed_transmission, encode_typed_transmission,
-    encode_typed_transmission_into, parse_size_prefix,
+    DotsHeader, FramingError, MAX_BODY_SIZE, RawTransmission, Registry, SIZE_PREFIX_LEN,
+    SIZE_PREFIX_MARKER, StructDescriptorData, Transmission, decode_typed_transmission,
+    encode_frame_with_header, encode_typed_transmission, encode_typed_transmission_into,
+    parse_size_prefix,
 };
 
 #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
@@ -344,4 +346,88 @@ fn typed_encode_then_dynamic_reencode_is_byte_identical() {
     let (txn, _) = Transmission::decode(&typed_frame, &registry).unwrap();
     let dynamic_frame = txn.encode();
     assert_eq!(typed_frame, dynamic_frame);
+}
+
+// ----- RawTransmission -----
+
+#[test]
+fn raw_transmission_decode_recovers_header_and_payload_slice() {
+    let header = header_for("Sample");
+    let payload = Sample {
+        id: Some(42),
+        label: Some("hi".into()),
+    };
+    let frame_bytes = encode_typed_transmission(&header, &payload);
+
+    let raw = RawTransmission::decode(Bytes::from(frame_bytes.clone())).unwrap();
+    assert_eq!(raw.header, header);
+
+    // Re-encoding the original header with the raw payload bytes must
+    // reproduce the exact original frame — proving the slice boundaries
+    // are correct and `encode_frame_with_header` is byte-symmetric with
+    // `encode_typed_transmission_into`.
+    let mut rebuilt = Vec::new();
+    encode_frame_with_header(&header, &raw.payload, &mut rebuilt);
+    assert_eq!(rebuilt, frame_bytes);
+}
+
+#[test]
+fn raw_transmission_decode_payload_matches_typed() {
+    let header = header_for("Sample");
+    let payload = Sample {
+        id: Some(7),
+        label: Some("seven".into()),
+    };
+    let frame_bytes = encode_typed_transmission(&header, &payload);
+    let registry = populated_registry();
+
+    let raw = RawTransmission::decode(Bytes::from(frame_bytes)).unwrap();
+    let dyn_payload = raw.decode_payload(&registry).unwrap();
+    // Round-trip through Sample to compare semantically.
+    let payload_bytes = dyn_payload.encode();
+    let recovered: Sample = dots_core::decode_typed_from_slice(&payload_bytes).unwrap();
+    assert_eq!(recovered, payload);
+}
+
+#[test]
+fn raw_transmission_rewrite_header_keeps_payload_bytes() {
+    // The whole point: rebuild a frame with a fresh header but the same
+    // payload bytes — and have a downstream typed decode of the new
+    // frame yield the original payload.
+    let header = header_for("Sample");
+    let payload = Sample {
+        id: Some(99),
+        label: Some("verbatim".into()),
+    };
+    let frame_bytes = encode_typed_transmission(&header, &payload);
+
+    let raw = RawTransmission::decode(Bytes::from(frame_bytes)).unwrap();
+
+    let new_header = DotsHeader {
+        type_name: Some("Sample".into()),
+        sender: Some(99),
+        server_sent_time: Some(dots_core::Timepoint(123.0)),
+        ..Default::default()
+    };
+    let mut rewritten = Vec::new();
+    encode_frame_with_header(&new_header, &raw.payload, &mut rewritten);
+
+    let (got_header, got_payload, _) = decode_typed_transmission::<Sample>(&rewritten).unwrap();
+    assert_eq!(got_header, new_header);
+    assert_eq!(got_payload, payload);
+}
+
+#[test]
+fn raw_transmission_rejects_short_buffer() {
+    let header = header_for("Sample");
+    let payload = Sample {
+        id: Some(1),
+        label: Some("x".into()),
+    };
+    let frame = encode_typed_transmission(&header, &payload);
+    let truncated = Bytes::copy_from_slice(&frame[..frame.len() - 2]);
+    match RawTransmission::decode(truncated) {
+        Err(FramingError::NeedMoreData { .. }) => {}
+        other => panic!("expected NeedMoreData, got {other:?}"),
+    }
 }

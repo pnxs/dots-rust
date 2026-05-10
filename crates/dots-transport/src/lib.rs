@@ -30,7 +30,7 @@ mod guest;
 mod host;
 
 pub use app::{App, AppError, Client, ClientClosed, now_timepoint};
-pub use codec::TransmissionCodec;
+pub use codec::{RawTransmissionCodec, TransmissionCodec};
 pub use connection::{Connection, ConnectionBuilder, ConnectionError, Event, Subscription};
 pub use container::{CloneInfo, Container, ContainerEntry, ContainerHandle, Operation};
 pub use endpoint::{Endpoint, EndpointError, parse_endpoint};

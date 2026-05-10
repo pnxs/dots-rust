@@ -24,7 +24,7 @@ use dots_transport::{Endpoint, EndpointHandle, HostTransceiver, parse_endpoint};
 const DEFAULT_ENDPOINT: &str = "tcp://0.0.0.0:11235";
 const DEFAULT_NAME: &str = "dotsd";
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(

@@ -15,24 +15,36 @@
 //! Cache replay on `Join` is **not** done here; that lives in step 3
 //! of the host implementation slice (the [`ContainerPool`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex as AsyncMutex;
 
 use dots_core::{DynamicStruct, StructValue, decode_typed_from_slice, key_set};
 use dots_model::{
     DotsCacheInfo, DotsConnectionState, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect,
-    DotsMsgConnectResponse, DotsMsgHello, EnumDescriptorData, Registry, StructDescriptorData,
-    Transmission, daemon::DotsClient, encode_typed_transmission_into,
-    encode_typed_transmission_with_mask_into,
+    DotsMsgConnectResponse, DotsMsgHello, EnumDescriptorData, RawTransmission, Registry,
+    StructDescriptorData, Transmission, daemon::DotsClient, encode_frame_with_header,
+    encode_typed_transmission_into, encode_typed_transmission_with_mask_into,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::codec::Framed;
+use tokio_util::codec::FramedRead;
 
-use crate::codec::TransmissionCodec;
+use crate::codec::RawTransmissionCodec;
 use crate::guest::now_timepoint;
+
+/// Type-erased writer half shared between the per-guest read task
+/// (which writes its own handshake responses) and any other guest's
+/// task that fans out to it. The `AsyncMutex` serialises concurrent
+/// writers; `Box<dyn ...>` keeps `GuestRecord` non-generic so the
+/// guest registry can hold heterogeneous stream types side-by-side.
+type SharedWriter = Arc<AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>>;
 
 /// Sentinel sender id used for transmissions originating from the
 /// host itself (matches dots-cpp `Connection::HostId`).
@@ -49,16 +61,16 @@ pub struct HostTransceiver {
 
 struct HostInner {
     /// Per-type-name → set of guest ids that have joined the group.
-    groups: HashMap<String, HashSet<u32>>,
+    groups: FxHashMap<String, FxHashSet<u32>>,
     /// Per-guest state, keyed by client id.
-    guests: HashMap<u32, GuestRecord>,
+    guests: FxHashMap<u32, GuestRecord>,
     /// Monotonic id allocator for new guests. Starts at 2 since 1 is
     /// reserved as `HOST_ID`.
     next_client_id: u32,
     /// Container pool: per-cached-type, key-bytes → cached entry.
     /// Updated on every incoming transmission of a cached type;
     /// replayed on `DotsMember(Join)`.
-    pool: HashMap<String, BTreeMap<Vec<u8>, CachedEntry>>,
+    pool: FxHashMap<String, BTreeMap<Vec<u8>, CachedEntry>>,
 }
 
 /// One cached instance held in the pool. The payload is stored as the
@@ -78,10 +90,15 @@ struct CachedEntry {
 
 struct GuestRecord {
     client_name: Option<String>,
-    /// Pre-encoded transmissions queued to be written to this guest.
-    outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
-    /// Handle to the per-guest task. Kept so the host can join/abort
-    /// during shutdown if needed.
+    /// Shared write end of this guest's connection. The per-guest
+    /// read task uses it for handshake responses and direct replies
+    /// (echo, descriptor-request); peer tasks use it during fan-out
+    /// to write transmissions destined for this guest. `AsyncMutex`
+    /// serialises any concurrent writers — uncontended on a typical
+    /// fan-out since each subscriber's lock fires once per message.
+    write_half: SharedWriter,
+    /// Handle to the per-guest read task. Kept so the host can
+    /// abort it during shutdown.
     #[allow(dead_code)]
     task: JoinHandle<()>,
 }
@@ -102,10 +119,10 @@ impl HostTransceiver {
             self_name: self_name.into(),
             registry,
             inner: Arc::new(Mutex::new(HostInner {
-                groups: HashMap::new(),
-                guests: HashMap::new(),
+                groups: FxHashMap::default(),
+                guests: FxHashMap::default(),
                 next_client_id: HOST_ID + 1,
-                pool: HashMap::new(),
+                pool: FxHashMap::default(),
             })),
         })
     }
@@ -130,7 +147,7 @@ impl HostTransceiver {
             .expect("host mutex poisoned")
             .groups
             .get(type_name)
-            .map(HashSet::len)
+            .map(FxHashSet::len)
             .unwrap_or(0)
     }
 
@@ -179,31 +196,44 @@ impl HostTransceiver {
     }
 
     /// Accept an incoming guest stream. Spawns a tokio task that runs
-    /// the broker-side handshake and dispatch loop. Returns the
-    /// allocated client id.
+    /// the broker-side handshake and inbound-dispatch loop. Returns
+    /// the allocated client id.
+    ///
+    /// The stream is split into independent halves: the read half is
+    /// owned by the spawned task; the write half is wrapped in an
+    /// `AsyncMutex` so any task — including this guest's own read
+    /// task and any peer task fanning out a transmission — can write
+    /// to it after acquiring the lock. Replaces the older mpsc-based
+    /// design where a per-guest writer task drained an outbound
+    /// channel; we now write directly from whichever task produced
+    /// the outbound bytes.
     pub fn accept<S>(self: &Arc<Self>, stream: S) -> u32
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let host = self.clone();
         let mut inner = self.inner.lock().expect("host mutex poisoned");
         let client_id = inner.next_client_id;
         inner.next_client_id += 1;
+        let (read_half, write_half) = tokio::io::split(stream);
+        let writer: SharedWriter = Arc::new(AsyncMutex::new(
+            Box::new(write_half) as Box<dyn AsyncWrite + Send + Unpin>,
+        ));
+        let writer_for_record = writer.clone();
         let task = {
             let host = host.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_guest(host.clone(), client_id, stream, out_rx).await {
+                if let Err(e) = run_guest(host.clone(), client_id, read_half, writer).await {
                     tracing::warn!(client_id, error = %e, "guest task ended with error");
                 }
-                host.remove_guest(client_id);
+                host.remove_guest(client_id).await;
             })
         };
         inner.guests.insert(
             client_id,
             GuestRecord {
                 client_name: None,
-                outbound_tx: out_tx,
+                write_half: writer_for_record,
                 task,
             },
         );
@@ -291,7 +321,10 @@ impl HostTransceiver {
     /// Publish a typed value from the host itself. Routes to every
     /// guest currently subscribed to `T`'s type-name group, and folds
     /// the value into the cache pool if `T` is `cached`.
-    pub fn publish<T>(&self, value: &T)
+    ///
+    /// Async because fan-out now writes directly into each
+    /// subscriber's socket (no mpsc hand-off).
+    pub async fn publish<T>(&self, value: &T)
     where
         T: StructValue,
     {
@@ -321,14 +354,15 @@ impl HostTransceiver {
 
         let mut bytes = Vec::with_capacity(64);
         encode_typed_transmission_into(&header, value, &mut bytes);
-        self.fan_out_bytes(type_name, &bytes, /*exclude*/ HOST_ID);
+        self.fan_out_bytes(type_name, Bytes::from(bytes), /*exclude*/ HOST_ID)
+            .await;
     }
 
     /// Publish a removal from the host. Routes to every guest
     /// subscribed to `T`'s type-name group, with `header.remove_obj
     /// = true` and only key fields in the payload. Drops the entry
     /// from the host's cache pool.
-    pub fn remove<T>(&self, value: &T)
+    pub async fn remove<T>(&self, value: &T)
     where
         T: StructValue,
     {
@@ -360,21 +394,42 @@ impl HostTransceiver {
 
         let mut bytes = Vec::with_capacity(64);
         encode_typed_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.fan_out_bytes(type_name, &bytes, /*exclude*/ HOST_ID);
+        self.fan_out_bytes(type_name, Bytes::from(bytes), /*exclude*/ HOST_ID)
+            .await;
     }
 
-    fn fan_out_bytes(&self, type_name: &str, bytes: &[u8], exclude_client_id: u32) {
-        let inner = self.inner.lock().expect("host mutex poisoned");
-        let Some(targets) = inner.groups.get(type_name) else {
-            return;
+    /// Snapshot the writer handles of every subscriber to `type_name`
+    /// (excluding `exclude_client_id`), then write `bytes` to each
+    /// directly. The lookup is brief — we hold the host's inner
+    /// mutex only long enough to clone the `Arc<AsyncMutex<...>>`
+    /// handles. Per-subscriber writes happen sequentially under
+    /// each subscriber's own write lock.
+    ///
+    /// `SmallVec<[_; 8]>` keeps the snapshot on the stack for typical
+    /// fan-outs (≤8 subscribers) — the common case for ping/pong-shaped
+    /// workloads. Larger groups still work; the SmallVec spills to
+    /// the heap automatically.
+    async fn fan_out_bytes(&self, type_name: &str, bytes: Bytes, exclude_client_id: u32) {
+        let writers: SmallVec<[SharedWriter; 8]> = {
+            let inner = self.inner.lock().expect("host mutex poisoned");
+            let Some(targets) = inner.groups.get(type_name) else {
+                return;
+            };
+            targets
+                .iter()
+                .copied()
+                .filter(|&id| id != exclude_client_id)
+                .filter_map(|id| inner.guests.get(&id).map(|r| r.write_half.clone()))
+                .collect()
         };
-        for &client_id in targets {
-            if client_id == exclude_client_id {
-                continue;
-            }
-            if let Some(record) = inner.guests.get(&client_id) {
-                let _ = record.outbound_tx.send(bytes.to_vec());
-            }
+        for writer in writers {
+            let mut w = writer.lock().await;
+            // Subscriber-side errors are fatal for that one connection,
+            // not the broker. The reader task will notice the broken
+            // socket on its next poll and trigger remove_guest. Drop
+            // the error here; logging it would spam on benign
+            // disconnects.
+            let _ = w.write_all(&bytes).await;
         }
     }
 
@@ -425,73 +480,78 @@ impl HostTransceiver {
     /// Replay the cached entries for `type_name` to the guest with
     /// `client_id`, then send `DotsCacheInfo{end_transmission}`. No-op
     /// for non-cached types.
-    fn replay_cache_to(&self, client_id: u32, type_name: &str) {
-        let inner = self.inner.lock().expect("host mutex poisoned");
-        let Some(map) = inner.pool.get(type_name) else {
-            // Not cached or no entries — still send end-transmission
-            // so the guest's preload sequencer terminates cleanly,
-            // but only if a cached descriptor exists.
-            let cached = matches!(
+    async fn replay_cache_to(&self, client_id: u32, type_name: &str) {
+        // Snapshot the cache contents and the guest's writer handle
+        // under the std::Mutex, then drop the lock before any await.
+        let writer: Option<SharedWriter>;
+        let entries: Vec<(DotsHeader, DynamicStruct)>;
+        let cached_type: bool;
+        {
+            let inner = self.inner.lock().expect("host mutex poisoned");
+            writer = inner.guests.get(&client_id).map(|r| r.write_half.clone());
+            cached_type = matches!(
                 self.registry.lookup(type_name),
                 Some(dots_model::DescriptorEntry::Struct(d)) if d.flags.is_cached()
             );
-            if cached {
-                drop(inner);
-                self.send_cache_info_end(client_id, type_name);
-            }
+            entries = match inner.pool.get(type_name) {
+                None => Vec::new(),
+                Some(map) => {
+                    // `header.from_cache` counts down from `len-1` to
+                    // `0` so the receiver knows when the last entry
+                    // has arrived.
+                    let total = map.len();
+                    map.values()
+                        .enumerate()
+                        .map(|(i, e)| {
+                            let from_cache = (total - 1 - i) as u32;
+                            let header = DotsHeader {
+                                type_name: Some(type_name.to_string()),
+                                sent_time: e.last_update_time,
+                                server_sent_time: Some(now_timepoint()),
+                                attributes: Some(e.attributes),
+                                sender: e.last_update_sender,
+                                from_cache: Some(from_cache),
+                                remove_obj: Some(false),
+                                is_from_myself: Some(false),
+                            };
+                            (header, e.payload.clone())
+                        })
+                        .collect()
+                }
+            };
+        }
+
+        let Some(writer) = writer else {
             return;
         };
-
-        // Snapshot — clone the entries so we can drop the lock before
-        // the (lock-free) send loop. `header.from_cache` counts down
-        // from `len-1` to `0` so the receiver knows when the last
-        // entry has arrived.
-        let total = map.len();
-        let snapshot: Vec<(DotsHeader, DynamicStruct)> = map
-            .values()
-            .enumerate()
-            .map(|(i, e)| {
-                let from_cache = (total - 1 - i) as u32;
-                let header = DotsHeader {
-                    type_name: Some(type_name.to_string()),
-                    sent_time: e.last_update_time,
-                    server_sent_time: Some(now_timepoint()),
-                    attributes: Some(e.attributes),
-                    sender: e.last_update_sender,
-                    from_cache: Some(from_cache),
-                    remove_obj: Some(false),
-                    is_from_myself: Some(false),
-                };
-                (header, e.payload.clone())
-            })
-            .collect();
-        drop(inner);
-
-        let inner = self.inner.lock().expect("host mutex poisoned");
-        let Some(record) = inner.guests.get(&client_id) else {
+        // No entries and not a cached type: don't even send the end
+        // marker — the guest's preload sequencer doesn't expect one
+        // for non-cached groups.
+        if entries.is_empty() && !cached_type {
             return;
-        };
-        for (header, payload) in &snapshot {
+        }
+
+        // Hold the writer lock for the whole replay so other peers'
+        // fan-outs don't interleave between replayed entries.
+        let mut w = writer.lock().await;
+        for (header, payload) in &entries {
             let txn = Transmission {
                 header: header.clone(),
                 payload: payload.clone(),
             };
             let mut buf = Vec::with_capacity(64);
             txn.encode_into(&mut buf);
-            if record.outbound_tx.send(buf).is_err() {
+            if w.write_all(&buf).await.is_err() {
                 tracing::debug!(
                     client_id,
                     type_name,
-                    "outbound channel closed during cache replay; aborting"
+                    "write to guest failed during cache replay; aborting"
                 );
                 return;
             }
         }
-        drop(inner);
-        self.send_cache_info_end(client_id, type_name);
-    }
-
-    fn send_cache_info_end(&self, client_id: u32, type_name: &str) {
+        // Append the end-transmission marker on the same locked
+        // writer to keep ordering against any in-flight fan-outs.
         let info = DotsCacheInfo {
             type_name: Some(type_name.into()),
             end_transmission: Some(true),
@@ -505,10 +565,7 @@ impl HostTransceiver {
         };
         let mut buf = Vec::with_capacity(64);
         encode_typed_transmission_into(&header, &info, &mut buf);
-        let inner = self.inner.lock().expect("host mutex poisoned");
-        if let Some(record) = inner.guests.get(&client_id) {
-            let _ = record.outbound_tx.send(buf);
-        }
+        let _ = w.write_all(&buf).await;
     }
 
     fn leave_group(&self, client_id: u32, group_name: &str) {
@@ -521,12 +578,12 @@ impl HostTransceiver {
         }
     }
 
-    fn remove_guest(&self, client_id: u32) {
+    async fn remove_guest(&self, client_id: u32) {
         // 1. Honor `[cleanup]` flags: any cached entry whose
         //    `last_update_sender` is this guest must be removed and
         //    its removal fanned out to subscribers. Mirrors C++
         //    HostTransceiver::handleTransitionImpl.
-        self.cleanup_entries_for_guest(client_id);
+        self.cleanup_entries_for_guest(client_id).await;
 
         // 2. Drop the guest from the registry and prune empty
         //    groups. Snapshot the name so we can publish DotsClient
@@ -547,7 +604,8 @@ impl HostTransceiver {
         tracing::debug!(client_id, "guest removed");
 
         // 3. Publish the final DotsClient state.
-        self.publish_dots_client(client_id, name, DotsConnectionState::Closed, false);
+        self.publish_dots_client(client_id, name, DotsConnectionState::Closed, false)
+            .await;
     }
 
     /// Walk the cache pool for entries owned by `client_id` whose
@@ -555,7 +613,7 @@ impl HostTransceiver {
     /// and fan a removal transmission out to existing subscribers.
     /// Mirrors dots-cpp's "auto-remove instances of cleanup-flagged
     /// types when their publisher disconnects" semantics.
-    fn cleanup_entries_for_guest(&self, client_id: u32) {
+    async fn cleanup_entries_for_guest(&self, client_id: u32) {
         let to_publish: Vec<Transmission> = {
             let mut inner = self.inner.lock().expect("host mutex poisoned");
 
@@ -621,7 +679,8 @@ impl HostTransceiver {
             let type_name = txn.header.type_name.clone().unwrap_or_default();
             let mut buf = Vec::with_capacity(64);
             txn.encode_into(&mut buf);
-            self.fan_out_bytes(&type_name, &buf, HOST_ID);
+            self.fan_out_bytes(&type_name, Bytes::from(buf), HOST_ID)
+                .await;
         }
     }
 
@@ -629,7 +688,7 @@ impl HostTransceiver {
     /// Routes through the normal publish path so the cache pool stays
     /// in sync. C++ dotsd publishes on every connection-state
     /// transition; we mirror that.
-    fn publish_dots_client(
+    async fn publish_dots_client(
         &self,
         client_id: u32,
         name: Option<String>,
@@ -643,24 +702,27 @@ impl HostTransceiver {
             connection_state: Some(state),
             ..Default::default()
         };
-        self.publish(&record);
+        self.publish(&record).await;
     }
 }
 
 // ===== Per-guest task =====
 
-async fn run_guest<S>(
+async fn run_guest<R>(
     host: Arc<HostTransceiver>,
     client_id: u32,
-    stream: S,
-    mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    read_half: R,
+    writer: SharedWriter,
 ) -> Result<(), HostError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
 {
-    let codec = TransmissionCodec::new(host.registry.clone());
-    let framed = Framed::new(stream, codec);
-    let (mut sink, mut stream_in) = framed.split();
+    // Reader-only loop: outbound bytes (handshake replies, fan-out
+    // arrivals from peer tasks) are written directly into `writer`
+    // by whichever task produced them, so we no longer need a
+    // `select!` between an inbound stream and an outbound channel.
+    let mut stream_in =
+        FramedRead::new(read_half, RawTransmissionCodec::new(host.registry.clone()));
 
     // ----- Phase 1: Hello -----
     let hello = DotsMsgHello {
@@ -668,12 +730,12 @@ where
         auth_challenge: Some(0),
         authentication_required: Some(false),
     };
-    send_typed(&mut sink, "DotsMsgHello", &hello).await?;
+    write_typed(&writer, "DotsMsgHello", &hello).await?;
     tracing::debug!(client_id, "sent Hello");
 
     // ----- Phase 2: Connect / ConnectResponse -----
-    let connect_txn = next_txn(&mut stream_in).await?;
-    let connect: DotsMsgConnect = decode_handshake(&connect_txn, "DotsMsgConnect")?;
+    let connect_raw = next_txn(&mut stream_in).await?;
+    let connect: DotsMsgConnect = decode_handshake(&connect_raw, "DotsMsgConnect")?;
     let preload_requested = connect.preload_cache == Some(true);
     host.set_client_name(client_id, connect.client_name.clone());
     tracing::info!(
@@ -690,7 +752,7 @@ where
         preload: Some(preload_requested),
         ..Default::default()
     };
-    send_typed(&mut sink, "DotsMsgConnectResponse", &resp).await?;
+    write_typed(&writer, "DotsMsgConnectResponse", &resp).await?;
     let initial_state = if preload_requested {
         DotsConnectionState::EarlySubscribe
     } else {
@@ -701,28 +763,20 @@ where
         connect.client_name.clone(),
         initial_state,
         true,
-    );
+    )
+    .await;
 
     // ----- Phase 3: EarlySubscribe (if preload requested) -----
     if preload_requested {
         loop {
-            tokio::select! {
-                biased;
-                inbound = stream_in.next() => match inbound {
-                    Some(Ok(txn)) => {
-                        if handle_preload_message(&host, client_id, &txn, &mut sink).await? {
-                            // preload_client_finished — break and enter Connected state.
-                            break;
-                        }
+            match stream_in.next().await {
+                Some(Ok(raw)) => {
+                    if handle_preload_message(&host, client_id, &raw, &writer).await? {
+                        break;
                     }
-                    Some(Err(e)) => return Err(HostError::Transport(e.to_string())),
-                    None => return Ok(()),
-                },
-                outbound = out_rx.recv() => match outbound {
-                    Some(bytes) => sink.send(bytes).await
-                        .map_err(|e| HostError::Transport(e.to_string()))?,
-                    None => return Ok(()),
                 }
+                Some(Err(e)) => return Err(HostError::Transport(e.to_string())),
+                None => return Ok(()),
             }
         }
         tracing::debug!(client_id, "guest preload phase complete");
@@ -731,25 +785,20 @@ where
             connect.client_name.clone(),
             DotsConnectionState::Connected,
             true,
-        );
+        )
+        .await;
     }
 
-    // ----- Phase 4: Connected — fan-out main loop -----
+    // ----- Phase 4: Connected — fan-out happens inline in
+    //                 `handle_connected_message` (writes to peers'
+    //                 shared writers directly).
     loop {
-        tokio::select! {
-            biased;
-            inbound = stream_in.next() => match inbound {
-                Some(Ok(txn)) => {
-                    handle_connected_message(&host, client_id, &txn);
-                }
-                Some(Err(e)) => return Err(HostError::Transport(e.to_string())),
-                None => return Ok(()),
-            },
-            outbound = out_rx.recv() => match outbound {
-                Some(bytes) => sink.send(bytes).await
-                    .map_err(|e| HostError::Transport(e.to_string()))?,
-                None => return Ok(()),
+        match stream_in.next().await {
+            Some(Ok(raw)) => {
+                handle_connected_message(&host, client_id, &raw).await;
             }
+            Some(Err(e)) => return Err(HostError::Transport(e.to_string())),
+            None => return Ok(()),
         }
     }
 }
@@ -757,18 +806,15 @@ where
 /// Handle a transmission received during the EarlySubscribe phase.
 /// Returns `Ok(true)` when the guest sent `preload_client_finished`,
 /// at which point the broker should send `ConnectResponse(preload_finished)`.
-async fn handle_preload_message<W>(
+async fn handle_preload_message(
     host: &Arc<HostTransceiver>,
     client_id: u32,
-    txn: &Transmission,
-    sink: &mut W,
-) -> Result<bool, HostError>
-where
-    W: futures_util::Sink<Vec<u8>, Error = crate::TransportError> + Unpin,
-{
-    let type_name = txn.header.type_name.as_deref().unwrap_or("");
+    raw: &RawTransmission,
+    writer: &SharedWriter,
+) -> Result<bool, HostError> {
+    let type_name = raw.header.type_name.as_deref().unwrap_or("");
     if type_name == "DotsMsgConnect" {
-        let connect: DotsMsgConnect = decode_handshake(txn, "DotsMsgConnect")?;
+        let connect: DotsMsgConnect = decode_handshake(raw, "DotsMsgConnect")?;
         if connect.preload_client_finished == Some(true) {
             let resp = DotsMsgConnectResponse {
                 server_name: Some(host.self_name.clone()),
@@ -777,7 +823,7 @@ where
                 preload_finished: Some(true),
                 ..Default::default()
             };
-            send_typed(sink, "DotsMsgConnectResponse", &resp).await?;
+            write_typed(writer, "DotsMsgConnectResponse", &resp).await?;
             return Ok(true);
         }
         return Ok(false);
@@ -787,39 +833,46 @@ where
     // phase uses. That ensures descriptors received during one
     // guest's preload are also fanned out to other already-connected
     // guests subscribed to `StructDescriptorData`.
-    handle_connected_message(host, client_id, txn);
+    handle_connected_message(host, client_id, raw).await;
     Ok(false)
 }
 
 /// Handle a transmission received in the Connected phase: route
 /// `DotsMember`, fan everything else out to the type group.
-fn handle_connected_message(
+///
+/// Hot-path principle: the payload travels as raw `Bytes` through the
+/// broker. Internal types and cached types decode it on demand; pure
+/// pass-through types (the bulk of fan-out traffic) never touch the
+/// CBOR decoder beyond the header. Outbound bytes are produced once
+/// per inbound transmission and refcount-shared across all subscribers
+/// via [`HostTransceiver::fan_out_bytes`].
+async fn handle_connected_message(
     host: &Arc<HostTransceiver>,
     client_id: u32,
-    txn: &Transmission,
+    raw: &RawTransmission,
 ) {
-    let Some(type_name) = txn.header.type_name.as_deref() else {
+    let Some(type_name) = raw.header.type_name.as_deref() else {
         return;
     };
     if type_name == "DotsMember" {
         // Group membership is for the broker; not fanned out.
-        handle_member(host, client_id, txn);
+        handle_member(host, client_id, raw).await;
         return;
     }
     if type_name == "DotsEcho" {
         // Direct reply only; no fan-out.
-        handle_echo(host, client_id, txn);
+        handle_echo(host, client_id, raw).await;
         return;
     }
     if type_name == "DotsDescriptorRequest" {
         // Direct reply with all matching descriptors; no fan-out.
-        handle_descriptor_request(host, client_id, txn);
+        handle_descriptor_request(host, client_id, raw).await;
         return;
     }
     if type_name == "DotsClearCache" {
         // Operates on the broker's pool; the resulting removals are
         // fanned out via the standard publish-with-remove_obj path.
-        handle_clear_cache(host, txn);
+        handle_clear_cache(host, raw).await;
         return;
     }
     if type_name == "StructDescriptorData" {
@@ -827,9 +880,9 @@ fn handle_connected_message(
         // the new type, then fall through to fan-out — other guests
         // subscribed to `StructDescriptorData` (e.g. dots-cpp guests
         // populating their own type registry) need to see it too.
-        register_incoming_struct(host, txn);
+        register_incoming_struct(host, raw);
     } else if type_name == "EnumDescriptorData" {
-        register_incoming_enum(host, txn);
+        register_incoming_enum(host, raw);
     } else if type_name == "DotsMsgConnect"
         || type_name == "DotsMsgConnectResponse"
         || type_name == "DotsMsgHello"
@@ -840,9 +893,11 @@ fn handle_connected_message(
         return;
     }
 
-    // Re-encode with the original sender preserved (or stamped if
-    // missing) and a fresh server_sent_time.
-    let mut header = txn.header.clone();
+    // Build the outbound header: preserve `sender` if the guest set
+    // it, else stamp with the broker's view; refresh server_sent_time;
+    // default `is_from_myself` to false (the receiving guest flips it
+    // to true on loopback when comparing sender to its own client_id).
+    let mut header = raw.header.clone();
     if header.sender.is_none() {
         header.sender = Some(client_id);
     }
@@ -851,23 +906,41 @@ fn handle_connected_message(
         header.is_from_myself = Some(false);
     }
 
-    // Update the cache pool if this type is cached.
-    host.update_cache(type_name, &header, &txn.payload);
+    // Cache merge — only cached types pay the payload-decode cost.
+    // Non-cached types skip the dynamic round-trip entirely.
+    if let Some(dots_model::DescriptorEntry::Struct(d)) = host.registry.lookup(type_name) {
+        if d.flags.is_cached() {
+            match DynamicStruct::decode(d.clone(), &raw.payload) {
+                Ok(payload) => host.update_cache(type_name, &header, &payload),
+                Err(e) => {
+                    tracing::warn!(
+                        client_id,
+                        type_name,
+                        error = %e,
+                        "failed to decode payload for cache update; skipping cache merge",
+                    );
+                }
+            }
+        }
+    }
 
-    let mut buf = Vec::with_capacity(64);
-    let outgoing = Transmission {
-        header,
-        payload: txn.payload.clone(),
-    };
-    outgoing.encode_into(&mut buf);
-    host.fan_out_bytes(type_name, &buf, 0);
+    // Fan-out: re-encode the (small) header, splice in the payload
+    // bytes verbatim. No DynamicStruct allocation, no CBOR walk over
+    // the payload.
+    let mut buf = Vec::with_capacity(SIZE_PREFIX_LEN_HINT + raw.payload.len());
+    encode_frame_with_header(&header, &raw.payload, &mut buf);
+    host.fan_out_bytes(type_name, Bytes::from(buf), 0).await;
 }
+
+/// Capacity hint for the size prefix + a typical re-encoded header,
+/// used so the fan-out scratch buffer doesn't need to grow on the
+/// first append. Hot path; constant.
+const SIZE_PREFIX_LEN_HINT: usize = 64;
 
 /// Reply to a `DotsEcho` request: copy the payload, set `request =
 /// false`, and send it back only to the originating guest. No fan-out.
-fn handle_echo(host: &Arc<HostTransceiver>, client_id: u32, txn: &Transmission) {
-    let bytes = txn.payload.encode();
-    let echo: dots_model::DotsEcho = match decode_typed_from_slice(&bytes) {
+async fn handle_echo(host: &Arc<HostTransceiver>, client_id: u32, raw: &RawTransmission) {
+    let echo: dots_model::DotsEcho = match decode_typed_from_slice(&raw.payload) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(client_id, error = %e, "failed to decode DotsEcho");
@@ -893,11 +966,7 @@ fn handle_echo(host: &Arc<HostTransceiver>, client_id: u32, txn: &Transmission) 
     };
     let mut buf = Vec::with_capacity(64);
     encode_typed_transmission_into(&header, &reply, &mut buf);
-
-    let inner = host.inner.lock().expect("host mutex poisoned");
-    if let Some(record) = inner.guests.get(&client_id) {
-        let _ = record.outbound_tx.send(buf);
-    }
+    send_to_guest(host, client_id, &buf).await;
 }
 
 /// Reply to a `DotsDescriptorRequest`: stream all known non-internal
@@ -905,13 +974,12 @@ fn handle_echo(host: &Arc<HostTransceiver>, client_id: u32, txn: &Transmission) 
 /// the requesting guest, terminated by
 /// `DotsCacheInfo{end_descriptor_request: true}`. Mirrors C++
 /// `HostTransceiver::handleDescriptorRequest`.
-fn handle_descriptor_request(
+async fn handle_descriptor_request(
     host: &Arc<HostTransceiver>,
     client_id: u32,
-    txn: &Transmission,
+    raw: &RawTransmission,
 ) {
-    let bytes = txn.payload.encode();
-    let req: dots_model::DotsDescriptorRequest = match decode_typed_from_slice(&bytes) {
+    let req: dots_model::DotsDescriptorRequest = match decode_typed_from_slice(&raw.payload) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(client_id, error = %e, "failed to decode DotsDescriptorRequest");
@@ -938,6 +1006,22 @@ fn handle_descriptor_request(
         "replying to DotsDescriptorRequest"
     );
 
+    // Snapshot the guest's writer once, then write every descriptor
+    // and the terminator under a single lock-acquire — keeps the
+    // descriptor stream from interleaving with anything else this
+    // guest might be sent.
+    let writer = host
+        .inner
+        .lock()
+        .expect("host mutex poisoned")
+        .guests
+        .get(&client_id)
+        .map(|r| r.write_half.clone());
+    let Some(writer) = writer else {
+        return;
+    };
+    let mut w = writer.lock().await;
+
     for d in &descriptors {
         let data = StructDescriptorData::from_dynamic(d);
         let header = DotsHeader {
@@ -950,7 +1034,9 @@ fn handle_descriptor_request(
         };
         let mut buf = Vec::with_capacity(64);
         encode_typed_transmission_into(&header, &data, &mut buf);
-        send_to_guest(host, client_id, buf);
+        if w.write_all(&buf).await.is_err() {
+            return;
+        }
     }
 
     // Terminate with DotsCacheInfo{end_descriptor_request: true}.
@@ -968,16 +1054,24 @@ fn handle_descriptor_request(
     };
     let mut buf = Vec::with_capacity(32);
     encode_typed_transmission_into(&header, &info, &mut buf);
-    send_to_guest(host, client_id, buf);
+    let _ = w.write_all(&buf).await;
 }
 
-/// Send pre-encoded bytes to a single guest by client_id. Logs at
-/// debug if the channel is closed (the guest is gone).
-fn send_to_guest(host: &Arc<HostTransceiver>, client_id: u32, bytes: Vec<u8>) {
-    let inner = host.inner.lock().expect("host mutex poisoned");
-    if let Some(record) = inner.guests.get(&client_id) {
-        if record.outbound_tx.send(bytes).is_err() {
-            tracing::debug!(client_id, "outbound channel closed; dropping send");
+/// Send pre-encoded bytes to a single guest by client_id. The lookup
+/// + write happens under that guest's writer lock; if the guest has
+/// already been removed, the call is a no-op.
+async fn send_to_guest(host: &Arc<HostTransceiver>, client_id: u32, bytes: &[u8]) {
+    let writer = host
+        .inner
+        .lock()
+        .expect("host mutex poisoned")
+        .guests
+        .get(&client_id)
+        .map(|r| r.write_half.clone());
+    if let Some(writer) = writer {
+        let mut w = writer.lock().await;
+        if w.write_all(bytes).await.is_err() {
+            tracing::debug!(client_id, "write to guest failed; subscriber will be removed by its read task");
         }
     }
 }
@@ -985,9 +1079,8 @@ fn send_to_guest(host: &Arc<HostTransceiver>, client_id: u32, bytes: Vec<u8>) {
 /// Handle `DotsClearCache`: drop the named types' entries from the
 /// host's pool and fan out removal transmissions for each cleared
 /// instance. Mirrors C++ `HostTransceiver::handleClearCache`.
-fn handle_clear_cache(host: &Arc<HostTransceiver>, txn: &Transmission) {
-    let bytes = txn.payload.encode();
-    let req: dots_model::DotsClearCache = match decode_typed_from_slice(&bytes) {
+async fn handle_clear_cache(host: &Arc<HostTransceiver>, raw: &RawTransmission) {
+    let req: dots_model::DotsClearCache = match decode_typed_from_slice(&raw.payload) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "failed to decode DotsClearCache");
@@ -1039,13 +1132,13 @@ fn handle_clear_cache(host: &Arc<HostTransceiver>, txn: &Transmission) {
         let type_name = txn.header.type_name.clone().unwrap_or_default();
         let mut buf = Vec::with_capacity(64);
         txn.encode_into(&mut buf);
-        host.fan_out_bytes(&type_name, &buf, HOST_ID);
+        host.fan_out_bytes(&type_name, Bytes::from(buf), HOST_ID)
+            .await;
     }
 }
 
-fn register_incoming_struct(host: &Arc<HostTransceiver>, txn: &Transmission) {
-    let bytes = txn.payload.encode();
-    let data: StructDescriptorData = match decode_typed_from_slice(&bytes) {
+fn register_incoming_struct(host: &Arc<HostTransceiver>, raw: &RawTransmission) {
+    let data: StructDescriptorData = match decode_typed_from_slice(&raw.payload) {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(error = %e, "failed to decode StructDescriptorData");
@@ -1067,9 +1160,8 @@ fn register_incoming_struct(host: &Arc<HostTransceiver>, txn: &Transmission) {
     }
 }
 
-fn register_incoming_enum(host: &Arc<HostTransceiver>, txn: &Transmission) {
-    let bytes = txn.payload.encode();
-    let data: EnumDescriptorData = match decode_typed_from_slice(&bytes) {
+fn register_incoming_enum(host: &Arc<HostTransceiver>, raw: &RawTransmission) {
+    let data: EnumDescriptorData = match decode_typed_from_slice(&raw.payload) {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(error = %e, "failed to decode EnumDescriptorData");
@@ -1091,9 +1183,8 @@ fn register_incoming_enum(host: &Arc<HostTransceiver>, txn: &Transmission) {
     }
 }
 
-fn handle_member(host: &Arc<HostTransceiver>, client_id: u32, txn: &Transmission) {
-    let bytes = txn.payload.encode();
-    let member: DotsMember = match decode_typed_from_slice(&bytes) {
+async fn handle_member(host: &Arc<HostTransceiver>, client_id: u32, raw: &RawTransmission) {
+    let member: DotsMember = match decode_typed_from_slice(&raw.payload) {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(client_id, error = %e, "failed to decode DotsMember");
@@ -1108,7 +1199,7 @@ fn handle_member(host: &Arc<HostTransceiver>, client_id: u32, txn: &Transmission
         Some(DotsMemberEvent::Join) => {
             host.join_group(client_id, group_name);
             tracing::debug!(client_id, group_name, "guest joined group");
-            host.replay_cache_to(client_id, group_name);
+            host.replay_cache_to(client_id, group_name).await;
         }
         Some(DotsMemberEvent::Leave) => {
             host.leave_group(client_id, group_name);
@@ -1139,9 +1230,12 @@ impl core::fmt::Display for HostError {
 
 impl std::error::Error for HostError {}
 
-async fn send_typed<W, T>(sink: &mut W, type_name: &str, value: &T) -> Result<(), HostError>
+async fn write_typed<T>(
+    writer: &SharedWriter,
+    type_name: &str,
+    value: &T,
+) -> Result<(), HostError>
 where
-    W: futures_util::Sink<Vec<u8>, Error = crate::TransportError> + Unpin,
     T: StructValue,
 {
     let header = DotsHeader {
@@ -1152,14 +1246,15 @@ where
     };
     let mut buf = Vec::with_capacity(64);
     encode_typed_transmission_into(&header, value, &mut buf);
-    sink.send(buf)
+    let mut w = writer.lock().await;
+    w.write_all(&buf)
         .await
         .map_err(|e| HostError::Transport(e.to_string()))
 }
 
-async fn next_txn<R>(stream: &mut R) -> Result<Transmission, HostError>
+async fn next_txn<R>(stream: &mut R) -> Result<RawTransmission, HostError>
 where
-    R: futures_util::Stream<Item = Result<Transmission, crate::TransportError>> + Unpin,
+    R: futures_util::Stream<Item = Result<RawTransmission, crate::TransportError>> + Unpin,
 {
     match stream.next().await {
         Some(Ok(txn)) => Ok(txn),
@@ -1168,18 +1263,17 @@ where
     }
 }
 
-fn decode_handshake<T>(txn: &Transmission, expected: &str) -> Result<T, HostError>
+fn decode_handshake<T>(raw: &RawTransmission, expected: &str) -> Result<T, HostError>
 where
     T: StructValue + Default,
 {
-    let actual = txn.header.type_name.as_deref().unwrap_or("");
+    let actual = raw.header.type_name.as_deref().unwrap_or("");
     if actual != expected {
         return Err(HostError::Decode(format!(
             "expected {expected}, got {actual}"
         )));
     }
-    let bytes = txn.payload.encode();
-    decode_typed_from_slice(&bytes).map_err(|e| HostError::Decode(e.to_string()))
+    decode_typed_from_slice(&raw.payload).map_err(|e| HostError::Decode(e.to_string()))
 }
 
 // ===== Public endpoint handle =====

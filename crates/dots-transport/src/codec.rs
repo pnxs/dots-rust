@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-use bytes::{Buf, BufMut, BytesMut};
-use dots_model::{FramingError, Registry, Transmission};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use dots_model::{
+    FramingError, RawTransmission, Registry, SIZE_PREFIX_LEN, Transmission, parse_size_prefix,
+};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::TransportError;
@@ -93,6 +95,19 @@ impl Encoder<Vec<u8>> for TransmissionCodec {
     }
 }
 
+impl Encoder<Bytes> for TransmissionCodec {
+    type Error = TransportError;
+
+    /// `Bytes` variant used by the host's fan-out path: the same
+    /// pre-framed buffer is shared (refcounted) across all subscribers
+    /// of a transmission, avoiding a per-subscriber `Vec` clone.
+    fn encode(&mut self, item: Bytes, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        dst.reserve(item.len());
+        dst.put_slice(&item);
+        Ok(())
+    }
+}
+
 impl Encoder<Transmission> for TransmissionCodec {
     type Error = TransportError;
 
@@ -110,5 +125,73 @@ impl Encoder<Transmission> for TransmissionCodec {
         dst.reserve(self.scratch.len());
         dst.put_slice(&self.scratch);
         Ok(())
+    }
+}
+
+/// Decoder-only codec used by the broker on the inbound side.
+///
+/// Yields a [`RawTransmission`] for each complete v2 frame: the
+/// `DotsHeader` is decoded eagerly (it's small and used for routing,
+/// cache lookup, and re-stamping), but the payload stays as an
+/// untouched `Bytes` slice of the inbound buffer. The broker then
+/// either forwards those bytes verbatim during fan-out or decodes
+/// them on demand for cache merging / internal-type dispatch — saving
+/// the per-message `DynamicStruct` decode-clone-re-encode round-trip
+/// that [`TransmissionCodec`] forces on the codec consumer.
+///
+/// No `Encoder` impl: outbound traffic still flows through
+/// [`TransmissionCodec`]'s `Encoder<Bytes>` / `Encoder<Vec<u8>>` paths.
+#[derive(Debug)]
+pub struct RawTransmissionCodec {
+    registry: Arc<Registry>,
+}
+
+impl RawTransmissionCodec {
+    pub fn new(registry: Arc<Registry>) -> Self {
+        Self { registry }
+    }
+
+    pub fn registry(&self) -> &Arc<Registry> {
+        &self.registry
+    }
+}
+
+impl Clone for RawTransmissionCodec {
+    fn clone(&self) -> Self {
+        Self::new(self.registry.clone())
+    }
+}
+
+impl Decoder for RawTransmissionCodec {
+    type Item = RawTransmission;
+    type Error = TransportError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // Phase 1: peek at the size prefix to determine how many bytes
+        // belong to this frame. `NeedMoreData` here just means the
+        // 5-byte prefix isn't fully buffered yet.
+        let body_size = match parse_size_prefix(src.as_ref()) {
+            Ok(n) => n as usize,
+            Err(FramingError::NeedMoreData { have, need }) => {
+                src.reserve(need.saturating_sub(have));
+                return Ok(None);
+            }
+            Err(other) => return Err(TransportError::Framing(other)),
+        };
+        let total = SIZE_PREFIX_LEN + body_size;
+        if src.len() < total {
+            src.reserve(total - src.len());
+            return Ok(None);
+        }
+
+        // Phase 2: take ownership of one frame's bytes via split_to +
+        // freeze (zero copy), then decode the header. The payload
+        // remains as a refcounted `Bytes` slice into the same buffer
+        // — fan-out clones will all share that allocation.
+        let frame = src.split_to(total).freeze();
+        match RawTransmission::decode(frame) {
+            Ok(raw) => Ok(Some(raw)),
+            Err(e) => Err(TransportError::Framing(e)),
+        }
     }
 }

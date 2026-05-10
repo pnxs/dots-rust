@@ -36,9 +36,9 @@ pub use descriptors::{
     StructDescriptorData, StructDocumentation, StructPropertyData,
 };
 pub use framing::{
-    FramingError, MAX_BODY_SIZE, SIZE_PREFIX_LEN, SIZE_PREFIX_MARKER, Transmission,
-    decode_typed_transmission, encode_typed_transmission, encode_typed_transmission_into,
-    encode_typed_transmission_with_mask_into, parse_size_prefix,
+    FramingError, MAX_BODY_SIZE, RawTransmission, SIZE_PREFIX_LEN, SIZE_PREFIX_MARKER, Transmission,
+    decode_typed_transmission, encode_frame_with_header, encode_typed_transmission,
+    encode_typed_transmission_into, encode_typed_transmission_with_mask_into, parse_size_prefix,
 };
 pub use registry::{DescriptorEntry, Registry, RegistryError};
 

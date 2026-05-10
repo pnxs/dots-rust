@@ -11,7 +11,7 @@ description = "DOTS broker daemon — listens on TCP and routes pub/sub between 
 [dependencies]
 dots-transport.workspace = true
 
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 

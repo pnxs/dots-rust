@@ -11,5 +11,7 @@ description = "DOTS-internal types: descriptors, connection, events. Mirrors the
 dots-core.workspace = true
 dots-derive.workspace = true
 
+bytes.workspace = true
+
 [lints]
 workspace = true
