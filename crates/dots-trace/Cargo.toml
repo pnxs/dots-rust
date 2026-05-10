@@ -1,0 +1,20 @@
+[package]
+name = "dots-trace"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "DOTS trace tool — connects to a broker and prints every transmission as it arrives."
+
+[dependencies]
+dots-core.workspace = true
+dots-model.workspace = true
+dots-transport.workspace = true
+
+tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+
+[lints]
+workspace = true

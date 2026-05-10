@@ -143,6 +143,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dots-trace"
+version = "0.1.0"
+dependencies = [
+ "dots-core",
+ "dots-model",
+ "dots-transport",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dots-transport"
 version = "0.1.0"
 dependencies = [
