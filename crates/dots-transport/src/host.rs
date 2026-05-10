@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::Mutex as AsyncMutex;
 
-use dots_core::{DynamicStruct, StructValue, decode_typed_from_slice, key_set};
+use dots_core::{DynamicStruct, PropertySet, StructValue, decode_typed_from_slice, key_set};
 use dots_model::{
     DotsCacheInfo, DotsConnectionState, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect,
     DotsMsgConnectResponse, DotsMsgHello, EnumDescriptorData, RawTransmission, Registry,
@@ -88,7 +88,7 @@ struct WriteState {
 /// past this threshold. Mirrors the C++ broker's "disconnect slow
 /// consumers" policy. 1 MiB matches the default size that the C++
 /// `dotsd` uses for its per-connection write buffer.
-const WRITE_OVERFLOW_THRESHOLD: usize = 1 * 1024 * 1024;
+const WRITE_OVERFLOW_THRESHOLD: usize = 1024 * 1024;
 
 /// Underlying write half. The TCP/Unix variants expose `&self`
 /// methods (`try_write`, `writable`) so the drive loop can use them
@@ -585,20 +585,7 @@ impl HostTransceiver {
             server_sent_time: Some(now_timepoint()),
             ..Default::default()
         };
-
-        // Cache update: re-decode through the registry to get a
-        // DynamicStruct (matches the shape we'd see if the value had
-        // arrived from a guest).
-        if let Some(dots_model::DescriptorEntry::Struct(d)) = self.registry.lookup(type_name) {
-            if d.flags.is_cached() {
-                let mut payload_bytes = Vec::with_capacity(64);
-                let mut enc = dots_core::minicbor::Encoder::new(&mut payload_bytes);
-                dots_core::encode_into_encoder(value, &mut enc).expect("encode infallible");
-                if let Ok(payload) = DynamicStruct::decode(d.clone(), &payload_bytes) {
-                    self.update_cache(type_name, &header, &payload);
-                }
-            }
-        }
+        self.cache_merge_typed(type_name, &header, value, None);
 
         let mut bytes = Vec::with_capacity(64);
         encode_typed_transmission_into(&header, value, &mut bytes);
@@ -624,24 +611,40 @@ impl HostTransceiver {
             remove_obj: Some(true),
             ..Default::default()
         };
-
-        // Update cache: round-trip via DynamicStruct so `update_cache`
-        // can use payload.key_bytes(). Same path as host.publish.
-        if let Some(dots_model::DescriptorEntry::Struct(d)) = self.registry.lookup(type_name) {
-            if d.flags.is_cached() {
-                let mut payload_bytes = Vec::with_capacity(64);
-                let mut enc = dots_core::minicbor::Encoder::new(&mut payload_bytes);
-                dots_core::encode_into_encoder_with_mask(value, mask, &mut enc)
-                    .expect("encode infallible");
-                if let Ok(payload) = DynamicStruct::decode(d.clone(), &payload_bytes) {
-                    self.update_cache(type_name, &header, &payload);
-                }
-            }
-        }
+        self.cache_merge_typed(type_name, &header, value, Some(mask));
 
         let mut bytes = Vec::with_capacity(64);
         encode_typed_transmission_with_mask_into(&header, value, mask, &mut bytes);
         self.fan_out_bytes(type_name, &bytes, /*exclude*/ HOST_ID);
+    }
+
+    /// Fold a host-originated typed value into the cache pool. No-op
+    /// for non-cached types or types not in the registry. Round-trips
+    /// the value through CBOR so `update_cache` sees a `DynamicStruct`
+    /// (whose `key_bytes()` matches the shape used by guest publishes).
+    fn cache_merge_typed<T: StructValue>(
+        &self,
+        type_name: &str,
+        header: &DotsHeader,
+        value: &T,
+        mask: Option<PropertySet>,
+    ) {
+        let Some(dots_model::DescriptorEntry::Struct(d)) = self.registry.lookup(type_name) else {
+            return;
+        };
+        if !d.flags.is_cached() {
+            return;
+        }
+        let mut payload_bytes = Vec::with_capacity(64);
+        let mut enc = dots_core::minicbor::Encoder::new(&mut payload_bytes);
+        match mask {
+            Some(m) => dots_core::encode_into_encoder_with_mask(value, m, &mut enc)
+                .expect("encode infallible"),
+            None => dots_core::encode_into_encoder(value, &mut enc).expect("encode infallible"),
+        }
+        if let Ok(payload) = DynamicStruct::decode(d.clone(), &payload_bytes) {
+            self.update_cache(type_name, header, &payload);
+        }
     }
 
     /// Enqueue `bytes` to every subscriber of `type_name` (excluding
@@ -870,20 +873,7 @@ impl HostTransceiver {
                     .collect();
                 for key in keys_to_remove {
                     if let Some(entry) = map.remove(&key) {
-                        let header = DotsHeader {
-                            type_name: Some(type_name.clone()),
-                            sent_time: entry.last_update_time,
-                            server_sent_time: Some(now_timepoint()),
-                            attributes: Some(entry.attributes),
-                            sender: Some(HOST_ID),
-                            remove_obj: Some(true),
-                            is_from_myself: Some(false),
-                            ..Default::default()
-                        };
-                        out.push(Transmission {
-                            header,
-                            payload: entry.payload,
-                        });
+                        out.push(removal_txn(&type_name, entry));
                     }
                 }
                 if map.is_empty() {
@@ -900,7 +890,27 @@ impl HostTransceiver {
                 "publishing cleanup removals for departing guest"
             );
         }
-        for txn in to_publish {
+        self.fan_out_removals(to_publish);
+    }
+
+    /// Snapshot the per-guest writer for `client_id`. Returns `None`
+    /// if the guest is no longer connected. Acquires and releases the
+    /// inner lock on each call — cheap (one std::Mutex round-trip),
+    /// so callers don't need to share the snapshot across an await.
+    fn writer_for(&self, client_id: u32) -> Option<SharedWriter> {
+        self.inner
+            .lock()
+            .expect("host mutex poisoned")
+            .guests
+            .get(&client_id)
+            .map(|r| r.write_half.clone())
+    }
+
+    /// Encode each removal transmission and route it to subscribers,
+    /// excluding the host itself. Shared by `cleanup_entries_for_guest`
+    /// and `handle_clear_cache`.
+    fn fan_out_removals(&self, txns: Vec<Transmission>) {
+        for txn in txns {
             let type_name = txn.header.type_name.clone().unwrap_or_default();
             let mut buf = Vec::with_capacity(64);
             txn.encode_into(&mut buf);
@@ -1215,7 +1225,9 @@ fn handle_echo(host: &Arc<HostTransceiver>, client_id: u32, raw: &RawTransmissio
     };
     let mut buf = Vec::with_capacity(64);
     encode_typed_transmission_into(&header, &reply, &mut buf);
-    send_to_guest(host, client_id, &buf);
+    if let Some(writer) = host.writer_for(client_id) {
+        writer.enqueue(&buf);
+    }
 }
 
 /// Reply to a `DotsDescriptorRequest`: stream all known non-internal
@@ -1255,18 +1267,11 @@ fn handle_descriptor_request(
         "replying to DotsDescriptorRequest"
     );
 
-    // Snapshot the guest's writer once, then write every descriptor
-    // and the terminator under a single lock-acquire — keeps the
-    // descriptor stream from interleaving with anything else this
-    // guest might be sent.
-    let writer = host
-        .inner
-        .lock()
-        .expect("host mutex poisoned")
-        .guests
-        .get(&client_id)
-        .map(|r| r.write_half.clone());
-    let Some(writer) = writer else {
+    // Snapshot the guest's writer once, then concatenate every
+    // descriptor + terminator into a single buffer that's written as
+    // one atomic enqueue — keeps the descriptor stream from
+    // interleaving with anything else this guest might be sent.
+    let Some(writer) = host.writer_for(client_id) else {
         return;
     };
 
@@ -1305,16 +1310,6 @@ fn handle_descriptor_request(
     writer.enqueue(&buf);
 }
 
-/// Enqueue pre-encoded bytes to a single guest by client_id. The
-/// lookup + enqueue is sync; if the guest has already been removed,
-/// the call is a no-op.
-fn send_to_guest(host: &Arc<HostTransceiver>, client_id: u32, bytes: &[u8]) {
-    let inner = host.inner.lock().expect("host mutex poisoned");
-    if let Some(record) = inner.guests.get(&client_id) {
-        record.write_half.enqueue(bytes);
-    }
-}
-
 /// Handle `DotsClearCache`: drop the named types' entries from the
 /// host's pool and fan out removal transmissions for each cleared
 /// instance. Mirrors C++ `HostTransceiver::handleClearCache`.
@@ -1339,20 +1334,7 @@ fn handle_clear_cache(host: &Arc<HostTransceiver>, raw: &RawTransmission) {
                 continue;
             };
             for (_, entry) in map {
-                let header = DotsHeader {
-                    type_name: Some(type_name.clone()),
-                    sent_time: entry.last_update_time,
-                    server_sent_time: Some(now_timepoint()),
-                    attributes: Some(entry.attributes),
-                    sender: Some(HOST_ID),
-                    remove_obj: Some(true),
-                    is_from_myself: Some(false),
-                    ..Default::default()
-                };
-                out.push(Transmission {
-                    header,
-                    payload: entry.payload,
-                });
+                out.push(removal_txn(type_name, entry));
             }
         }
         out
@@ -1365,11 +1347,27 @@ fn handle_clear_cache(host: &Arc<HostTransceiver>, raw: &RawTransmission) {
             "publishing DotsClearCache removals"
         );
     }
-    for txn in to_publish {
-        let type_name = txn.header.type_name.clone().unwrap_or_default();
-        let mut buf = Vec::with_capacity(64);
-        txn.encode_into(&mut buf);
-        host.fan_out_bytes(&type_name, &buf, HOST_ID);
+    host.fan_out_removals(to_publish);
+}
+
+/// Build a host-originated removal transmission for a cached entry.
+/// Used when the broker drops an entry on its own initiative — either
+/// because the publisher disconnected (`cleanup` flag) or a guest
+/// asked to clear the type via `DotsClearCache`.
+fn removal_txn(type_name: &str, entry: CachedEntry) -> Transmission {
+    let header = DotsHeader {
+        type_name: Some(type_name.to_string()),
+        sent_time: entry.last_update_time,
+        server_sent_time: Some(now_timepoint()),
+        attributes: Some(entry.attributes),
+        sender: Some(HOST_ID),
+        remove_obj: Some(true),
+        is_from_myself: Some(false),
+        ..Default::default()
+    };
+    Transmission {
+        header,
+        payload: entry.payload,
     }
 }
 
