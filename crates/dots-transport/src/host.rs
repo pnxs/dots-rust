@@ -5,15 +5,15 @@
 //! [`accept`](HostTransceiver::accept), drives the broker-side
 //! handshake (`Hello` → `Connect` → `ConnectResponse`), routes
 //! `DotsMember(Join/Leave)` to maintain per-type subscription groups,
-//! and fans out incoming transmissions to subscribed peers.
+//! fans out incoming transmissions to subscribed peers, and replays
+//! the cached pool to late subscribers on `Join`.
 //!
-//! This iteration is in-memory only: tests connect a guest via
-//! [`tokio::io::duplex`] and use the existing [`crate::App`] /
-//! [`crate::GuestTransceiver`] on the other end. A `Listener` trait
-//! (TCP / UDS) will be added in a later step.
-//!
-//! Cache replay on `Join` is **not** done here; that lives in step 3
-//! of the host implementation slice (the [`ContainerPool`]).
+//! Listening accepts both TCP ([`accept_tcp`](HostTransceiver::accept_tcp))
+//! and Unix-domain sockets ([`accept_unix`](HostTransceiver::accept_unix));
+//! [`serve_endpoint`](HostTransceiver::serve_endpoint) parses URI strings
+//! produced by [`crate::parse_endpoint`] and binds the appropriate
+//! listener. Tests can also feed an in-memory duplex stream into
+//! [`accept`](HostTransceiver::accept) directly.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -103,9 +103,8 @@ enum WriteHandle {
 }
 
 /// `Arc`-wrapped `GuestWriter`. Producers clone the `Arc` to fan
-/// out (single atomic op per subscriber); the driver loop runs on
-/// whichever task happened to be the first producer to find
-/// `in_flight = false`.
+/// out (single atomic op per subscriber); a dedicated drainer task
+/// per guest ([`writer_loop`]) owns the actual socket writes.
 type SharedWriter = Arc<GuestWriter>;
 
 impl GuestWriter {
@@ -299,16 +298,13 @@ struct CachedEntry {
 
 struct GuestRecord {
     client_name: Option<String>,
-    /// Shared write end of this guest's connection. The per-guest
-    /// read task uses it for handshake responses and direct replies
-    /// (echo, descriptor-request); peer tasks use it during fan-out
-    /// to write transmissions destined for this guest. `AsyncMutex`
-    /// serialises any concurrent writers — uncontended on a typical
-    /// fan-out since each subscriber's lock fires once per message.
+    /// Shared write end of this guest's connection. Producers
+    /// (handshake replies, direct replies, fan-out from peer tasks)
+    /// `enqueue` bytes synchronously; the per-guest drainer task
+    /// awaits notifications and performs the actual socket I/O.
     write_half: SharedWriter,
     /// Handle to the per-guest read task. Kept so the host can
     /// abort it during shutdown.
-    #[allow(dead_code)]
     task: JoinHandle<()>,
 }
 
@@ -410,9 +406,9 @@ impl HostTransceiver {
     ///
     /// All outbound traffic flows through the per-guest
     /// [`GuestWriter`]: producers append bytes to its internal queue
-    /// under a brief sync mutex, and the first producer to find no
-    /// drive-loop active runs the drain. Avoids the `tokio::sync::Mutex`
-    /// cost the design used to pay on every fan-out subscriber.
+    /// under a brief sync mutex; a dedicated drainer task awaits a
+    /// notification and writes the queue to the socket. The fan-out
+    /// hot path therefore stays sync and `.await`-free per subscriber.
     pub fn accept<S>(self: &Arc<Self>, stream: S) -> u32
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -946,9 +942,9 @@ where
     R: AsyncRead + Unpin + Send + 'static,
 {
     // Reader-only loop: outbound bytes (handshake replies, fan-out
-    // arrivals from peer tasks) are written directly into `writer`
-    // by whichever task produced them, so we no longer need a
-    // `select!` between an inbound stream and an outbound channel.
+    // arrivals from peer tasks) are enqueued into `writer` by
+    // whichever task produces them; the per-guest drainer task does
+    // the socket I/O.
     let mut stream_in =
         FramedRead::new(read_half, RawTransmissionCodec::new(host.registry.clone()));
 
@@ -1180,15 +1176,15 @@ fn handle_connected_message(
     // Fan-out: re-encode the (small) header, splice in the payload
     // bytes verbatim. No DynamicStruct allocation, no CBOR walk over
     // the payload.
-    let mut buf = Vec::with_capacity(SIZE_PREFIX_LEN_HINT + raw.payload.len());
+    let mut buf = Vec::with_capacity(FRAME_OVERHEAD_HINT + raw.payload.len());
     encode_frame_with_header(&header, &raw.payload, &mut buf);
     host.fan_out_bytes(type_name, &buf, 0);
 }
 
-/// Capacity hint for the size prefix + a typical re-encoded header,
-/// used so the fan-out scratch buffer doesn't need to grow on the
-/// first append. Hot path; constant.
-const SIZE_PREFIX_LEN_HINT: usize = 64;
+/// Capacity hint for the per-frame overhead (4-byte size prefix +
+/// CBOR-encoded `DotsHeader`) so the fan-out scratch buffer doesn't
+/// need to grow on the first append. Hot path; constant.
+const FRAME_OVERHEAD_HINT: usize = 64;
 
 /// Reply to a `DotsEcho` request: copy the payload, set `request =
 /// false`, and send it back only to the originating guest. No fan-out.

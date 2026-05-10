@@ -80,7 +80,7 @@ impl Eq for FieldKind {}
 /// instance whose lifetime exceeds the call. A zero-initialized buffer
 /// of the right `(size, align)` always satisfies this for `Option<T>`
 /// because `None` is bit-pattern zero for every primitive `T` plus
-/// `String`, `Vec<u8>`, `Vec<T>`, and `Box<_>` (niche optimization).
+/// `String`, `Vec<T>`, and `Box<_>` (niche optimization).
 pub struct PropertyVtable {
     /// Layout of `Option<T>` for this property — used for sub-validation
     /// and (later) potential per-property allocation strategies.

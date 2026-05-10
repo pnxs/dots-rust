@@ -414,19 +414,9 @@ fn deallocate(ptr: NonNull<u8>, layout: Layout) {
 // ===== DotsField: uniform encode/decode trait =====
 //
 // `DotsField` abstracts over "any type that can occupy a DOTS struct
-// field". The per-property thunks dispatch through it.
-//
-// We do *not* use a blanket impl over `T: minicbor::Encode + Decode`
-// because some leaf types need wire-format choices that diverge from
-// minicbor's defaults — so each is given an explicit impl below. The
-// `Vec<u8>` case in particular: it follows the same `opt_encode_vec`
-// path as every other `Vec<T>`, producing a CBOR array of u8 (matching
-// dots-cpp's `CborSerializer::visitVectorBeginDerived`, which has no
-// byte-string special case for `vector_t<uint8_t>`).
-//
-// `#[derive(DotsStruct)]` adds one more impl family on top: every derived
-// struct gets a manual `DotsField` impl that delegates to the descriptor-
-// driven codec via `encode_struct_value` / `decode_struct_default`.
+// field". The per-property thunks dispatch through it. Each leaf type
+// has an explicit impl below; `#[derive(DotsStruct)]` adds one per
+// derived struct that delegates to the descriptor-driven codec.
 
 /// Trait implemented by every type that can occupy a DOTS property slot.
 pub trait DotsField: Sized {

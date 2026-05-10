@@ -51,7 +51,7 @@ struct RoundtripData {
     home: Option<Address>,
 
     #[dots(tag = 6)]
-    raw: Option<Vec<u8>>,           // CBOR byte string
+    raw: Option<Vec<u8>>,           // CBOR array of u8
 
     #[dots(tag = 7)]
     counters: Option<Vec<u32>>,     // CBOR array of u32

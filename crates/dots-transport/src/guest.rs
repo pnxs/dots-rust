@@ -300,7 +300,6 @@ impl GuestTransceiver {
         self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
     }
 
-    /// Signal the driver's run loop to exit at the next iteration.
     /// Signal the [`GuestDriver`]'s run loop to exit at the next
     /// iteration. Returns immediately; the actual loop break happens
     /// on the next pass through the select. The notify ensures that

@@ -319,9 +319,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 ///
 /// `Option<Vec<X>>` fields route through the `opt_*_vec<X>` helpers
 /// (CBOR array). All other field types stay on the regular `opt_*<T>`
-/// helpers, which dispatch through `T: DotsField`. `Vec<u8>` follows
-/// the same array path as every other vector — matching dots-cpp's
-/// `CborSerializer`, which has no byte-string special case.
+/// helpers, which dispatch through `T: DotsField`.
 fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
     let inner_ty = f.inner_ty;
     let vtable_ident = vtable_ident(f.ident);
