@@ -108,7 +108,7 @@ type DriverFuture = Pin<Box<dyn Future<Output = Result<(), GuestError>> + Send>>
 ///
 /// Owns an [`Arc<GuestTransceiver>`](GuestTransceiver) (the shareable
 /// API surface) and a type-erased driver future (consumed by
-/// [`run`](Self::run)). Constructed via [`connect`](Self::connect)
+/// [`run`](Self::run)). Constructed via [`connect`](Self::connect_tcp)
 /// for TCP or [`connect_unix`](Self::connect_unix) for Unix domain
 /// sockets.
 pub struct App {
@@ -120,13 +120,13 @@ impl App {
     /// Connect to a DOTS broker over TCP and run the handshake (with
     /// `preload = true`). Returns an `App` ready for the user to add
     /// subscriptions, then `run()`.
-    pub async fn connect(addr: &str, client_name: &str) -> Result<App, AppError> {
+    pub async fn connect_tcp(addr: &str, client_name: &str) -> Result<App, AppError> {
         Self::connect_tcp_inner(addr, client_name, None).await
     }
 
-    /// Same as [`connect`](Self::connect) but supplies a shared secret
+    /// Same as [`connect`](Self::connect_tcp) but supplies a shared secret
     /// for SHA-256 challenge-response authentication.
-    pub async fn connect_with_auth(
+    pub async fn connect_tcp_with_auth(
         addr: &str,
         client_name: &str,
         secret: &str,
@@ -156,15 +156,15 @@ impl App {
     }
 
     /// Connect over a parsed [`crate::Endpoint`]. Dispatches to
-    /// [`connect`](Self::connect) for `tcp://` URIs and
+    /// [`connect`](Self::connect_tcp) for `tcp://` URIs and
     /// [`connect_unix`](Self::connect_unix) for `uds://` URIs. Use
     /// [`crate::parse_endpoint`] to build the [`crate::Endpoint`].
-    pub async fn connect_endpoint(
+    pub async fn connect(
         endpoint: crate::Endpoint,
         client_name: &str,
     ) -> Result<App, AppError> {
         match endpoint {
-            crate::Endpoint::Tcp(addr) => Self::connect(&addr, client_name).await,
+            crate::Endpoint::Tcp(addr) => Self::connect_tcp(&addr, client_name).await,
             #[cfg(unix)]
             crate::Endpoint::Uds(path) => Self::connect_unix(path, client_name).await,
             #[cfg(not(unix))]
@@ -175,16 +175,16 @@ impl App {
         }
     }
 
-    /// Same as [`connect_endpoint`](Self::connect_endpoint) but with
+    /// Same as [`connect_endpoint`](Self::connect) but with
     /// authentication.
-    pub async fn connect_endpoint_with_auth(
+    pub async fn connect_with_auth(
         endpoint: crate::Endpoint,
         client_name: &str,
         secret: &str,
     ) -> Result<App, AppError> {
         match endpoint {
             crate::Endpoint::Tcp(addr) => {
-                Self::connect_with_auth(&addr, client_name, secret).await
+                Self::connect_tcp_with_auth(&addr, client_name, secret).await
             }
             #[cfg(unix)]
             crate::Endpoint::Uds(path) => {

@@ -155,7 +155,7 @@ async fn app_connects_and_runs_until_exit() {
     })
     .await;
 
-    let app = App::connect(&addr.to_string(), "client").await.unwrap();
+    let app = App::connect_tcp(&addr.to_string(), "client").await.unwrap();
     let client = app.client();
     let run = tokio::spawn(app.run());
     // Give the loop a tick to start, then exit.
@@ -180,7 +180,7 @@ async fn app_auto_publishes_descriptors_for_subscribed_types() {
     })
     .await;
 
-    let app = App::connect(&addr.to_string(), "registrar").await.unwrap();
+    let app = App::connect_tcp(&addr.to_string(), "registrar").await.unwrap();
     let _sub = app.subscribe::<Pinger>(|_| {});
     let client = app.client();
     let run = tokio::spawn(app.run());
@@ -223,7 +223,7 @@ async fn callback_subscription_receives_events() {
     })
     .await;
 
-    let app = App::connect(&addr.to_string(), "callback-test").await.unwrap();
+    let app = App::connect_tcp(&addr.to_string(), "callback-test").await.unwrap();
     let client = app.client();
     let counter_in_handler = counter.clone();
     app.subscribe::<Pinger>(move |_event| {
@@ -292,7 +292,7 @@ async fn client_publish_from_handler_reaches_server() {
     })
     .await;
 
-    let app = App::connect(&addr.to_string(), "echoer").await.unwrap();
+    let app = App::connect_tcp(&addr.to_string(), "echoer").await.unwrap();
     let client = app.client();
     let client_in_handler = client.clone();
     app.subscribe::<Pinger>(move |event| {
@@ -341,7 +341,7 @@ async fn container_alongside_callback_both_update() {
     })
     .await;
 
-    let app = App::connect(&addr.to_string(), "dual").await.unwrap();
+    let app = App::connect_tcp(&addr.to_string(), "dual").await.unwrap();
     let client = app.client();
     let pingers = app.container::<Pinger>();
     let counter_in_handler = counter.clone();
@@ -398,7 +398,7 @@ async fn dropping_subscription_handle_unsubscribes() {
     })
     .await;
 
-    let app = App::connect(&addr.to_string(), "drop-test").await.unwrap();
+    let app = App::connect_tcp(&addr.to_string(), "drop-test").await.unwrap();
     let client = app.client();
     let counter_in_handler = counter.clone();
     let sub = app.subscribe::<Pinger>(move |_| {

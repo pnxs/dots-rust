@@ -6,7 +6,7 @@
 //! types the broker knows about. Demonstrates the dynamic-client API
 //! end to end:
 //!
-//! - [`App::connect_endpoint`] for TCP or UDS connections,
+//! - [`App::connect`] for TCP or UDS connections,
 //! - [`App::publish`] of `DotsDescriptorRequest` to ask the broker to
 //!   stream every cached descriptor,
 //! - [`App::subscribe_all_types`] for one handler that fires for
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = parse_endpoint(&endpoint_str)?;
     eprintln!("connecting to {endpoint_str} as `{CLIENT_NAME}`...");
 
-    let app = App::connect_endpoint(endpoint, CLIENT_NAME).await?;
+    let app = App::connect(endpoint, CLIENT_NAME).await?;
 
     // Ask the broker to stream every cached descriptor — this is what
     // turns dots-trace into a *dynamic* client. Without it, we'd only

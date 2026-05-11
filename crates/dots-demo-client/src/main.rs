@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = args.next().unwrap_or_else(|| DEFAULT_ADDR.into());
     let name = args.next().unwrap_or_else(|| DEFAULT_NAME.into());
 
-    let app = App::connect(&addr, &name).await?;
+    let app = App::connect_tcp(&addr, &name).await?;
 
     // Container — typed local mirror of the broker's Pinger cache.
     let pingers = app.container::<Pinger>();
