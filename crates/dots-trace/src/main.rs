@@ -29,8 +29,7 @@ use dots_transport::{App, parse_endpoint};
 const DEFAULT_ENDPOINT: &str = "tcp://127.0.0.1:11235";
 const CLIENT_NAME: &str = "dots-trace";
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -39,6 +38,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(true)
         .compact()
         .init();
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
 
     let endpoint_str = std::env::args()
         .nth(1)
