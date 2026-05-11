@@ -23,13 +23,13 @@ use std::task::{Context, Poll};
 
 use bytes::BufMut;
 use dots_core::{
-    EnumDescriptor, PropertySet, Publishable, StructDescriptor, StructValue, decode_typed_from_slice,
-    key_set,
+    EnumDescriptor, PropertySet, Publishable, StructDescriptor, StructValue, Transmittable,
+    decode_typed_from_slice,
 };
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
-    EnumDescriptorData, Registry, StructDescriptorData, Transmission,
-    encode_typed_transmission_into, encode_typed_transmission_with_mask_into,
+    EnumDescriptorData, Registry, StructDescriptorData, Transmission, encode_transmission_into,
+    encode_transmission_with_mask_into,
 };
 use futures_util::{SinkExt, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -345,7 +345,7 @@ where
         payload: &T,
     ) -> Result<(), ConnectionError>
     where
-        T: StructValue,
+        T: Transmittable,
     {
         // dotsd requires `attributes` on every published header — it's
         // the bitmask of payload properties that are valid. The CBOR
@@ -358,7 +358,7 @@ where
             ..Default::default()
         };
         self.scratch.clear();
-        encode_typed_transmission_into(&header, payload, &mut self.scratch);
+        encode_transmission_into(&header, payload, &mut self.scratch);
 
         let buf = self.framed.write_buffer_mut();
         buf.reserve(self.scratch.len());
@@ -381,39 +381,33 @@ where
         Ok(())
     }
 
-    /// Publish a typed value. The wire `type_name` comes from
-    /// `T::DESCRIPTOR.name`, so this is the recommended high-level
-    /// shortcut over [`send_typed`](Self::send_typed) when the value's
-    /// own descriptor name is what should appear in the header.
-    pub async fn publish<T>(&mut self, value: &T) -> Result<(), ConnectionError>
-    where
-        T: StructValue + Publishable,
-    {
-        let type_name = value.descriptor().name;
-        self.send_typed(type_name, value).await
+    /// Publish a value. The wire `type_name` comes from
+    /// [`Transmittable::type_name`], so this is the recommended
+    /// high-level shortcut over [`send_typed`](Self::send_typed) when
+    /// the value's own descriptor name is what should appear in the
+    /// header.
+    pub async fn publish<P: Publishable>(&mut self, value: &P) -> Result<(), ConnectionError> {
+        let type_name = value.type_name().to_string();
+        self.send_typed(&type_name, value).await
     }
 
-    /// Publish a typed value with a property mask. See
+    /// Publish a value with a property mask. See
     /// [`GuestTransceiver::publish_with_mask`](crate::GuestTransceiver::publish_with_mask)
     /// for the masking semantics.
-    pub async fn publish_with_mask<T>(
+    pub async fn publish_with_mask<P: Publishable>(
         &mut self,
-        value: &T,
+        value: &P,
         included: PropertySet,
-    ) -> Result<(), ConnectionError>
-    where
-        T: StructValue + Publishable,
-    {
-        let type_name = value.descriptor().name;
-        let mask = (included | key_set(value)) & value.valid_set();
+    ) -> Result<(), ConnectionError> {
+        let mask = (included | value.key_set()) & value.valid_set();
         let header = DotsHeader {
-            type_name: Some(type_name.into()),
+            type_name: Some(value.type_name().into()),
             attributes: Some(mask),
             sender: self.client_id,
             ..Default::default()
         };
         self.scratch.clear();
-        encode_typed_transmission_with_mask_into(&header, value, mask, &mut self.scratch);
+        encode_transmission_with_mask_into(&header, value, mask, &mut self.scratch);
 
         let buf = self.framed.write_buffer_mut();
         buf.reserve(self.scratch.len());

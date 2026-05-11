@@ -1133,7 +1133,7 @@ async fn dynamic_publish_routes_through_broker_to_typed_subscriber() {
             (3, DynamicValue::U64(77)),
         ],
     };
-    gt_pub.publish_dynamic(&value).unwrap();
+    gt_pub.publish(&value.try_as_publishable().unwrap()).unwrap();
 
     let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
         .await

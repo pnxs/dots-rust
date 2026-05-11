@@ -11,7 +11,7 @@ use dots_core::{StructValue, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
-    Registry, Transmission, encode_typed_transmission, registry_with_internal_types,
+    Registry, Transmission, encode_transmission, registry_with_internal_types,
 };
 use dots_transport::{Connection, ConnectionBuilder, ConnectionError, TransmissionCodec};
 use futures_util::{SinkExt, StreamExt};
@@ -447,7 +447,7 @@ async fn next_after_handshake_yields_server_traffic() {
             sender: Some(99),
             ..Default::default()
         };
-        let bytes = encode_typed_transmission(&header, &demo);
+        let bytes = encode_transmission(&header, &demo);
         let stream = framed.get_mut();
         stream.write_all(&bytes).await.unwrap();
     });

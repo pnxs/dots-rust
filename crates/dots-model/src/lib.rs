@@ -37,9 +37,8 @@ pub use descriptors::{
 };
 pub use framing::{
     FramingError, MAX_BODY_SIZE, RawTransmission, SIZE_PREFIX_LEN, SIZE_PREFIX_MARKER, Transmission,
-    decode_typed_transmission, encode_dynamic_transmission_into, encode_frame_with_header,
-    encode_typed_transmission, encode_typed_transmission_into,
-    encode_typed_transmission_with_mask_into, parse_size_prefix,
+    decode_typed_transmission, encode_frame_with_header, encode_transmission,
+    encode_transmission_into, encode_transmission_with_mask_into, parse_size_prefix,
 };
 pub use registry::{DescriptorEntry, Registry, RegistryError};
 

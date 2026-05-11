@@ -16,7 +16,7 @@ use dots_core::{PropertySet, StructValue, decode_typed_from_slice, encode_to_vec
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsHeader, DotsMsgConnectResponse, DotsMsgHello, Registry, Transmission,
-    encode_typed_transmission, registry_with_internal_types,
+    encode_transmission, registry_with_internal_types,
 };
 use dots_transport::{Connection, TransmissionCodec};
 use futures_util::{SinkExt, StreamExt};
@@ -117,7 +117,7 @@ async fn subscription_receives_event_pushed_by_server() {
             sender: Some(42),
             ..Default::default()
         };
-        let frame = encode_typed_transmission(&header, &pinger);
+        let frame = encode_transmission(&header, &pinger);
         framed.get_mut().write_all(&frame).await.unwrap();
     });
 
@@ -158,7 +158,7 @@ async fn subscription_filters_by_type_name() {
         };
         framed
             .get_mut()
-            .write_all(&encode_typed_transmission(&bonk_header, &bonk))
+            .write_all(&encode_transmission(&bonk_header, &bonk))
             .await
             .unwrap();
 
@@ -173,7 +173,7 @@ async fn subscription_filters_by_type_name() {
         };
         framed
             .get_mut()
-            .write_all(&encode_typed_transmission(&pinger_header, &pinger))
+            .write_all(&encode_transmission(&pinger_header, &pinger))
             .await
             .unwrap();
     });
@@ -217,7 +217,7 @@ async fn multiple_subscriptions_to_same_type_each_receive() {
         };
         framed
             .get_mut()
-            .write_all(&encode_typed_transmission(&header, &pinger))
+            .write_all(&encode_transmission(&header, &pinger))
             .await
             .unwrap();
     });
@@ -260,7 +260,7 @@ async fn dropping_subscription_stops_receiving() {
             };
             framed
                 .get_mut()
-                .write_all(&encode_typed_transmission(&header, &pinger))
+                .write_all(&encode_transmission(&header, &pinger))
                 .await
                 .unwrap();
         }
@@ -340,7 +340,7 @@ async fn publish_then_server_echoes_then_subscription_receives() {
         };
         framed
             .get_mut()
-            .write_all(&encode_typed_transmission(&header, &pinger))
+            .write_all(&encode_transmission(&header, &pinger))
             .await
             .unwrap();
     });

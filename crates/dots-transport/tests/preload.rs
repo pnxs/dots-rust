@@ -22,7 +22,7 @@ use dots_core::{StructValue, decode_typed_from_slice, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
-    Registry, StructDescriptorData, Transmission, encode_typed_transmission,
+    Registry, StructDescriptorData, Transmission, encode_transmission,
     registry_with_internal_types,
 };
 use dots_transport::{ConnectionBuilder, ConnectionError, TransmissionCodec};
@@ -129,7 +129,7 @@ async fn preload_server(
             from_cache: Some(remaining),
             ..Default::default()
         };
-        let frame = encode_typed_transmission(&header, pinger);
+        let frame = encode_transmission(&header, pinger);
         framed.get_mut().write_all(&frame).await.unwrap();
     }
 

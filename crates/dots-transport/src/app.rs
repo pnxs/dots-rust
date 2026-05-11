@@ -325,37 +325,22 @@ impl App {
         self.transceiver.register_enum(descriptor)
     }
 
-    pub fn publish<T>(&self, value: &T) -> Result<(), ClientClosed>
-    where
-        T: StructValue + Publishable,
-    {
+    pub fn publish<P: Publishable>(&self, value: &P) -> Result<(), ClientClosed> {
         self.transceiver.publish(value)
     }
 
     /// Publish a partial update — see [`GuestTransceiver::publish_with_mask`].
-    pub fn publish_with_mask<T>(
+    pub fn publish_with_mask<P: Publishable>(
         &self,
-        value: &T,
+        value: &P,
         included: PropertySet,
-    ) -> Result<(), ClientClosed>
-    where
-        T: StructValue + Publishable,
-    {
+    ) -> Result<(), ClientClosed> {
         self.transceiver.publish_with_mask(value, included)
     }
 
     /// Publish a removal — see [`GuestTransceiver::remove`].
-    pub fn remove<T>(&self, value: &T) -> Result<(), ClientClosed>
-    where
-        T: StructValue + Publishable,
-    {
+    pub fn remove<P: Publishable>(&self, value: &P) -> Result<(), ClientClosed> {
         self.transceiver.remove(value)
-    }
-
-    /// Publish a runtime-described value — see
-    /// [`GuestTransceiver::publish_dynamic`].
-    pub fn publish_dynamic(&self, value: &DynamicStruct) -> Result<(), ClientClosed> {
-        self.transceiver.publish_dynamic(value)
     }
 
     pub fn exit(&self) {

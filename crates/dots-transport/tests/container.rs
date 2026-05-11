@@ -7,7 +7,7 @@ use dots_core::{StructValue, Timepoint, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsHeader, DotsMsgConnectResponse, DotsMsgHello, Registry, Transmission,
-    encode_typed_transmission, registry_with_internal_types,
+    encode_transmission, registry_with_internal_types,
 };
 use dots_transport::{Connection, Operation, TransmissionCodec};
 use futures_util::{SinkExt, StreamExt};
@@ -87,7 +87,7 @@ async fn push_pinger(
         remove_obj: Some(remove),
         ..Default::default()
     };
-    let frame = encode_typed_transmission(&header, pinger);
+    let frame = encode_transmission(&header, pinger);
     framed.get_mut().write_all(&frame).await.unwrap();
 }
 

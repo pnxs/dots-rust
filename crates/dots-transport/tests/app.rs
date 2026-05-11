@@ -12,7 +12,7 @@ use dots_core::{StructValue, decode_typed_from_slice, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello, Registry,
-    StructDescriptorData, Transmission, encode_typed_transmission,
+    StructDescriptorData, Transmission, encode_transmission,
     registry_with_internal_types,
 };
 use dots_transport::{App, TransmissionCodec};
@@ -214,7 +214,7 @@ async fn callback_subscription_receives_events() {
             };
             framed
                 .get_mut()
-                .write_all(&encode_typed_transmission(&header, &p))
+                .write_all(&encode_transmission(&header, &p))
                 .await
                 .unwrap();
         }
@@ -267,7 +267,7 @@ async fn client_publish_from_handler_reaches_server() {
         };
         framed
             .get_mut()
-            .write_all(&encode_typed_transmission(&header, &trigger))
+            .write_all(&encode_transmission(&header, &trigger))
             .await
             .unwrap();
 
@@ -333,7 +333,7 @@ async fn container_alongside_callback_both_update() {
             };
             framed
                 .get_mut()
-                .write_all(&encode_typed_transmission(&header, &p))
+                .write_all(&encode_transmission(&header, &p))
                 .await
                 .unwrap();
         }
@@ -390,7 +390,7 @@ async fn dropping_subscription_handle_unsubscribes() {
             };
             framed
                 .get_mut()
-                .write_all(&encode_typed_transmission(&header, &p))
+                .write_all(&encode_transmission(&header, &p))
                 .await
                 .unwrap();
         }

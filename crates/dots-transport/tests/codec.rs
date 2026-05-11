@@ -248,7 +248,7 @@ async fn decoder_surfaces_unknown_type_for_payload_not_in_registry() {
 
 #[tokio::test]
 async fn typed_payload_decodes_via_registry_then_back_to_typed() {
-    // Sender uses encode_typed_transmission; receiver gets a dynamic
+    // Sender uses encode_transmission; receiver gets a dynamic
     // Transmission, re-encodes the payload, decodes back to typed Sample.
     // Proves the codec is a transparent path for typed/dynamic mix.
     let registry = populated_registry();
@@ -265,7 +265,7 @@ async fn typed_payload_decodes_via_registry_then_back_to_typed() {
         id: Some(1234),
         label: Some("typed→dynamic→typed".into()),
     };
-    let frame = dots_model::encode_typed_transmission(&header, &typed_payload);
+    let frame = dots_model::encode_transmission(&header, &typed_payload);
 
     a.write_all(&frame).await.unwrap();
     a.shutdown().await.unwrap();

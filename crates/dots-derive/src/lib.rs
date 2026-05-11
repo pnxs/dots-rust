@@ -226,7 +226,13 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         quote! {}
     } else {
         quote! {
-            impl ::dots_core::Publishable for #struct_ident {}
+            impl ::dots_core::Publishable for #struct_ident {
+                fn static_descriptor(&self) -> ::core::option::Option<&'static ::dots_core::StructDescriptor> {
+                    ::core::option::Option::Some(
+                        <Self as ::dots_core::StructValue>::type_descriptor(),
+                    )
+                }
+            }
         }
     };
 

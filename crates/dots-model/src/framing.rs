@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use dots_core::{
-    DecodeError, DynamicStruct, DynamicStructDescriptor, PropertySet, StructValue,
-    decode_typed_from_decoder, encode_into_vec, encode_into_vec_with_mask,
+    DecodeError, DynamicStruct, DynamicStructDescriptor, PropertySet, StructValue, Transmittable,
+    decode_typed_from_decoder, encode_into_vec,
 };
 
 use crate::{DotsHeader, Registry};
@@ -112,56 +112,55 @@ impl From<DecodeError> for FramingError {
 
 // ===== Encoding =====
 
-/// Encode a transmission with a typed payload, producing the full v2
-/// frame (size prefix + header + payload).
+/// Encode a transmission, producing the full v2 frame (size prefix +
+/// header + payload).
 ///
-/// Caller is responsible for setting `header.type_name` to match
-/// `payload`'s descriptor name — the framer itself does not validate
-/// or override it.
-pub fn encode_typed_transmission(header: &DotsHeader, payload: &dyn StructValue) -> Vec<u8> {
+/// Accepts any [`Transmittable`] payload — typed Rust structs,
+/// `AnyStruct`, or `DynamicStruct`. Caller is responsible for setting
+/// `header.type_name` to match `payload.type_name()`; the framer
+/// itself does not validate or override it.
+pub fn encode_transmission(header: &DotsHeader, payload: &dyn Transmittable) -> Vec<u8> {
     let mut out = Vec::with_capacity(SIZE_PREFIX_LEN + 64);
-    encode_typed_transmission_into(header, payload, &mut out);
+    encode_transmission_into(header, payload, &mut out);
     out
 }
 
-/// Append a typed-payload transmission to an existing buffer.
+/// Append a transmission to an existing buffer.
 ///
 /// Lets callers (e.g. the async transport's encoder) reuse a scratch
 /// buffer across many sends, eliminating the per-send allocation. Also
 /// usable for building a single buffer of back-to-back frames — each
 /// call appends one complete frame whose size prefix references only
 /// that frame's body.
-pub fn encode_typed_transmission_into(
+pub fn encode_transmission_into(
     header: &DotsHeader,
-    payload: &dyn StructValue,
+    payload: &dyn Transmittable,
     out: &mut Vec<u8>,
 ) {
-    let frame_start = out.len();
-    out.extend_from_slice(&[SIZE_PREFIX_MARKER, 0, 0, 0, 0]);
-    encode_into_vec(header, out);
-    encode_into_vec(payload, out);
-    patch_size_prefix(out, frame_start);
+    encode_transmission_with_mask_into(header, payload, payload.valid_set(), out);
 }
 
-/// Same as [`encode_typed_transmission_into`], but emits only the
-/// payload properties whose tag is in `mask`. Used by the remove
-/// path to publish a key-only payload alongside `header.remove_obj
-/// = true`.
-pub fn encode_typed_transmission_with_mask_into(
+/// Same as [`encode_transmission_into`], but emits only the payload
+/// properties whose tag is in `mask`. Used by the remove path to
+/// publish a key-only payload alongside `header.remove_obj = true`.
+pub fn encode_transmission_with_mask_into(
     header: &DotsHeader,
-    payload: &dyn StructValue,
+    payload: &dyn Transmittable,
     mask: PropertySet,
     out: &mut Vec<u8>,
 ) {
     let frame_start = out.len();
     out.extend_from_slice(&[SIZE_PREFIX_MARKER, 0, 0, 0, 0]);
     encode_into_vec(header, out);
-    encode_into_vec_with_mask(payload, mask, out);
+    let mut encoder = dots_core::minicbor::Encoder::new(&mut *out);
+    payload
+        .encode_into(mask, &mut encoder)
+        .expect("Vec<u8> writes are infallible");
     patch_size_prefix(out, frame_start);
 }
 
 impl Transmission {
-    /// Encode this transmission (with its dynamic payload) into a v2 frame.
+    /// Encode this transmission into a v2 frame.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(SIZE_PREFIX_LEN + 64);
         self.encode_into(&mut out);
@@ -170,30 +169,10 @@ impl Transmission {
 
     /// Append this transmission's frame bytes to an existing buffer.
     /// Same scratch-buffer / batching benefits as
-    /// [`encode_typed_transmission_into`].
+    /// [`encode_transmission_into`].
     pub fn encode_into(&self, out: &mut Vec<u8>) {
-        let frame_start = out.len();
-        out.extend_from_slice(&[SIZE_PREFIX_MARKER, 0, 0, 0, 0]);
-        encode_into_vec(&self.header, out);
-        self.payload.encode_into(out);
-        patch_size_prefix(out, frame_start);
+        encode_transmission_into(&self.header, &self.payload, out);
     }
-}
-
-/// Append a frame whose payload is a [`DynamicStruct`] to an existing
-/// buffer. Companion to [`encode_typed_transmission_into`] for the
-/// runtime-described publish path — used by dynamic clients that
-/// don't have a compiled-in `T`.
-pub fn encode_dynamic_transmission_into(
-    header: &DotsHeader,
-    payload: &DynamicStruct,
-    out: &mut Vec<u8>,
-) {
-    let frame_start = out.len();
-    out.extend_from_slice(&[SIZE_PREFIX_MARKER, 0, 0, 0, 0]);
-    encode_into_vec(header, out);
-    payload.encode_into(out);
-    patch_size_prefix(out, frame_start);
 }
 
 /// Patch the 4-byte big-endian size field of a frame whose 5-byte
@@ -364,7 +343,7 @@ impl RawTransmission {
 }
 
 /// Append a v2 frame with `new_header` and the given raw payload bytes
-/// to `out`. Mirrors [`encode_typed_transmission_into`] but takes the
+/// to `out`. Mirrors [`encode_transmission_into`] but takes the
 /// payload pre-encoded — used by the broker to rewrite a transmission's
 /// header (sender, server_sent_time) while reusing the original
 /// payload bytes verbatim.

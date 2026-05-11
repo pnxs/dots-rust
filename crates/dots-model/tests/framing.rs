@@ -8,7 +8,7 @@ use bytes::Bytes;
 use dots_model::{
     DotsHeader, FramingError, MAX_BODY_SIZE, RawTransmission, Registry, SIZE_PREFIX_LEN,
     SIZE_PREFIX_MARKER, StructDescriptorData, Transmission, decode_typed_transmission,
-    encode_frame_with_header, encode_typed_transmission, encode_typed_transmission_into,
+    encode_frame_with_header, encode_transmission, encode_transmission_into,
     parse_size_prefix,
 };
 
@@ -46,7 +46,7 @@ fn wire_starts_with_marker_and_be_size() {
         id: Some(1),
         label: Some("hi".into()),
     };
-    let bytes = encode_typed_transmission(&header, &payload);
+    let bytes = encode_transmission(&header, &payload);
 
     // 0x1A marker.
     assert_eq!(bytes[0], SIZE_PREFIX_MARKER);
@@ -63,7 +63,7 @@ fn body_is_header_then_payload_concatenated() {
         id: Some(1),
         ..Default::default()
     };
-    let frame = encode_typed_transmission(&header, &payload);
+    let frame = encode_transmission(&header, &payload);
     let body = &frame[SIZE_PREFIX_LEN..];
 
     // Header alone should be a prefix of the body.
@@ -124,7 +124,7 @@ fn typed_decode_recovers_header_and_payload() {
         id: Some(42),
         label: Some("hello".into()),
     };
-    let frame = encode_typed_transmission(&header, &payload);
+    let frame = encode_transmission(&header, &payload);
 
     let (h, p, consumed) = decode_typed_transmission::<Sample>(&frame).unwrap();
     assert_eq!(h, header);
@@ -134,7 +134,7 @@ fn typed_decode_recovers_header_and_payload() {
 
 #[test]
 fn typed_decode_with_partial_buffer_signals_need_more() {
-    let frame = encode_typed_transmission(&header_for("Sample"), &Sample::default());
+    let frame = encode_transmission(&header_for("Sample"), &Sample::default());
     // Hand the decoder a truncated buffer.
     let truncated = &frame[..frame.len() - 1];
     match decode_typed_transmission::<Sample>(truncated) {
@@ -152,7 +152,7 @@ fn dynamic_decode_recovers_payload_via_registry() {
         id: Some(99),
         label: Some("dyn".into()),
     };
-    let frame = encode_typed_transmission(&header, &payload);
+    let frame = encode_transmission(&header, &payload);
 
     let registry = populated_registry();
     let (txn, consumed) = Transmission::decode(&frame, &registry).unwrap();
@@ -170,7 +170,7 @@ fn dynamic_decode_fails_on_unknown_type() {
         id: Some(1),
         ..Default::default()
     };
-    let frame = encode_typed_transmission(&header, &payload);
+    let frame = encode_transmission(&header, &payload);
 
     let registry = populated_registry();
     match Transmission::decode(&frame, &registry) {
@@ -185,7 +185,7 @@ fn dynamic_decode_fails_when_header_lacks_type_name() {
         sender: Some(1),
         ..Default::default()
     };
-    let frame = encode_typed_transmission(&header, &Sample::default());
+    let frame = encode_transmission(&header, &Sample::default());
 
     let registry = populated_registry();
     match Transmission::decode(&frame, &registry) {
@@ -208,9 +208,9 @@ fn back_to_back_frames_decode_with_correct_offsets() {
         label: Some("second".into()),
     };
 
-    let mut stream = encode_typed_transmission(&header, &p1);
+    let mut stream = encode_transmission(&header, &p1);
     let frame1_len = stream.len();
-    stream.extend_from_slice(&encode_typed_transmission(&header, &p2));
+    stream.extend_from_slice(&encode_transmission(&header, &p2));
 
     let registry = populated_registry();
 
@@ -231,7 +231,7 @@ fn back_to_back_frames_decode_with_correct_offsets() {
 
 #[test]
 fn decode_returns_need_more_data_when_body_short() {
-    let frame = encode_typed_transmission(&header_for("Sample"), &Sample::default());
+    let frame = encode_transmission(&header_for("Sample"), &Sample::default());
     let registry = populated_registry();
     let truncated = &frame[..frame.len() - 1];
     match Transmission::decode(truncated, &registry) {
@@ -260,7 +260,7 @@ fn decode_returns_need_more_data_when_prefix_short() {
 #[test]
 fn encode_into_appends_to_existing_buffer() {
     let mut buf = vec![0xAB_u8, 0xCD]; // pre-existing bytes
-    encode_typed_transmission_into(
+    encode_transmission_into(
         &header_for("Sample"),
         &Sample {
             id: Some(1),
@@ -281,7 +281,7 @@ fn encode_into_appends_to_existing_buffer() {
 fn encode_into_batches_multiple_frames() {
     let mut buf = Vec::new();
     let h = header_for("Sample");
-    encode_typed_transmission_into(
+    encode_transmission_into(
         &h,
         &Sample {
             id: Some(1),
@@ -290,7 +290,7 @@ fn encode_into_batches_multiple_frames() {
         &mut buf,
     );
     let after_first = buf.len();
-    encode_typed_transmission_into(
+    encode_transmission_into(
         &h,
         &Sample {
             id: Some(2),
@@ -318,7 +318,7 @@ fn encode_into_batches_multiple_frames() {
 #[test]
 fn transmission_encode_into_matches_encode() {
     let registry = populated_registry();
-    let typed_frame = encode_typed_transmission(
+    let typed_frame = encode_transmission(
         &header_for("Sample"),
         &Sample {
             id: Some(7),
@@ -340,7 +340,7 @@ fn typed_encode_then_dynamic_reencode_is_byte_identical() {
         id: Some(31415),
         label: Some("π".into()),
     };
-    let typed_frame = encode_typed_transmission(&header, &payload);
+    let typed_frame = encode_transmission(&header, &payload);
 
     let registry = populated_registry();
     let (txn, _) = Transmission::decode(&typed_frame, &registry).unwrap();
@@ -357,7 +357,7 @@ fn raw_transmission_decode_recovers_header_and_payload_slice() {
         id: Some(42),
         label: Some("hi".into()),
     };
-    let frame_bytes = encode_typed_transmission(&header, &payload);
+    let frame_bytes = encode_transmission(&header, &payload);
 
     let raw = RawTransmission::decode(Bytes::from(frame_bytes.clone())).unwrap();
     assert_eq!(raw.header, header);
@@ -365,7 +365,7 @@ fn raw_transmission_decode_recovers_header_and_payload_slice() {
     // Re-encoding the original header with the raw payload bytes must
     // reproduce the exact original frame — proving the slice boundaries
     // are correct and `encode_frame_with_header` is byte-symmetric with
-    // `encode_typed_transmission_into`.
+    // `encode_transmission_into`.
     let mut rebuilt = Vec::new();
     encode_frame_with_header(&header, &raw.payload, &mut rebuilt);
     assert_eq!(rebuilt, frame_bytes);
@@ -378,7 +378,7 @@ fn raw_transmission_decode_payload_matches_typed() {
         id: Some(7),
         label: Some("seven".into()),
     };
-    let frame_bytes = encode_typed_transmission(&header, &payload);
+    let frame_bytes = encode_transmission(&header, &payload);
     let registry = populated_registry();
 
     let raw = RawTransmission::decode(Bytes::from(frame_bytes)).unwrap();
@@ -399,7 +399,7 @@ fn raw_transmission_rewrite_header_keeps_payload_bytes() {
         id: Some(99),
         label: Some("verbatim".into()),
     };
-    let frame_bytes = encode_typed_transmission(&header, &payload);
+    let frame_bytes = encode_transmission(&header, &payload);
 
     let raw = RawTransmission::decode(Bytes::from(frame_bytes)).unwrap();
 
@@ -424,7 +424,7 @@ fn raw_transmission_rejects_short_buffer() {
         id: Some(1),
         label: Some("x".into()),
     };
-    let frame = encode_typed_transmission(&header, &payload);
+    let frame = encode_transmission(&header, &payload);
     let truncated = Bytes::copy_from_slice(&frame[..frame.len() - 2]);
     match RawTransmission::decode(truncated) {
         Err(FramingError::NeedMoreData { .. }) => {}

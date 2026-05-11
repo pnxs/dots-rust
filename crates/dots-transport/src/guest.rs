@@ -18,12 +18,11 @@ use std::sync::{Arc, Mutex, Weak};
 
 use dots_core::{
     DynamicStruct, DynamicStructDescriptor, EnumDescriptor, PropertySet, Publishable,
-    StructDescriptor, StructValue, Timepoint, decode_typed_from_slice, key_set,
+    StructDescriptor, StructValue, Timepoint, Transmittable, decode_typed_from_slice,
 };
 use dots_model::{
     DotsHeader, DotsMember, DotsMemberEvent, EnumDescriptorData, Registry, StructDescriptorData,
-    Transmission, encode_dynamic_transmission_into, encode_typed_transmission_into,
-    encode_typed_transmission_with_mask_into,
+    Transmission, encode_transmission_into, encode_transmission_with_mask_into,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -286,8 +285,9 @@ impl GuestTransceiver {
     /// Mirrors dots-cpp's `subscribe<StructDescriptor>` /
     /// `DynamicTypeReceiver` pattern. Combine with
     /// [`subscribe_dynamic`](Self::subscribe_dynamic) and
-    /// [`publish_dynamic`](Self::publish_dynamic) for a fully
-    /// dynamic client.
+    /// [`publish`](Self::publish) (with
+    /// [`DynamicStruct::try_as_publishable`](dots_core::DynamicStruct::try_as_publishable))
+    /// for a fully dynamic client.
     pub fn subscribe_new_struct_type<F>(self: &Arc<Self>, handler: F) -> SubscriptionHandle
     where
         F: FnMut(&Arc<DynamicStructDescriptor>) + Send + 'static,
@@ -383,72 +383,64 @@ impl GuestTransceiver {
         self.register_enum_descriptor_internal(descriptor);
     }
 
-    /// Publish a typed value. Synchronous — bytes are pushed onto the
+    /// Publish a value. Synchronous — bytes are pushed onto the
     /// outbound channel and sent by the [`GuestDriver::run`] loop.
     ///
+    /// Accepts any [`Publishable`]: typed Rust structs (via the
+    /// derive), and runtime-described values borrowed through
+    /// [`DynamicStruct::try_as_publishable`](dots_core::DynamicStruct::try_as_publishable).
     /// Substruct-only types (`#[dots(substruct_only)]`) intentionally
-    /// don't implement [`Publishable`], so this fails to compile at
-    /// the call site rather than producing a runtime error.
-    pub fn publish<T>(&self, value: &T) -> Result<(), ClientClosed>
-    where
-        T: StructValue + Publishable,
-    {
-        self.register_struct_descriptor(T::type_descriptor());
-        self.publish_typed(value)
+    /// don't implement [`Publishable`], so the compile error fires at
+    /// the call site for typed values; for runtime-described values,
+    /// `try_as_publishable` returns `NotPublishable::SubstructOnly`.
+    ///
+    /// For typed values, the underlying type's descriptor is
+    /// auto-registered with the broker. Runtime-described values
+    /// return `None` from `static_descriptor()` and the caller is
+    /// responsible for descriptor registration.
+    pub fn publish<P: Publishable>(&self, value: &P) -> Result<(), ClientClosed> {
+        if let Some(d) = value.static_descriptor() {
+            self.register_struct_descriptor(d);
+        }
+        let header = DotsHeader {
+            type_name: Some(value.type_name().into()),
+            attributes: Some(value.valid_set()),
+            sender: self.client_id(),
+            sent_time: Some(now_timepoint()),
+            ..Default::default()
+        };
+        let mut bytes = Vec::with_capacity(64);
+        encode_transmission_into(&header, value, &mut bytes);
+        self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
     }
 
-    /// Publish a typed value, restricting the wire payload to the
-    /// properties named in `included` (plus the type's keys, which
-    /// are always sent so receivers can identify the instance).
+    /// Publish a value, restricting the wire payload to the properties
+    /// named in `included` (plus the type's keys, which are always sent
+    /// so receivers can identify the instance).
     ///
     /// Mirrors C++ `publish(instance, includedProperties, remove=false)`:
     /// only properties that are *both* set on `value` *and* included
     /// in the union of `included | key_set(value)` make it onto the
     /// wire. Useful for partial updates where some non-key fields
     /// are populated locally but should not be propagated yet.
-    pub fn publish_with_mask<T>(
+    pub fn publish_with_mask<P: Publishable>(
         &self,
-        value: &T,
+        value: &P,
         included: PropertySet,
-    ) -> Result<(), ClientClosed>
-    where
-        T: StructValue + Publishable,
-    {
-        self.register_struct_descriptor(T::type_descriptor());
-        let mask = (included | key_set(value)) & value.valid_set();
+    ) -> Result<(), ClientClosed> {
+        if let Some(d) = value.static_descriptor() {
+            self.register_struct_descriptor(d);
+        }
+        let mask = (included | value.key_set()) & value.valid_set();
         let header = DotsHeader {
-            type_name: Some(value.descriptor().name.into()),
+            type_name: Some(value.type_name().into()),
             attributes: Some(mask),
             sender: self.client_id(),
             sent_time: Some(now_timepoint()),
             ..Default::default()
         };
         let mut bytes = Vec::with_capacity(64);
-        encode_typed_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
-    }
-
-    /// Publish a runtime-described value. The wire `type_name` and
-    /// `attributes` come from `value.descriptor.name` and
-    /// `value.valid` respectively. Used by dynamic clients that
-    /// construct a [`DynamicStruct`] from a runtime descriptor (often
-    /// learned from the broker via `StructDescriptorData`).
-    ///
-    /// Note: the descriptor is *not* re-published to the broker here.
-    /// If the descriptor was learned from the broker, the broker
-    /// already knows it; if the caller built it locally, they must
-    /// publish a `StructDescriptorData` for it themselves before any
-    /// peer can decode the payload.
-    pub fn publish_dynamic(&self, value: &DynamicStruct) -> Result<(), ClientClosed> {
-        let header = DotsHeader {
-            type_name: Some(value.descriptor.name.clone().into()),
-            attributes: Some(value.valid),
-            sender: self.client_id(),
-            sent_time: Some(now_timepoint()),
-            ..Default::default()
-        };
-        let mut bytes = Vec::with_capacity(64);
-        encode_dynamic_transmission_into(&header, value, &mut bytes);
+        encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
         self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
     }
 
@@ -458,14 +450,13 @@ impl GuestTransceiver {
     /// = true` and `header.attributes` is the key-only bitmask.
     ///
     /// Mirrors C++ `transceiver.remove(instance)`.
-    pub fn remove<T>(&self, value: &T) -> Result<(), ClientClosed>
-    where
-        T: StructValue + Publishable,
-    {
-        self.register_struct_descriptor(T::type_descriptor());
-        let mask = key_set(value);
+    pub fn remove<P: Publishable>(&self, value: &P) -> Result<(), ClientClosed> {
+        if let Some(d) = value.static_descriptor() {
+            self.register_struct_descriptor(d);
+        }
+        let mask = value.key_set();
         let header = DotsHeader {
-            type_name: Some(value.descriptor().name.into()),
+            type_name: Some(value.type_name().into()),
             attributes: Some(mask),
             sender: self.client_id(),
             sent_time: Some(now_timepoint()),
@@ -473,7 +464,7 @@ impl GuestTransceiver {
             ..Default::default()
         };
         let mut bytes = Vec::with_capacity(64);
-        encode_typed_transmission_with_mask_into(&header, value, mask, &mut bytes);
+        encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
         self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
     }
 
@@ -604,16 +595,15 @@ impl GuestTransceiver {
     }
 
     fn publish_typed<T: StructValue>(&self, value: &T) -> Result<(), ClientClosed> {
-        let type_name = value.descriptor().name;
         let header = DotsHeader {
-            type_name: Some(type_name.into()),
-            attributes: Some(value.valid_set()),
+            type_name: Some(<T as Transmittable>::type_name(value).into()),
+            attributes: Some(<T as Transmittable>::valid_set(value)),
             sender: self.client_id(),
             sent_time: Some(now_timepoint()),
             ..Default::default()
         };
         let mut bytes = Vec::with_capacity(64);
-        encode_typed_transmission_into(&header, value, &mut bytes);
+        encode_transmission_into(&header, value, &mut bytes);
         self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
     }
 }

@@ -30,7 +30,7 @@ pub use descriptor::{
 };
 pub use dynamic::{
     DynamicEnumDescriptor, DynamicEnumElement, DynamicFieldKind, DynamicPropertyDescriptor,
-    DynamicStruct, DynamicStructDescriptor, DynamicValue,
+    DynamicPublishable, DynamicStruct, DynamicStructDescriptor, DynamicValue, NotPublishable,
 };
 pub use layout::{
     AnyStruct, DecodeError, DotsField, EncodeError, decode_typed_from_decoder,
@@ -39,7 +39,7 @@ pub use layout::{
 };
 pub use property_set::PropertySet;
 pub use temporal::{Duration, Timepoint};
-pub use value::{Publishable, StructValue};
+pub use value::{Publishable, StructValue, Transmittable};
 
 /// Re-export of the `minicbor` crate so derived code and downstream users
 /// reference a single, version-aligned copy. Prefer importing

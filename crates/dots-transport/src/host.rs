@@ -22,13 +22,13 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::Mutex as AsyncMutex;
 
 use dots_core::{
-    DynamicStruct, PropertySet, Publishable, StructValue, decode_typed_from_slice, key_set,
+    DynamicStruct, PropertySet, Publishable, StructValue, Transmittable, decode_typed_from_slice,
 };
 use dots_model::{
     DotsCacheInfo, DotsConnectionState, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect,
     DotsMsgConnectResponse, DotsMsgHello, EnumDescriptorData, RawTransmission, Registry,
     StructDescriptorData, Transmission, daemon::DotsClient, encode_frame_with_header,
-    encode_typed_transmission_into, encode_typed_transmission_with_mask_into,
+    encode_transmission_into, encode_transmission_with_mask_into,
 };
 use futures_util::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -574,63 +574,55 @@ impl HostTransceiver {
     /// Synchronous: enqueues bytes to each subscriber's drainer
     /// task. The actual socket I/O happens asynchronously in those
     /// drainer tasks.
-    pub fn publish<T>(&self, value: &T)
-    where
-        T: StructValue + Publishable,
-    {
-        let type_name = value.descriptor().name;
+    pub fn publish<P: Publishable>(&self, value: &P) {
+        let type_name = value.type_name().to_string();
+        let mask = value.valid_set();
         let header = DotsHeader {
-            type_name: Some(type_name.into()),
-            attributes: Some(value.valid_set()),
-            sender: Some(HOST_ID),
-            sent_time: Some(now_timepoint()),
-            server_sent_time: Some(now_timepoint()),
-            ..Default::default()
-        };
-        self.cache_merge_typed(type_name, &header, value, None);
-
-        let mut bytes = Vec::with_capacity(64);
-        encode_typed_transmission_into(&header, value, &mut bytes);
-        self.fan_out_bytes(type_name, &bytes, /*exclude*/ HOST_ID);
-    }
-
-    /// Publish a partial update from the host. Same masking rules as
-    /// [`GuestTransceiver::publish_with_mask`](crate::GuestTransceiver::publish_with_mask):
-    /// only properties that are both set on `value` and present in
-    /// `included | key_set(value)` are emitted.
-    pub fn publish_with_mask<T>(&self, value: &T, included: PropertySet)
-    where
-        T: StructValue + Publishable,
-    {
-        let type_name = value.descriptor().name;
-        let mask = (included | key_set(value)) & value.valid_set();
-        let header = DotsHeader {
-            type_name: Some(type_name.into()),
+            type_name: Some(type_name.clone()),
             attributes: Some(mask),
             sender: Some(HOST_ID),
             sent_time: Some(now_timepoint()),
             server_sent_time: Some(now_timepoint()),
             ..Default::default()
         };
-        self.cache_merge_typed(type_name, &header, value, Some(mask));
+        self.cache_merge(&type_name, &header, value, mask);
 
         let mut bytes = Vec::with_capacity(64);
-        encode_typed_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.fan_out_bytes(type_name, &bytes, /*exclude*/ HOST_ID);
+        encode_transmission_into(&header, value, &mut bytes);
+        self.fan_out_bytes(&type_name, &bytes, /*exclude*/ HOST_ID);
+    }
+
+    /// Publish a partial update from the host. Same masking rules as
+    /// [`GuestTransceiver::publish_with_mask`](crate::GuestTransceiver::publish_with_mask):
+    /// only properties that are both set on `value` and present in
+    /// `included | key_set(value)` are emitted.
+    pub fn publish_with_mask<P: Publishable>(&self, value: &P, included: PropertySet) {
+        let type_name = value.type_name().to_string();
+        let mask = (included | value.key_set()) & value.valid_set();
+        let header = DotsHeader {
+            type_name: Some(type_name.clone()),
+            attributes: Some(mask),
+            sender: Some(HOST_ID),
+            sent_time: Some(now_timepoint()),
+            server_sent_time: Some(now_timepoint()),
+            ..Default::default()
+        };
+        self.cache_merge(&type_name, &header, value, mask);
+
+        let mut bytes = Vec::with_capacity(64);
+        encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
+        self.fan_out_bytes(&type_name, &bytes, /*exclude*/ HOST_ID);
     }
 
     /// Publish a removal from the host. Routes to every guest
-    /// subscribed to `T`'s type-name group, with `header.remove_obj
-    /// = true` and only key fields in the payload. Drops the entry
-    /// from the host's cache pool.
-    pub fn remove<T>(&self, value: &T)
-    where
-        T: StructValue + Publishable,
-    {
-        let type_name = value.descriptor().name;
-        let mask = key_set(value);
+    /// subscribed to the value's type-name group, with
+    /// `header.remove_obj = true` and only key fields in the payload.
+    /// Drops the entry from the host's cache pool.
+    pub fn remove<P: Publishable>(&self, value: &P) {
+        let type_name = value.type_name().to_string();
+        let mask = value.key_set();
         let header = DotsHeader {
-            type_name: Some(type_name.into()),
+            type_name: Some(type_name.clone()),
             attributes: Some(mask),
             sender: Some(HOST_ID),
             sent_time: Some(now_timepoint()),
@@ -638,23 +630,23 @@ impl HostTransceiver {
             remove_obj: Some(true),
             ..Default::default()
         };
-        self.cache_merge_typed(type_name, &header, value, Some(mask));
+        self.cache_merge(&type_name, &header, value, mask);
 
         let mut bytes = Vec::with_capacity(64);
-        encode_typed_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.fan_out_bytes(type_name, &bytes, /*exclude*/ HOST_ID);
+        encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
+        self.fan_out_bytes(&type_name, &bytes, /*exclude*/ HOST_ID);
     }
 
-    /// Fold a host-originated typed value into the cache pool. No-op
-    /// for non-cached types or types not in the registry. Round-trips
-    /// the value through CBOR so `update_cache` sees a `DynamicStruct`
+    /// Fold a host-originated value into the cache pool. No-op for
+    /// non-cached types or types not in the registry. Round-trips the
+    /// value through CBOR so `update_cache` sees a `DynamicStruct`
     /// (whose `key_bytes()` matches the shape used by guest publishes).
-    fn cache_merge_typed<T: StructValue>(
+    fn cache_merge<T: Transmittable + ?Sized>(
         &self,
         type_name: &str,
         header: &DotsHeader,
         value: &T,
-        mask: Option<PropertySet>,
+        mask: PropertySet,
     ) {
         let Some(dots_model::DescriptorEntry::Struct(d)) = self.registry.lookup(type_name) else {
             return;
@@ -664,11 +656,9 @@ impl HostTransceiver {
         }
         let mut payload_bytes = Vec::with_capacity(64);
         let mut enc = dots_core::minicbor::Encoder::new(&mut payload_bytes);
-        match mask {
-            Some(m) => dots_core::encode_into_encoder_with_mask(value, m, &mut enc)
-                .expect("encode infallible"),
-            None => dots_core::encode_into_encoder(value, &mut enc).expect("encode infallible"),
-        }
+        value
+            .encode_into(mask, &mut enc)
+            .expect("encode infallible");
         if let Ok(payload) = DynamicStruct::decode(d.clone(), &payload_bytes) {
             self.update_cache(type_name, header, &payload);
         }
@@ -816,11 +806,11 @@ impl HostTransceiver {
         };
         let header = DotsHeader {
             type_name: Some("DotsCacheInfo".into()),
-            attributes: Some(info.valid_set()),
+            attributes: Some(Transmittable::valid_set(&info)),
             sender: Some(HOST_ID),
             ..Default::default()
         };
-        encode_typed_transmission_into(&header, &info, &mut buf);
+        encode_transmission_into(&header, &info, &mut buf);
         writer.enqueue(&buf);
     }
 
@@ -1244,14 +1234,14 @@ fn handle_echo(host: &Arc<HostTransceiver>, client_id: u32, raw: &RawTransmissio
     };
     let header = DotsHeader {
         type_name: Some("DotsEcho".into()),
-        attributes: Some(reply.valid_set()),
+        attributes: Some(Transmittable::valid_set(&reply)),
         sender: Some(HOST_ID),
         sent_time: Some(now_timepoint()),
         server_sent_time: Some(now_timepoint()),
         ..Default::default()
     };
     let mut buf = Vec::with_capacity(64);
-    encode_typed_transmission_into(&header, &reply, &mut buf);
+    encode_transmission_into(&header, &reply, &mut buf);
     if let Some(writer) = host.writer_for(client_id) {
         writer.enqueue(&buf);
     }
@@ -1312,13 +1302,13 @@ fn handle_descriptor_request(
         let data = StructDescriptorData::from_dynamic(d);
         let header = DotsHeader {
             type_name: Some("StructDescriptorData".into()),
-            attributes: Some(data.valid_set()),
+            attributes: Some(Transmittable::valid_set(&data)),
             sender: Some(HOST_ID),
             sent_time: Some(now_timepoint()),
             server_sent_time: Some(now_timepoint()),
             ..Default::default()
         };
-        encode_typed_transmission_into(&header, &data, &mut buf);
+        encode_transmission_into(&header, &data, &mut buf);
     }
 
     let info = DotsCacheInfo {
@@ -1327,13 +1317,13 @@ fn handle_descriptor_request(
     };
     let header = DotsHeader {
         type_name: Some("DotsCacheInfo".into()),
-        attributes: Some(info.valid_set()),
+        attributes: Some(Transmittable::valid_set(&info)),
         sender: Some(HOST_ID),
         sent_time: Some(now_timepoint()),
         server_sent_time: Some(now_timepoint()),
         ..Default::default()
     };
-    encode_typed_transmission_into(&header, &info, &mut buf);
+    encode_transmission_into(&header, &info, &mut buf);
     writer.enqueue(&buf);
 }
 
@@ -1497,12 +1487,12 @@ where
 {
     let header = DotsHeader {
         type_name: Some(type_name.into()),
-        attributes: Some(value.valid_set()),
+        attributes: Some(<T as Transmittable>::valid_set(value)),
         sender: Some(HOST_ID),
         ..Default::default()
     };
     let mut buf = Vec::with_capacity(64);
-    encode_typed_transmission_into(&header, value, &mut buf);
+    encode_transmission_into(&header, value, &mut buf);
     writer.enqueue(&buf);
 }
 

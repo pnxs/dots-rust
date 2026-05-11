@@ -24,7 +24,8 @@ use alloc::{
 };
 
 use crate::{
-    DotsField, EnumDescriptor, FieldKind, PropertySet, StructDescriptor, StructFlags,
+    DotsField, EnumDescriptor, FieldKind, Publishable, PropertySet, StructDescriptor, StructFlags,
+    Transmittable,
     layout::{CborDecoder, CborEncoder, DecodeError, EncodeError},
 };
 
@@ -269,22 +270,16 @@ impl DynamicStruct {
     }
 
     /// Encode this value to a freshly allocated `Vec<u8>`.
+    ///
+    /// Equivalent to building a `CborEncoder` over a fresh `Vec<u8>`
+    /// and calling [`Transmittable::encode_into`] with the full
+    /// `valid_set()`; offered as an inherent method since the
+    /// majority of callers want the simple "give me the bytes" shape.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
-        self.encode_into(&mut buf);
+        let mut encoder = minicbor::Encoder::new(&mut buf);
+        encode_struct(self, self.valid, &mut encoder).expect("Vec<u8> writes are infallible");
         buf
-    }
-
-    /// Append the encoded form of this value to an existing `Vec<u8>`.
-    pub fn encode_into(&self, buf: &mut Vec<u8>) {
-        let mut encoder = minicbor::Encoder::new(buf);
-        encode_struct(self, &mut encoder).expect("Vec<u8> writes are infallible");
-    }
-
-    /// Encode directly into an active CBOR encoder. Used by the framing
-    /// layer to assemble header + payload into a single buffer.
-    pub fn encode_into_encoder(&self, encoder: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
-        encode_struct(self, encoder)
     }
 
     /// Encode the key-properties of this struct as a deterministic
@@ -329,17 +324,132 @@ impl DynamicStruct {
         }
         buf
     }
+
+    /// Borrow this value as a [`Publishable`].
+    ///
+    /// Runtime-checks the descriptor's `substruct_only` flag — this is
+    /// the dynamic counterpart of the compile-time guarantee that
+    /// `#[derive(DotsStruct)]` provides for typed structs (the derive
+    /// suppresses the `Publishable` impl when `substruct_only` is set,
+    /// so the call site fails to compile).
+    pub fn try_as_publishable(&self) -> Result<DynamicPublishable<'_>, NotPublishable> {
+        if self.descriptor.flags.is_substruct_only() {
+            Err(NotPublishable::SubstructOnly)
+        } else {
+            Ok(DynamicPublishable(self))
+        }
+    }
+}
+
+impl Transmittable for DynamicStruct {
+    fn type_name(&self) -> &str {
+        &self.descriptor.name
+    }
+
+    fn valid_set(&self) -> PropertySet {
+        self.valid
+    }
+
+    fn key_set(&self) -> PropertySet {
+        let mut set = PropertySet::EMPTY;
+        for prop in &self.descriptor.properties {
+            if prop.is_key {
+                set = set.with_tag(prop.tag);
+            }
+        }
+        set
+    }
+
+    fn encode_into(
+        &self,
+        mask: PropertySet,
+        encoder: &mut CborEncoder<'_>,
+    ) -> Result<(), EncodeError> {
+        encode_struct(self, mask, encoder)
+    }
+}
+
+/// Publishable view of a [`DynamicStruct`] obtained via
+/// [`DynamicStruct::try_as_publishable`].
+///
+/// Holds a borrow of the underlying value and forwards every
+/// [`Transmittable`] method to it. Implements [`Publishable`] so it
+/// can be passed to the transport's `publish` / `publish_with_mask` /
+/// `remove` methods.
+///
+/// `static_descriptor()` returns `None` — runtime-described values
+/// have no compile-time descriptor, so the transport will not
+/// auto-register the type with the broker. The caller is responsible
+/// for ensuring the broker already knows about the descriptor (e.g.
+/// because the descriptor was learned from the broker, or because the
+/// caller has published a `StructDescriptorData` for it).
+pub struct DynamicPublishable<'a>(&'a DynamicStruct);
+
+impl<'a> DynamicPublishable<'a> {
+    /// Borrow the underlying [`DynamicStruct`].
+    pub fn as_struct(&self) -> &'a DynamicStruct {
+        self.0
+    }
+}
+
+impl<'a> Transmittable for DynamicPublishable<'a> {
+    fn type_name(&self) -> &str {
+        self.0.type_name()
+    }
+
+    fn valid_set(&self) -> PropertySet {
+        self.0.valid_set()
+    }
+
+    fn key_set(&self) -> PropertySet {
+        Transmittable::key_set(self.0)
+    }
+
+    fn encode_into(
+        &self,
+        mask: PropertySet,
+        encoder: &mut CborEncoder<'_>,
+    ) -> Result<(), EncodeError> {
+        self.0.encode_into(mask, encoder)
+    }
+}
+
+impl<'a> Publishable for DynamicPublishable<'a> {}
+
+/// Reasons a [`DynamicStruct`] cannot be published as a top-level
+/// instance. Returned by [`DynamicStruct::try_as_publishable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotPublishable {
+    /// The struct's descriptor carries `substruct_only`, so values of
+    /// this type may only appear nested inside another struct.
+    SubstructOnly,
+}
+
+impl core::fmt::Display for NotPublishable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SubstructOnly => {
+                f.write_str("struct is marked `substruct_only` and cannot be published")
+            }
+        }
+    }
 }
 
 // ===== Encoding =====
 
-fn encode_struct(s: &DynamicStruct, e: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
-    e.map(u64::from(s.valid.len()))?;
+fn encode_struct(
+    s: &DynamicStruct,
+    mask: PropertySet,
+    e: &mut CborEncoder<'_>,
+) -> Result<(), EncodeError> {
+    let emit = s.valid & mask;
+    e.map(u64::from(emit.len()))?;
     // Walk the descriptor's properties (ascending declaration order)
-    // and emit only the ones that are present in `valid`. This matches
-    // the static encoder's ordering so wire bytes are identical.
+    // and emit only the ones present in both `valid` and `mask`. The
+    // descriptor-order walk matches the static encoder so wire bytes
+    // are identical.
     for prop in &s.descriptor.properties {
-        if !s.valid.has(prop.tag) {
+        if !emit.has(prop.tag) {
             continue;
         }
         let value = s
@@ -377,7 +487,7 @@ fn encode_value(value: &DynamicValue, e: &mut CborEncoder<'_>) -> Result<(), Enc
             }
             Ok(())
         }
-        DynamicValue::Struct(inner) => encode_struct(inner, e),
+        DynamicValue::Struct(inner) => encode_struct(inner, inner.valid, e),
         DynamicValue::Enum(v) => e.i32(*v).map(|_| ()),
         DynamicValue::Timepoint(v) | DynamicValue::Duration(v) => e.f64(*v).map(|_| ()),
     }
