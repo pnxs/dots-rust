@@ -24,6 +24,18 @@ pub enum Endpoint {
     Uds(PathBuf),
 }
 
+/// Default URI when neither the caller nor the `DOTS_ENDPOINT`
+/// environment variable specifies one. Matches dots-cpp's
+/// `Application` default (`tcp://127.0.0.1`); the port `11235` is
+/// supplied explicitly because [`parse_endpoint`] does not infer a
+/// default port.
+pub const DEFAULT_ENDPOINT_URI: &str = "tcp://127.0.0.1:11235";
+
+/// Environment variable consulted by [`Endpoint::from_env_or_default`].
+/// Same name as dots-cpp, so a value set in a mixed-language deployment
+/// is honoured by both clients.
+pub const DOTS_ENDPOINT_ENV: &str = "DOTS_ENDPOINT";
+
 impl Endpoint {
     /// `tcp://addr:port` form. Borrowed so callers can pass `&str`
     /// without allocating.
@@ -34,6 +46,22 @@ impl Endpoint {
     /// `uds:///path/to/sock` form.
     pub fn uds(path: impl AsRef<Path>) -> Self {
         Self::Uds(path.as_ref().to_path_buf())
+    }
+
+    /// Resolve the default broker endpoint.
+    ///
+    /// If the `DOTS_ENDPOINT` environment variable is set, its value
+    /// is parsed via [`parse_endpoint`] — a malformed value yields
+    /// [`EndpointError::UnknownScheme`] rather than silently falling
+    /// back, so the user sees the typo. Unset or empty → fall back to
+    /// [`DEFAULT_ENDPOINT_URI`].
+    pub fn from_env_or_default() -> Result<Self, EndpointError> {
+        let from_env = std::env::var(DOTS_ENDPOINT_ENV).ok();
+        let uri = from_env
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_ENDPOINT_URI);
+        parse_endpoint(uri)
     }
 }
 
@@ -105,5 +133,13 @@ mod tests {
     #[test]
     fn parse_no_scheme_errors() {
         assert!(parse_endpoint("127.0.0.1:11235").is_err());
+    }
+
+    /// The hard-coded default URI must itself be parseable; otherwise
+    /// `Endpoint::from_env_or_default` would error in the
+    /// no-env-var branch.
+    #[test]
+    fn default_uri_parses() {
+        assert!(parse_endpoint(DEFAULT_ENDPOINT_URI).is_ok());
     }
 }

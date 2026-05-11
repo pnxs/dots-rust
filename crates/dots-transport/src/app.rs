@@ -47,6 +47,10 @@ pub enum AppError {
     Connection(ConnectionError),
     Transport(TransportError),
     Io(std::io::Error),
+    /// The `DOTS_ENDPOINT` environment variable held a value that
+    /// could not be parsed as an endpoint URI. Only produced by the
+    /// default-endpoint resolver used by [`App::new`].
+    Endpoint(crate::EndpointError),
 }
 
 impl core::fmt::Display for AppError {
@@ -55,6 +59,7 @@ impl core::fmt::Display for AppError {
             Self::Connection(e) => write!(f, "{e}"),
             Self::Transport(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "{e}"),
+            Self::Endpoint(e) => write!(f, "{e}"),
         }
     }
 }
@@ -65,6 +70,7 @@ impl std::error::Error for AppError {
             Self::Connection(e) => Some(e),
             Self::Transport(e) => Some(e),
             Self::Io(e) => Some(e),
+            Self::Endpoint(e) => Some(e),
         }
     }
 }
@@ -82,6 +88,11 @@ impl From<TransportError> for AppError {
 impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
+    }
+}
+impl From<crate::EndpointError> for AppError {
+    fn from(e: crate::EndpointError) -> Self {
+        Self::Endpoint(e)
     }
 }
 impl From<GuestError> for AppError {
@@ -117,6 +128,28 @@ pub struct App {
 }
 
 impl App {
+    /// Connect to a DOTS broker using the default endpoint.
+    ///
+    /// Resolution order, matching dots-cpp's `Application(name)`:
+    ///
+    /// 1. `DOTS_ENDPOINT` environment variable (parsed as a URI such
+    ///    as `tcp://host:port` or `uds:///path/to/sock`).
+    /// 2. Fallback: [`crate::DEFAULT_ENDPOINT_URI`]
+    ///    (`tcp://127.0.0.1:11235`).
+    ///
+    /// A malformed `DOTS_ENDPOINT` returns
+    /// [`AppError::Endpoint`] rather than silently falling back, so a
+    /// typo is surfaced rather than hidden behind a working default.
+    ///
+    /// Use [`connect`](Self::connect),
+    /// [`connect_tcp`](Self::connect_tcp), or
+    /// [`connect_unix`](Self::connect_unix) when the caller wants to
+    /// pin the endpoint programmatically.
+    pub async fn new(client_name: &str) -> Result<App, AppError> {
+        let endpoint = crate::Endpoint::from_env_or_default()?;
+        Self::connect(endpoint, client_name).await
+    }
+
     /// Connect to a DOTS broker over TCP and run the handshake (with
     /// `preload = true`). Returns an `App` ready for the user to add
     /// subscriptions, then `run()`.

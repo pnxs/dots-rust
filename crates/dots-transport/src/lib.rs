@@ -35,7 +35,9 @@ pub use app::{App, AppError, Client, ClientClosed, now_timepoint};
 pub use codec::{RawTransmissionCodec, TransmissionCodec};
 pub use connection::{Connection, ConnectionBuilder, ConnectionError, Event, Subscription};
 pub use container::{CloneInfo, Container, ContainerEntry, ContainerHandle, Operation};
-pub use endpoint::{Endpoint, EndpointError, parse_endpoint};
+pub use endpoint::{
+    DEFAULT_ENDPOINT_URI, DOTS_ENDPOINT_ENV, Endpoint, EndpointError, parse_endpoint,
+};
 pub use dots_core::PropertySet;
 pub use error::TransportError;
 pub use guest::{

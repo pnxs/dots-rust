@@ -39,25 +39,20 @@ struct Pinger {
     sequence: Option<u64>,
 }
 
-const DEFAULT_ADDR: &str = "127.0.0.1:11235";
-const DEFAULT_NAME: &str = "dots-demo-client";
+const CLIENT_NAME: &str = "dots-demo-client";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dots_transport::init_tracing();
 
-    let mut args = std::env::args().skip(1);
-    let addr = args.next().unwrap_or_else(|| DEFAULT_ADDR.into());
-    let name = args.next().unwrap_or_else(|| DEFAULT_NAME.into());
-
-    let app = App::connect_tcp(&addr, &name).await?;
+    let app = App::new(CLIENT_NAME).await?;
 
     // Container — typed local mirror of the broker's Pinger cache.
     let pingers = app.container::<Pinger>();
     let pingers_for_handler = pingers.handle();
 
     // Synchronous callback handler — fires from App::run's read loop.
-    let name_for_handler = Arc::new(name.clone());
+    let name_for_handler = Arc::new(CLIENT_NAME);
     app.subscribe::<Pinger>(move |event| {
         let from_me = event.header.is_from_myself == Some(true);
         let obj = &event.value;
@@ -90,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Periodic publisher running concurrently with App::run.
     let client = app.client();
-    let pinger_name = name.clone();
+    let pinger_name = CLIENT_NAME;
     tokio::spawn(async move {
         let mut sequence: u64 = 0;
         let mut interval = tokio::time::interval(Duration::from_secs(1));
