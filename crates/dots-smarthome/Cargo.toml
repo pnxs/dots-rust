@@ -1,0 +1,32 @@
+[package]
+name = "dots-smarthome"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Smart-home example client (port of dots-cpp/bin/examples/smart-home)."
+
+[[bin]]
+name = "smart-home"
+path = "src/main.rs"
+
+[[bin]]
+name = "smart-home-sim"
+path = "src/sim.rs"
+
+[dependencies]
+dots-core.workspace = true
+dots-derive.workspace = true
+dots-model.workspace = true
+dots-transport = { workspace = true, features = ["tracing-init"] }
+
+tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time", "sync"] }
+tracing.workspace = true
+
+[build-dependencies]
+dots-build = { path = "../dots-build", version = "0.1.0" }
+
+[lints]
+workspace = true
