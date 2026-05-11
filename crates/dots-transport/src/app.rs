@@ -307,14 +307,14 @@ impl App {
         handler: impl FnMut(&Event<T>) + Send + 'static,
     ) -> SubscriptionHandle
     where
-        T: StructValue + Default + Send + 'static,
+        T: StructValue + Default + Send + 'static + dots_core::GlobalRegistration,
     {
         self.transceiver.subscribe(handler)
     }
 
     pub fn subscribe_stream<T>(&self) -> crate::Subscription<T>
     where
-        T: StructValue + Default + Send + 'static,
+        T: StructValue + Default + Send + 'static + dots_core::GlobalRegistration,
     {
         self.transceiver.subscribe_stream::<T>()
     }
@@ -349,7 +349,7 @@ impl App {
 
     pub fn container<T>(&self) -> Container<T>
     where
-        T: StructValue + Default + Send + 'static,
+        T: StructValue + Default + Send + 'static + dots_core::GlobalRegistration,
     {
         self.transceiver.container::<T>()
     }

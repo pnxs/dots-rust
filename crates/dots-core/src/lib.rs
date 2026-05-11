@@ -21,8 +21,14 @@ mod descriptor;
 pub mod dynamic;
 pub mod layout;
 mod property_set;
+mod registration;
 mod temporal;
 mod value;
+
+/// Re-export of the `linkme` crate so the derive macro can reference
+/// it as `::dots_core::linkme` without users adding it as a direct
+/// dep.
+pub use linkme;
 
 pub use descriptor::{
     DotsTypeKind, EnumDescriptor, EnumElement, FieldKind, PropertyDescriptor, PropertyVtable,
@@ -38,6 +44,7 @@ pub use layout::{
     encode_into_vec_with_mask, encode_key_bytes, encode_key_into, encode_to_vec, key_set,
 };
 pub use property_set::PropertySet;
+pub use registration::{GlobalRegistration, PUBLISHED_TYPES, SUBSCRIBED_TYPES};
 pub use temporal::{Duration, Timepoint};
 pub use value::{Publishable, StructValue, Transmittable};
 

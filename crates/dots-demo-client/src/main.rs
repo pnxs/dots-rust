@@ -11,7 +11,7 @@
 //! ```text
 //! ./dotsd                                                  # in one terminal
 //! cargo run --bin dots-demo-client                         # default 127.0.0.1:11235
-//! cargo run --bin dots-demo-client -- 127.0.0.1:11235 bob  # second client
+//! DOTS_ENDPOINT=uds:///tmp/dotsd.sock cargo run --bin dots-demo-client
 //! ```
 //!
 //! Logging is via `tracing` + `tracing-subscriber`. Override the default
@@ -21,9 +21,8 @@
 //! RUST_LOG=dots_transport=debug cargo run --bin dots-demo-client
 //! ```
 
-use std::sync::Arc;
 use std::time::Duration;
-use dots_core::dots;
+use dots_core::{PUBLISHED_TYPES, SUBSCRIBED_TYPES, dots};
 use dots_derive::DotsStruct;
 use dots_model::DotsCacheInfo;
 use dots_transport::App;
@@ -45,14 +44,23 @@ const CLIENT_NAME: &str = "dots-demo-client";
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dots_transport::init_tracing();
 
+    // Link-time-collected lists of types this binary actually touches.
+    // Populated by `subscribe::<T>` / `publish::<T>` monomorphizations
+    // (via the `GlobalRegistration` linkme distributed slices).
+    let subscribed: Vec<&str> = SUBSCRIBED_TYPES.iter().map(|d| d.name).collect();
+    let published: Vec<&str> = PUBLISHED_TYPES.iter().map(|d| d.name).collect();
+    eprintln!("subscribed types ({}): {subscribed:?}", subscribed.len());
+    eprintln!("published types  ({}): {published:?}", published.len());
+
     let app = App::new(CLIENT_NAME).await?;
 
     // Container — typed local mirror of the broker's Pinger cache.
+    // Cheap to clone; clones share the same backing store and the
+    // dispatch-unregister fires only when the last clone drops.
     let pingers = app.container::<Pinger>();
-    let pingers_for_handler = pingers.handle();
+    let pingers_for_handler = pingers.clone();
 
     // Synchronous callback handler — fires from App::run's read loop.
-    let name_for_handler = Arc::new(CLIENT_NAME);
     app.subscribe::<Pinger>(move |event| {
         let from_me = event.header.is_from_myself == Some(true);
         let obj = &event.value;
@@ -65,7 +73,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pingers_for_handler.len(),
             if from_me { "  (from me)" } else { "" },
         );
-        let _ = name_for_handler;
     })
     .discard();
 

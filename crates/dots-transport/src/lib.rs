@@ -34,7 +34,7 @@ mod tracing_init;
 pub use app::{App, AppError, Client, ClientClosed, now_timepoint};
 pub use codec::{RawTransmissionCodec, TransmissionCodec};
 pub use connection::{Connection, ConnectionBuilder, ConnectionError, Event, Subscription};
-pub use container::{CloneInfo, Container, ContainerEntry, ContainerHandle, Operation};
+pub use container::{CloneInfo, Container, ContainerEntry, Operation};
 pub use endpoint::{
     DEFAULT_ENDPOINT_URI, DOTS_ENDPOINT_ENV, Endpoint, EndpointError, parse_endpoint,
 };

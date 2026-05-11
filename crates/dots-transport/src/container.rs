@@ -54,18 +54,50 @@ type Entries<T> = BTreeMap<Vec<u8>, ContainerEntry<T>>;
 /// A typed local mirror of all instances of `T` the connection has
 /// observed. Updates as transmissions arrive (driven by
 /// [`Connection::next`](crate::Connection::next)).
+///
+/// Cheaply `Clone`-able — clones share the same backing store and the
+/// same RAII lifecycle, so dispatch-unregistration and any attached
+/// group-leave only fire when the last `Container<T>` clone drops.
+/// That makes it natural to hand a `Container<T>` into a callback or
+/// spawned task without extra ceremony.
 pub struct Container<T> {
     entries: Arc<Mutex<Entries<T>>>,
+    /// Refcounted lifecycle bits — dispatch handle and optional
+    /// group-leaver. The `Drop` impl on the inner struct fires once,
+    /// when the last `Container<T>` clone goes out of scope.
+    lifecycle: Arc<ContainerLifecycle>,
+    /// `PhantomData<fn() -> T>` rather than `PhantomData<T>` so the
+    /// container is unconditionally `Send + Sync` — `T`'s own
+    /// auto-traits don't gate it (the actual `T` values live behind
+    /// the `Arc<Mutex<…>>` in `entries`, whose `Sync` requirement is
+    /// only `T: Send`).
+    _phantom: PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for Container<T> {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            lifecycle: self.lifecycle.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// Lifecycle bits shared across all `Container<T>` clones. Held
+/// behind an `Arc` in [`Container`] so dispatch-unregistration and
+/// the optional [`GroupLeaver`] only run once — when the last clone
+/// drops.
+struct ContainerLifecycle {
     type_name: String,
     id: u64,
     dispatch: Weak<Mutex<DispatchState>>,
-    /// RAII guard that runs when this container is dropped, used by
-    /// [`crate::GuestTransceiver`] to publish `DotsMember(Leave)`
-    /// when the last subscriber for the type goes away. `None` when
-    /// the container was created via raw `Connection::container`
-    /// (which doesn't auto-join groups).
-    leaver: Option<crate::connection::GroupLeaver>,
-    _phantom: PhantomData<T>,
+    /// `Some` when the container was created via
+    /// [`GuestTransceiver::container`](crate::GuestTransceiver::container)
+    /// (publishes `DotsMember(Leave)` on drop once nobody else holds
+    /// a container for this type). `None` when created via raw
+    /// [`Connection::container`](crate::Connection::container).
+    _leaver: Option<crate::connection::GroupLeaver>,
 }
 
 impl<T> Container<T>
@@ -126,86 +158,7 @@ where
     }
 }
 
-impl<T> Container<T> {
-    /// A cheap, cloneable read-only handle on this container's
-    /// data. Useful for sharing into callback handlers and tasks
-    /// without giving up the [`Container`]'s RAII unregister.
-    ///
-    /// Dropping a handle does *not* unregister the underlying
-    /// dispatch entry — that lifetime stays tied to the original
-    /// [`Container`].
-    pub fn handle(&self) -> ContainerHandle<T> {
-        ContainerHandle {
-            entries: self.entries.clone(),
-            _phantom: PhantomData,
-        }
-    }
-}
-
-/// Cheap, cloneable read-only handle on a [`Container`]'s state.
-/// Yielded by [`Container::handle`].
-pub struct ContainerHandle<T> {
-    entries: Arc<Mutex<Entries<T>>>,
-    _phantom: PhantomData<T>,
-}
-
-impl<T> Clone for ContainerHandle<T> {
-    fn clone(&self) -> Self {
-        Self {
-            entries: self.entries.clone(),
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<T> ContainerHandle<T>
-where
-    T: StructValue + Default + Send + 'static,
-{
-    pub fn len(&self) -> usize {
-        self.entries.lock().expect("container mutex poisoned").len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries
-            .lock()
-            .expect("container mutex poisoned")
-            .is_empty()
-    }
-
-    pub fn with_entries<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&Entries<T>) -> R,
-    {
-        let entries = self.entries.lock().expect("container mutex poisoned");
-        f(&entries)
-    }
-}
-
-impl<T> ContainerHandle<T>
-where
-    T: StructValue + Default + Send + Clone + 'static,
-{
-    pub fn snapshot(&self) -> Vec<ContainerEntry<T>> {
-        self.entries
-            .lock()
-            .expect("container mutex poisoned")
-            .values()
-            .cloned()
-            .collect()
-    }
-
-    pub fn get(&self, query: &T) -> Option<ContainerEntry<T>> {
-        let key = encode_key_bytes(query);
-        self.entries
-            .lock()
-            .expect("container mutex poisoned")
-            .get(&key)
-            .cloned()
-    }
-}
-
-impl<T> Drop for Container<T> {
+impl Drop for ContainerLifecycle {
     fn drop(&mut self) {
         if let Some(dispatch) = self.dispatch.upgrade() {
             dispatch
@@ -213,6 +166,8 @@ impl<T> Drop for Container<T> {
                 .expect("dispatch mutex poisoned")
                 .unregister(&self.type_name, self.id);
         }
+        // `_leaver`'s own `Drop` (when `Some`) publishes the group
+        // `Leave` — we don't need to do anything explicit here.
     }
 }
 
@@ -220,7 +175,15 @@ impl<T> Drop for Container<T> {
 
 /// Build a [`Container<T>`] and register its backing dispatch entry
 /// with the connection's `DispatchState`.
-pub(crate) fn make_container<T>(dispatch: &Arc<Mutex<DispatchState>>) -> Container<T>
+///
+/// `leaver` carries the optional RAII group-`Leave` guard — `Some`
+/// when called from
+/// [`GuestTransceiver::container`](crate::GuestTransceiver::container),
+/// `None` from the raw `Connection::container` path.
+pub(crate) fn make_container<T>(
+    dispatch: &Arc<Mutex<DispatchState>>,
+    leaver: Option<crate::connection::GroupLeaver>,
+) -> Container<T>
 where
     T: StructValue + Default + Send + 'static,
 {
@@ -234,23 +197,16 @@ where
         .lock()
         .expect("dispatch mutex poisoned")
         .register(type_name.clone(), Box::new(entry));
-    Container {
-        entries,
+    let lifecycle = Arc::new(ContainerLifecycle {
         type_name,
         id,
         dispatch: Arc::downgrade(dispatch),
-        leaver: None,
+        _leaver: leaver,
+    });
+    Container {
+        entries,
+        lifecycle,
         _phantom: PhantomData,
-    }
-}
-
-impl<T> Container<T> {
-    /// Attach a leaver — called by `GuestTransceiver::container` after
-    /// `make_container` so that dropping this container publishes
-    /// `DotsMember(Leave)` once the per-type subscriber count drops
-    /// to zero.
-    pub(crate) fn set_leaver(&mut self, leaver: crate::connection::GroupLeaver) {
-        self.leaver = Some(leaver);
     }
 }
 

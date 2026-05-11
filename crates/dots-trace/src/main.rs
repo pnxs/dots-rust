@@ -6,7 +6,8 @@
 //! types the broker knows about. Demonstrates the dynamic-client API
 //! end to end:
 //!
-//! - [`App::connect`] for TCP or UDS connections,
+//! - [`App::new`] for the default endpoint (`tcp://127.0.0.1:11235`),
+//!   overridable via the `DOTS_ENDPOINT` env var,
 //! - [`App::publish`] of `DotsDescriptorRequest` to ask the broker to
 //!   stream every cached descriptor,
 //! - [`App::subscribe_all_types`] for one handler that fires for
@@ -17,29 +18,22 @@
 //! ```text
 //! ./dotsd                                              # in one terminal
 //! cargo run --bin dots-trace                           # default tcp://127.0.0.1:11235
-//! cargo run --bin dots-trace -- uds:///tmp/dotsd.sock  # over UDS
+//! DOTS_ENDPOINT=uds:///tmp/dotsd.sock cargo run --bin dots-trace
 //! ```
 //!
 //! Override the log level via `RUST_LOG`, e.g.
 //! `RUST_LOG=dots_transport=debug cargo run --bin dots-trace`.
 
 use dots_model::DotsDescriptorRequest;
-use dots_transport::{App, parse_endpoint};
+use dots_transport::App;
 
-const DEFAULT_ENDPOINT: &str = "tcp://127.0.0.1:11235";
 const CLIENT_NAME: &str = "dots-trace";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dots_transport::init_tracing();
 
-    let endpoint_str = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.into());
-    let endpoint = parse_endpoint(&endpoint_str)?;
-    eprintln!("connecting to {endpoint_str} as `{CLIENT_NAME}`...");
-
-    let app = App::connect(endpoint, CLIENT_NAME).await?;
+    let app = App::new(CLIENT_NAME).await?;
 
     // Ask the broker to stream every cached descriptor — this is what
     // turns dots-trace into a *dynamic* client. Without it, we'd only

@@ -273,7 +273,11 @@ async fn host_replays_cached_pingers_to_late_subscriber() {
 }
 
 #[tokio::test]
-async fn dropping_last_subscription_publishes_member_leave() {
+async fn dropping_subscription_keeps_group_alive_until_transceiver_drops() {
+    // Subscriptions are pure dispatch-handler additions; group
+    // membership is owned by the transceiver-level container pool.
+    // Drop the last sub → group stays alive (the pool still holds the
+    // container). Drop the transceiver → leave fires.
     let host = HostTransceiver::new("test-host");
     let registry = registry();
     registry.register_struct_static(Pinger::DESCRIPTOR);
@@ -302,9 +306,22 @@ async fn dropping_last_subscription_publishes_member_leave() {
     }
     assert_eq!(host.group_size("Pinger"), 1, "join should have landed");
 
-    // Dropping the last subscription should publish DotsMember(Leave),
-    // which the host applies to remove the guest from the group.
+    // Dropping the subscription does NOT publish a Leave — the pool
+    // still owns the container for Pinger, which keeps the group
+    // membership alive.
     drop(sub);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        host.group_size("Pinger"),
+        1,
+        "pool keeps the group alive after subscription drops"
+    );
+
+    // Dropping the transceiver itself drops the pool, which drops the
+    // container, which fires the group-leave.
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+    drop(gt);
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(20)).await;
         if host.group_size("Pinger") == 0 {
@@ -314,11 +331,8 @@ async fn dropping_last_subscription_publishes_member_leave() {
     assert_eq!(
         host.group_size("Pinger"),
         0,
-        "leave should have removed guest from group"
+        "leave should fire when transceiver drops"
     );
-
-    gt.exit();
-    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
 }
 
 #[tokio::test]

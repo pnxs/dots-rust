@@ -1,7 +1,7 @@
 use core::any::Any;
 
 use crate::{
-    PropertySet, StructDescriptor,
+    GlobalRegistration, PropertySet, StructDescriptor,
     layout::{CborEncoder, EncodeError},
 };
 
@@ -122,7 +122,7 @@ impl<T: StructValue> Transmittable for T {
 /// `substruct_only`-flag check.
 ///
 /// [`DynamicStruct`]: crate::DynamicStruct
-pub trait Publishable: Transmittable {
+pub trait Publishable: Transmittable + GlobalRegistration {
     /// Static descriptor for this type, if one exists. Used by the
     /// transport to register the type with the broker before
     /// publication.

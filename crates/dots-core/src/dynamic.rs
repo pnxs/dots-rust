@@ -416,6 +416,10 @@ impl<'a> Transmittable for DynamicPublishable<'a> {
 
 impl<'a> Publishable for DynamicPublishable<'a> {}
 
+/// Runtime-described values have no static descriptor to link, so
+/// they fall through to the default no-op `GlobalRegistration` impl.
+impl<'a> crate::GlobalRegistration for DynamicPublishable<'a> {}
+
 /// Reasons a [`DynamicStruct`] cannot be published as a top-level
 /// instance. Returned by [`DynamicStruct::try_as_publishable`].
 #[derive(Debug, Clone, PartialEq, Eq)]

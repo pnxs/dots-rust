@@ -125,6 +125,15 @@ pub struct GuestTransceiver {
     /// drop. `DotsMember(Join)` is published when a group's count
     /// transitions 0→1, `DotsMember(Leave)` on 1→0.
     joined_groups: Mutex<HashMap<String, u32>>,
+    /// Per-type container pool. One [`Container<T>`](crate::Container)
+    /// per `TypeId::of::<T>()`, library-owned. Subscribing to or
+    /// asking for the container of `T` populates this lazily; both
+    /// paths share the same backing instance.
+    ///
+    /// Stored as `Box<dyn Any + Send + Sync>` so the
+    /// generic-over-`T` `Container` instances can coexist in a single
+    /// map keyed by `TypeId`.
+    container_pool: Mutex<HashMap<std::any::TypeId, Box<dyn std::any::Any + Send + Sync>>>,
     outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
     exit_flag: AtomicBool,
     /// Notifies the [`GuestDriver`]'s select-loop that the exit flag
@@ -165,6 +174,7 @@ impl GuestTransceiver {
             pending_structs: Mutex::new(HashSet::new()),
             pending_enums: Mutex::new(HashSet::new()),
             joined_groups: Mutex::new(HashMap::new()),
+            container_pool: Mutex::new(HashMap::new()),
             outbound_tx: tx,
             exit_flag: AtomicBool::new(false),
             exit_notify: Notify::new(),
@@ -207,28 +217,27 @@ impl GuestTransceiver {
         handler: impl FnMut(&Event<T>) + Send + 'static,
     ) -> SubscriptionHandle
     where
-        T: StructValue + Default + Send + 'static,
+        T: StructValue + Default + Send + 'static + dots_core::GlobalRegistration,
     {
-        self.register_struct::<T>();
-        let group = T::type_descriptor().name;
-        self.join_group(group);
-        let mut handle = register_callback::<T, _>(&self.dispatch, handler);
-        handle.set_leaver(self.make_leaver(group));
-        handle
+        // Ensure the pool's container for T exists — `container::<T>`
+        // joins the group exactly once per type and attaches the
+        // group-leave guard to the pool entry. Subscriptions are now
+        // pure dispatch-handler additions: they don't drive group
+        // membership, so the broker sees one Join per type (regardless
+        // of subscriber count) and one Leave when the transceiver is
+        // dropped.
+        let _ = self.container::<T>();
+        register_callback::<T, _>(&self.dispatch, handler)
     }
 
     /// Subscribe to typed events as an async [`crate::Subscription<T>`]
     /// stream.
     pub fn subscribe_stream<T>(self: &Arc<Self>) -> crate::Subscription<T>
     where
-        T: StructValue + Default + Send + 'static,
+        T: StructValue + Default + Send + 'static + dots_core::GlobalRegistration,
     {
-        self.register_struct::<T>();
-        let group = T::type_descriptor().name;
-        self.join_group(group);
-        let mut sub = connection_subscribe::<T>(&self.dispatch);
-        sub.set_leaver(self.make_leaver(group));
-        sub
+        let _ = self.container::<T>();
+        connection_subscribe::<T>(&self.dispatch)
     }
 
     /// Subscribe to *every* DOTS type — known now or learned later —
@@ -349,16 +358,35 @@ impl GuestTransceiver {
     }
 
     /// Build a typed [`Container<T>`] for `T`.
+    /// Borrow the transceiver-owned container for `T`.
+    ///
+    /// One container exists per `TypeId::of::<T>()` per transceiver —
+    /// the first call creates it (registering the dispatch entry and
+    /// joining the `T`-named group), and every subsequent call (from
+    /// [`subscribe`](Self::subscribe), [`subscribe_stream`](Self::subscribe_stream),
+    /// or this method) returns a cheap clone backed by the same store.
+    /// The dispatch entry and the group-leave fire when the last clone
+    /// drops.
     pub fn container<T>(self: &Arc<Self>) -> Container<T>
     where
-        T: StructValue + Default + Send + 'static,
+        T: StructValue + Default + Send + 'static + dots_core::GlobalRegistration,
     {
-        self.register_struct::<T>();
-        let group = T::type_descriptor().name;
-        self.join_group(group);
-        let mut container = crate::container::make_container(&self.dispatch);
-        container.set_leaver(self.make_leaver(group));
-        container
+        let tid = std::any::TypeId::of::<T>();
+        let mut pool = self.container_pool.lock().expect("container pool poisoned");
+        let entry = pool.entry(tid).or_insert_with(|| {
+            T::register_as_subscribed();
+            self.register_struct::<T>();
+            let group = T::type_descriptor().name;
+            self.join_group(group);
+            let leaver = self.make_leaver(group);
+            let container: Container<T> =
+                crate::container::make_container(&self.dispatch, Some(leaver));
+            Box::new(container) as Box<dyn std::any::Any + Send + Sync>
+        });
+        entry
+            .downcast_ref::<Container<T>>()
+            .expect("container pool TypeId/type mismatch")
+            .clone()
     }
 
     /// Build a `GroupLeaver` whose drop publishes `DotsMember(Leave)`
@@ -399,6 +427,7 @@ impl GuestTransceiver {
     /// return `None` from `static_descriptor()` and the caller is
     /// responsible for descriptor registration.
     pub fn publish<P: Publishable>(&self, value: &P) -> Result<(), ClientClosed> {
+        P::register_as_published();
         if let Some(d) = value.static_descriptor() {
             self.register_struct_descriptor(d);
         }
@@ -428,6 +457,7 @@ impl GuestTransceiver {
         value: &P,
         included: PropertySet,
     ) -> Result<(), ClientClosed> {
+        P::register_as_published();
         if let Some(d) = value.static_descriptor() {
             self.register_struct_descriptor(d);
         }
@@ -451,6 +481,7 @@ impl GuestTransceiver {
     ///
     /// Mirrors C++ `transceiver.remove(instance)`.
     pub fn remove<P: Publishable>(&self, value: &P) -> Result<(), ClientClosed> {
+        P::register_as_published();
         if let Some(d) = value.static_descriptor() {
             self.register_struct_descriptor(d);
         }

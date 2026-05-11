@@ -236,6 +236,29 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     };
 
+    // Link-time registration hooks. Each fn body contains a static
+    // tagged with the linkme distributed-slice attribute. The transport's
+    // generic `publish::<T>` / `subscribe::<T>` entry points call these
+    // methods, so monomorphization for a given `T` causes the static
+    // to be emitted and linked into the slice. Types the binary never
+    // publishes or subscribes to don't appear in the slice (with LTO).
+    let global_registration_impl = quote! {
+        impl ::dots_core::GlobalRegistration for #struct_ident {
+            fn register_as_published() {
+                #[::dots_core::linkme::distributed_slice(::dots_core::PUBLISHED_TYPES)]
+                #[linkme(crate = ::dots_core::linkme)]
+                static REG: &'static ::dots_core::StructDescriptor = #struct_ident::DESCRIPTOR;
+                let _ = &REG;
+            }
+            fn register_as_subscribed() {
+                #[::dots_core::linkme::distributed_slice(::dots_core::SUBSCRIBED_TYPES)]
+                #[linkme(crate = ::dots_core::linkme)]
+                static REG: &'static ::dots_core::StructDescriptor = #struct_ident::DESCRIPTOR;
+                let _ = &REG;
+            }
+        }
+    };
+
     let output = quote! {
         // Hidden module-level block so per-property vtables and the
         // descriptor live at 'static lifetime even when nothing else
@@ -298,6 +321,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
 
         #publishable_impl
+
+        #global_registration_impl
 
         // `DotsTypeKind` lets the parent struct's macro look up this
         // type's `FieldKind` without needing to know whether it's a

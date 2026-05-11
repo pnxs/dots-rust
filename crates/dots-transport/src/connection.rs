@@ -490,7 +490,7 @@ where
     where
         T: StructValue + Default + Send + 'static,
     {
-        crate::container::make_container(&self.dispatch)
+        crate::container::make_container(&self.dispatch, None)
     }
 
     /// Current connection state. Becomes [`DotsConnectionState::Connected`]
