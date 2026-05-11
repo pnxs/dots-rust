@@ -69,19 +69,6 @@ impl From<TransportError> for GuestError {
     }
 }
 
-/// Returned when [`GuestTransceiver::publish`] is called after the
-/// driver has shut down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClientClosed;
-
-impl core::fmt::Display for ClientClosed {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("guest run loop has shut down — outbound channel closed")
-    }
-}
-
-impl std::error::Error for ClientClosed {}
-
 /// Wraps a `&'static T` with pointer-equality semantics for HashSet.
 struct DescriptorPtr<T: 'static>(&'static T);
 
@@ -426,7 +413,7 @@ impl GuestTransceiver {
     /// auto-registered with the broker. Runtime-described values
     /// return `None` from `static_descriptor()` and the caller is
     /// responsible for descriptor registration.
-    pub fn publish<P: Publishable>(&self, value: &P) -> Result<(), ClientClosed> {
+    pub fn publish<P: Publishable>(&self, value: &P) {
         P::register_as_published();
         if let Some(d) = value.static_descriptor() {
             self.register_struct_descriptor(d);
@@ -440,7 +427,7 @@ impl GuestTransceiver {
         };
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_into(&header, value, &mut bytes);
-        self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
+        self.enqueue_publish(bytes, value.type_name());
     }
 
     /// Publish a value, restricting the wire payload to the properties
@@ -452,11 +439,7 @@ impl GuestTransceiver {
     /// in the union of `included | key_set(value)` make it onto the
     /// wire. Useful for partial updates where some non-key fields
     /// are populated locally but should not be propagated yet.
-    pub fn publish_with_mask<P: Publishable>(
-        &self,
-        value: &P,
-        included: PropertySet,
-    ) -> Result<(), ClientClosed> {
+    pub fn publish_with_mask<P: Publishable>(&self, value: &P, included: PropertySet) {
         P::register_as_published();
         if let Some(d) = value.static_descriptor() {
             self.register_struct_descriptor(d);
@@ -471,7 +454,7 @@ impl GuestTransceiver {
         };
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
+        self.enqueue_publish(bytes, value.type_name());
     }
 
     /// Publish a removal: tells the broker to drop the cached
@@ -480,7 +463,7 @@ impl GuestTransceiver {
     /// = true` and `header.attributes` is the key-only bitmask.
     ///
     /// Mirrors C++ `transceiver.remove(instance)`.
-    pub fn remove<P: Publishable>(&self, value: &P) -> Result<(), ClientClosed> {
+    pub fn remove<P: Publishable>(&self, value: &P) {
         P::register_as_published();
         if let Some(d) = value.static_descriptor() {
             self.register_struct_descriptor(d);
@@ -496,7 +479,39 @@ impl GuestTransceiver {
         };
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
+        self.enqueue_publish(bytes, value.type_name());
+    }
+
+    /// `true` once the underlying driver has shut down and the
+    /// outbound channel is closed. Subsequent `publish` /
+    /// `publish_with_mask` / `remove` calls are no-ops (they log a
+    /// `warn!` and drop the bytes).
+    pub fn is_closed(&self) -> bool {
+        self.outbound_tx.is_closed()
+    }
+
+    /// Resolves once the driver has shut down. Use this in long-lived
+    /// publisher tasks to terminate cleanly:
+    ///
+    /// ```ignore
+    /// loop {
+    ///     tokio::select! {
+    ///         _ = interval.tick() => client.publish(&value),
+    ///         _ = client.closed() => break,
+    ///     }
+    /// }
+    /// ```
+    pub async fn closed(&self) {
+        self.outbound_tx.closed().await
+    }
+
+    fn enqueue_publish(&self, bytes: Vec<u8>, type_name: &str) {
+        if self.outbound_tx.send(bytes).is_err() {
+            tracing::warn!(
+                type_name,
+                "publish dropped: guest driver has exited; call `client.closed()` to terminate cleanly"
+            );
+        }
     }
 
     /// Signal the [`GuestDriver`]'s run loop to exit at the next
@@ -592,7 +607,7 @@ impl GuestTransceiver {
                 event: Some(DotsMemberEvent::Join),
                 client: self.client_id(),
             };
-            let _ = self.publish_typed(&member);
+            self.publish_typed(&member);
         }
     }
 
@@ -621,13 +636,14 @@ impl GuestTransceiver {
                 event: Some(DotsMemberEvent::Leave),
                 client: self.client_id(),
             };
-            let _ = self.publish_typed(&member);
+            self.publish_typed(&member);
         }
     }
 
-    fn publish_typed<T: StructValue>(&self, value: &T) -> Result<(), ClientClosed> {
+    fn publish_typed<T: StructValue>(&self, value: &T) {
+        let type_name = <T as Transmittable>::type_name(value);
         let header = DotsHeader {
-            type_name: Some(<T as Transmittable>::type_name(value).into()),
+            type_name: Some(type_name.into()),
             attributes: Some(<T as Transmittable>::valid_set(value)),
             sender: self.client_id(),
             sent_time: Some(now_timepoint()),
@@ -635,7 +651,7 @@ impl GuestTransceiver {
         };
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_into(&header, value, &mut bytes);
-        self.outbound_tx.send(bytes).map_err(|_| ClientClosed)
+        self.enqueue_publish(bytes, type_name);
     }
 }
 

@@ -90,7 +90,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .discard();
 
-    // Periodic publisher running concurrently with App::run.
+    // Periodic publisher running concurrently with App::run. Races
+    // the ticker against `client.closed()` so the task exits cleanly
+    // when the driver shuts down (instead of spinning publishes into
+    // a closed channel).
     let client = app.client();
     let pinger_name = CLIENT_NAME;
     tokio::spawn(async move {
@@ -98,16 +101,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            interval.tick().await;
-            sequence += 1;
-            let p = dots!(Pinger {
-                id: 0_u32,
-                message: format!("hello from {pinger_name}"),
-                sequence: sequence,
-            });
-            if client.publish(&p).is_err() {
-                eprintln!("connection closed; publisher exiting.");
-                break;
+            tokio::select! {
+                _ = interval.tick() => {
+                    sequence += 1;
+                    let p = dots!(Pinger {
+                        id: 0_u32,
+                        message: format!("hello from {pinger_name}"),
+                        sequence: sequence,
+                    });
+                    client.publish(&p);
+                }
+                _ = client.closed() => {
+                    eprintln!("connection closed; publisher exiting.");
+                    break;
+                }
             }
         }
     });

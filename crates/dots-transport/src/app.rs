@@ -39,7 +39,7 @@ use crate::container::Container;
 use crate::error::TransportError;
 use crate::guest::{GuestError, GuestTransceiver, SubscriptionHandle};
 
-pub use crate::guest::{ClientClosed, now_timepoint};
+pub use crate::guest::now_timepoint;
 
 /// Errors produced by the [`App`] lifecycle.
 #[derive(Debug)]
@@ -358,21 +358,17 @@ impl App {
         self.transceiver.register_enum(descriptor)
     }
 
-    pub fn publish<P: Publishable>(&self, value: &P) -> Result<(), ClientClosed> {
+    pub fn publish<P: Publishable>(&self, value: &P) {
         self.transceiver.publish(value)
     }
 
     /// Publish a partial update — see [`GuestTransceiver::publish_with_mask`].
-    pub fn publish_with_mask<P: Publishable>(
-        &self,
-        value: &P,
-        included: PropertySet,
-    ) -> Result<(), ClientClosed> {
+    pub fn publish_with_mask<P: Publishable>(&self, value: &P, included: PropertySet) {
         self.transceiver.publish_with_mask(value, included)
     }
 
     /// Publish a removal — see [`GuestTransceiver::remove`].
-    pub fn remove<P: Publishable>(&self, value: &P) -> Result<(), ClientClosed> {
+    pub fn remove<P: Publishable>(&self, value: &P) {
         self.transceiver.remove(value)
     }
 

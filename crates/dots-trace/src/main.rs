@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ask the broker to stream every cached descriptor — this is what
     // turns dots-trace into a *dynamic* client. Without it, we'd only
     // see types whose descriptors arrived during preload.
-    app.publish(&DotsDescriptorRequest::default())?;
+    app.publish(&DotsDescriptorRequest::default());
 
     // One handler for every type — the composite helper auto-installs
     // a dynamic subscription per descriptor (now and as new ones land).

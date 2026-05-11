@@ -105,8 +105,7 @@ async fn host_routes_pinger_between_two_guests() {
         id: Some(7),
         message: Some("hi from B".into()),
         sequence: Some(1),
-    })
-    .unwrap();
+    });
 
     // A should receive it.
     let event = tokio::time::timeout(Duration::from_secs(2), sub_a.recv())
@@ -199,14 +198,12 @@ async fn host_replays_cached_pingers_to_late_subscriber() {
         id: Some(1),
         message: Some("first".into()),
         sequence: Some(1),
-    })
-    .unwrap();
+    });
     gt_a.publish(&Pinger {
         id: Some(2),
         message: Some("second".into()),
         sequence: Some(1),
-    })
-    .unwrap();
+    });
 
     // Wait for the host to record both in its cache.
     for _ in 0..30 {
@@ -406,14 +403,12 @@ async fn guest_remove_drops_entry_from_host_cache() {
         id: Some(1),
         message: Some("first".into()),
         sequence: Some(1),
-    })
-    .unwrap();
+    });
     gt_a.publish(&Pinger {
         id: Some(2),
         message: Some("second".into()),
         sequence: Some(1),
-    })
-    .unwrap();
+    });
 
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -427,8 +422,7 @@ async fn guest_remove_drops_entry_from_host_cache() {
     gt_a.remove(&Pinger {
         id: Some(1),
         ..Default::default()
-    })
-    .unwrap();
+    });
 
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -480,8 +474,7 @@ async fn host_replies_to_dots_echo_request() {
         identifier: Some(7),
         sequence_number: Some(42),
         data: Some("ping".into()),
-    })
-    .unwrap();
+    });
 
     let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
         .await
@@ -768,8 +761,7 @@ async fn cleanup_flag_drops_publisher_entries_on_disconnect() {
         .publish(&TempClient {
             id: Some(7),
             label: Some("hi".into()),
-        })
-        .unwrap();
+        });
 
     // Observer should receive the create.
     let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
@@ -882,7 +874,7 @@ async fn host_replies_to_descriptor_request_with_known_structs() {
         }
     }
 
-    gt.publish(&DotsDescriptorRequest::default()).unwrap();
+    gt.publish(&DotsDescriptorRequest::default());
 
     // Expect at least one StructDescriptorData (Pinger) and a
     // DotsCacheInfo{end_descriptor_request:true}.
@@ -945,14 +937,12 @@ async fn dots_clear_cache_drops_named_types_and_publishes_removals() {
         .publish(&Pinger {
             id: Some(1),
             ..Default::default()
-        })
-        .unwrap();
+        });
     gt_pub
         .publish(&Pinger {
             id: Some(2),
             ..Default::default()
-        })
-        .unwrap();
+        });
 
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -966,8 +956,7 @@ async fn dots_clear_cache_drops_named_types_and_publishes_removals() {
     gt_pub
         .publish(&DotsClearCache {
             type_names: Some(vec!["Pinger".into()]),
-        })
-        .unwrap();
+        });
 
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1147,7 +1136,7 @@ async fn dynamic_publish_routes_through_broker_to_typed_subscriber() {
             (3, DynamicValue::U64(77)),
         ],
     };
-    gt_pub.publish(&value.try_as_publishable().unwrap()).unwrap();
+    gt_pub.publish(&value.try_as_publishable().unwrap());
 
     let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
         .await

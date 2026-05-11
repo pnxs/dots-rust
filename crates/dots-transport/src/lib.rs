@@ -31,7 +31,7 @@ mod host;
 #[cfg(feature = "tracing-init")]
 mod tracing_init;
 
-pub use app::{App, AppError, Client, ClientClosed, now_timepoint};
+pub use app::{App, AppError, Client, now_timepoint};
 pub use codec::{RawTransmissionCodec, TransmissionCodec};
 pub use connection::{Connection, ConnectionBuilder, ConnectionError, Event, Subscription};
 pub use container::{CloneInfo, Container, ContainerEntry, Operation};
