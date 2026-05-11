@@ -7,6 +7,13 @@ license.workspace = true
 authors.workspace = true
 description = "Async transport for dots-rust: tokio_util::codec adapter for v2 transmission framing."
 
+[features]
+default = []
+# Opt-in helper that installs a `tracing_subscriber` with sensible
+# defaults — see `dots_transport::init_tracing`. Off by default so
+# library consumers aren't forced to pull `tracing-subscriber`.
+tracing-init = ["dep:tracing-subscriber"]
+
 [dependencies]
 dots-core.workspace = true
 dots-model.workspace = true
@@ -16,6 +23,7 @@ tokio = { workspace = true, features = ["io-util", "sync", "macros", "net", "rt"
 tokio-util = { workspace = true, features = ["codec"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tracing.workspace = true
+tracing-subscriber = { workspace = true, optional = true }
 sha2.workspace = true
 rand.workspace = true
 rustc-hash.workspace = true

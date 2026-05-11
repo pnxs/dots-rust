@@ -11,10 +11,9 @@ description = "DOTS trace tool — connects to a broker and prints every transmi
 [dependencies]
 dots-core.workspace = true
 dots-model.workspace = true
-dots-transport.workspace = true
+dots-transport = { workspace = true, features = ["tracing-init"] }
 
 tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 
 [lints]
 workspace = true

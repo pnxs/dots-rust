@@ -112,7 +112,6 @@ dependencies = [
  "dots-model",
  "dots-transport",
  "tokio",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -150,7 +149,6 @@ dependencies = [
  "dots-model",
  "dots-transport",
  "tokio",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -168,6 +166,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -177,7 +176,6 @@ dependencies = [
  "dots-transport",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

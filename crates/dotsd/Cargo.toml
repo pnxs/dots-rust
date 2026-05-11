@@ -9,11 +9,10 @@ publish = false
 description = "DOTS broker daemon — listens on TCP and routes pub/sub between guests."
 
 [dependencies]
-dots-transport.workspace = true
+dots-transport = { workspace = true, features = ["tracing-init"] }
 
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal"] }
 tracing.workspace = true
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 
 [lints]
 workspace = true

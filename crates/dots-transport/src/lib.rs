@@ -28,6 +28,8 @@ mod endpoint;
 mod error;
 mod guest;
 mod host;
+#[cfg(feature = "tracing-init")]
+mod tracing_init;
 
 pub use app::{App, AppError, Client, ClientClosed, now_timepoint};
 pub use codec::{RawTransmissionCodec, TransmissionCodec};
@@ -40,6 +42,8 @@ pub use guest::{
     AllTypesSubscription, GuestDriver, GuestError, GuestTransceiver, SubscriptionHandle,
 };
 pub use host::{EndpointHandle, HOST_ID, HostTransceiver};
+#[cfg(feature = "tracing-init")]
+pub use tracing_init::init_tracing;
 
 // Re-export the framing layer's public types so callers don't need to
 // pull `dots-model` directly when wiring up a transport.

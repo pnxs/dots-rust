@@ -44,16 +44,7 @@ const DEFAULT_NAME: &str = "dots-demo-client";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Default log level: info. Override via RUST_LOG env var, e.g.
-    //   RUST_LOG=dots_transport=debug,dots_demo_client=info cargo run ...
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(true)
-        .compact()
-        .init();
+    dots_transport::init_tracing();
 
     let mut args = std::env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| DEFAULT_ADDR.into());
@@ -69,11 +60,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let name_for_handler = Arc::new(name.clone());
     app.subscribe::<Pinger>(move |event| {
         let from_me = event.header.is_from_myself == Some(true);
+        let obj = &event.value;
         println!(
             "✦ Pinger:  id={:?}  message={:?}  seq={:?}  from={:?}  cache_len={}{}",
-            event.value.id,
-            event.value.message,
-            event.value.sequence,
+            obj.id,
+            obj.message,
+            obj.sequence,
             event.header.sender,
             pingers_for_handler.len(),
             if from_me { "  (from me)" } else { "" },
@@ -85,11 +77,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Per-type cache-end notifications from dotsd. Sent after the
     // broker streams the cached objects following a DotsMember(join).
     app.subscribe::<DotsCacheInfo>(|event| {
-        if event.value.end_transmission == Some(true) {
-            if let Some(name) = event.value.type_name.as_deref() {
+        let cache_info = &event.value;
+        if cache_info.end_transmission == Some(true) {
+            if let Some(name) = cache_info.type_name.as_deref() {
                 eprintln!("⌛ cache transmission complete for `{name}`");
             }
-        } else if event.value.end_descriptor_request == Some(true) {
+        } else if cache_info.end_descriptor_request == Some(true) {
             eprintln!("⌛ descriptor request complete");
         }
     })

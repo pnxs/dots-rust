@@ -26,14 +26,7 @@ const DEFAULT_NAME: &str = "dotsd";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(true)
-        .compact()
-        .init();
+    dots_transport::init_tracing();
 
     let (daemon_name, endpoints) = parse_args()?;
 
