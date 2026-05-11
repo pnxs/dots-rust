@@ -53,10 +53,60 @@ pub use value::{Publishable, StructValue, Transmittable};
 /// `dots_core::minicbor` over adding minicbor directly to your `Cargo.toml`.
 pub use minicbor;
 
+/// Helper used by the [`dots!`] macro to coerce each field value
+/// into `Option<T>`. Wraps the user's expression so method dispatch
+/// can pick:
+///
+/// - **Inherent method** on `DotsAssign<Option<U>>` — passes the
+///   `Option` through, applying `Into::into` to the inner value if
+///   present.
+/// - **Trait method** ([`DotsAssignGeneric`]) on `DotsAssign<U>` for
+///   any other `U: Into<T>` — wraps a bare value in `Some(_)`.
+///
+/// The "auto-ref specialization" trick (inherent methods take
+/// priority over trait methods during dispatch) is what lets a
+/// single call site handle both shapes without overlapping impls.
+#[doc(hidden)]
+pub struct DotsAssign<V>(pub V);
+
+impl<U> DotsAssign<Option<U>> {
+    /// Inherent path for `Option<U>` values — wins method-dispatch
+    /// priority over the trait impl below.
+    #[doc(hidden)]
+    #[inline]
+    pub fn into_dots_field<T>(self) -> Option<T>
+    where
+        U: Into<T>,
+    {
+        self.0.map(Into::into)
+    }
+}
+
+/// Generic fallback path for non-`Option` values. Wraps `value` in
+/// `Some(_)` after an `Into::into` conversion. Hidden because it
+/// exists only to support the [`dots!`] macro.
+#[doc(hidden)]
+pub trait DotsAssignGeneric<T> {
+    fn into_dots_field(self) -> Option<T>;
+}
+
+impl<T, U: Into<T>> DotsAssignGeneric<T> for DotsAssign<U> {
+    #[inline]
+    fn into_dots_field(self) -> Option<T> {
+        Some(self.0.into())
+    }
+}
+
 /// Construct a DOTS struct literal with terse syntax.
 ///
-/// Every named field is wrapped in `Some(_)` and converted via `Into`,
-/// so `&str` literals become `String` and most coercions Just Work.
+/// Each field's value is coerced into the field's `Option<T>` type:
+///
+/// - A bare value is wrapped in `Some(_)` and `Into`-converted, so
+///   `dots!(Foo { name: "hi" })` produces `name: Some("hi".to_string())`.
+/// - An `Option<U>` is passed through verbatim (with `Into` on the
+///   inner type if needed), so `dots!(Foo { brightness: other.brightness })`
+///   forwards `None` as `None` and `Some(x)` as `Some(x.into())`.
+///
 /// Unspecified fields fall back to `Default::default()` (which for
 /// DOTS structs is all-`None`).
 ///
@@ -79,9 +129,16 @@ macro_rules! dots {
             #[allow(clippy::needless_update)]
             let __dots_value = $($ty)::+ {
                 $(
-                    $field: ::core::option::Option::Some(
-                        ::core::convert::Into::into($value)
-                    ),
+                    $field: {
+                        // Pull `DotsAssignGeneric` into scope so the
+                        // trait method is callable; the inherent
+                        // method on `DotsAssign<Option<_>>` wins for
+                        // `Option` values, the trait method handles
+                        // everything else.
+                        #[allow(unused_imports)]
+                        use $crate::DotsAssignGeneric as _;
+                        $crate::DotsAssign($value).into_dots_field()
+                    },
                 )*
                 ..::core::default::Default::default()
             };
@@ -128,5 +185,27 @@ mod macro_tests {
     fn dots_macro_with_no_fields_yields_default() {
         let foo = dots!(Foo {});
         assert_eq!(foo, Foo::default());
+    }
+
+    #[test]
+    fn dots_macro_passes_option_through() {
+        // `Option<u64>` flows verbatim — `Some(_)` stays `Some(_)`,
+        // `None` stays `None`. No second `Some(_)` wrap.
+        let upstream: Option<u64> = Some(7);
+        let foo = dots!(Foo { big_id: upstream });
+        assert_eq!(foo.big_id, Some(7));
+
+        let cleared: Option<u64> = None;
+        let foo = dots!(Foo { big_id: cleared });
+        assert_eq!(foo.big_id, None);
+    }
+
+    #[test]
+    fn dots_macro_inner_into_on_option() {
+        // Inner-type `Into` runs even when wrapped in `Option` —
+        // `Option<&str>` lands in an `Option<String>` field.
+        let upstream: Option<&str> = Some("hi");
+        let foo = dots!(Foo { name: upstream });
+        assert_eq!(foo.name.as_deref(), Some("hi"));
     }
 }
