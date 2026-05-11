@@ -209,7 +209,7 @@ async fn callback_subscription_receives_events() {
             };
             let header = DotsHeader {
                 type_name: Some("Pinger".into()),
-                attributes: Some(p.valid_set().bits()),
+                attributes: Some(p.valid_set()),
                 ..Default::default()
             };
             framed
@@ -262,7 +262,7 @@ async fn client_publish_from_handler_reaches_server() {
         };
         let header = DotsHeader {
             type_name: Some("Pinger".into()),
-            attributes: Some(trigger.valid_set().bits()),
+            attributes: Some(trigger.valid_set()),
             ..Default::default()
         };
         framed
@@ -328,7 +328,7 @@ async fn container_alongside_callback_both_update() {
             };
             let header = DotsHeader {
                 type_name: Some("Pinger".into()),
-                attributes: Some(p.valid_set().bits()),
+                attributes: Some(p.valid_set()),
                 ..Default::default()
             };
             framed
@@ -385,7 +385,7 @@ async fn dropping_subscription_handle_unsubscribes() {
             };
             let header = DotsHeader {
                 type_name: Some("Pinger".into()),
-                attributes: Some(p.valid_set().bits()),
+                attributes: Some(p.valid_set()),
                 ..Default::default()
             };
             framed

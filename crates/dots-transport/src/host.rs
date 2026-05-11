@@ -295,7 +295,7 @@ struct CachedEntry {
     last_update_time: Option<dots_core::Timepoint>,
     /// Property bitmask of the most recent update (for reproducing
     /// `header.attributes` on replay).
-    attributes: u64,
+    attributes: PropertySet,
 }
 
 struct GuestRecord {
@@ -581,7 +581,7 @@ impl HostTransceiver {
         let type_name = value.descriptor().name;
         let header = DotsHeader {
             type_name: Some(type_name.into()),
-            attributes: Some(value.valid_set().bits()),
+            attributes: Some(value.valid_set()),
             sender: Some(HOST_ID),
             sent_time: Some(now_timepoint()),
             server_sent_time: Some(now_timepoint()),
@@ -606,7 +606,7 @@ impl HostTransceiver {
         let mask = (included | key_set(value)) & value.valid_set();
         let header = DotsHeader {
             type_name: Some(type_name.into()),
-            attributes: Some(mask.bits()),
+            attributes: Some(mask),
             sender: Some(HOST_ID),
             sent_time: Some(now_timepoint()),
             server_sent_time: Some(now_timepoint()),
@@ -631,7 +631,7 @@ impl HostTransceiver {
         let mask = key_set(value);
         let header = DotsHeader {
             type_name: Some(type_name.into()),
-            attributes: Some(mask.bits()),
+            attributes: Some(mask),
             sender: Some(HOST_ID),
             sent_time: Some(now_timepoint()),
             server_sent_time: Some(now_timepoint()),
@@ -735,7 +735,7 @@ impl HostTransceiver {
                 payload: payload.clone(),
                 last_update_sender: header.sender,
                 last_update_time: header.sent_time,
-                attributes: header.attributes.unwrap_or(0),
+                attributes: header.attributes.unwrap_or_default(),
             },
         );
     }
@@ -816,7 +816,7 @@ impl HostTransceiver {
         };
         let header = DotsHeader {
             type_name: Some("DotsCacheInfo".into()),
-            attributes: Some(info.valid_set().bits()),
+            attributes: Some(info.valid_set()),
             sender: Some(HOST_ID),
             ..Default::default()
         };
@@ -1244,7 +1244,7 @@ fn handle_echo(host: &Arc<HostTransceiver>, client_id: u32, raw: &RawTransmissio
     };
     let header = DotsHeader {
         type_name: Some("DotsEcho".into()),
-        attributes: Some(reply.valid_set().bits()),
+        attributes: Some(reply.valid_set()),
         sender: Some(HOST_ID),
         sent_time: Some(now_timepoint()),
         server_sent_time: Some(now_timepoint()),
@@ -1312,7 +1312,7 @@ fn handle_descriptor_request(
         let data = StructDescriptorData::from_dynamic(d);
         let header = DotsHeader {
             type_name: Some("StructDescriptorData".into()),
-            attributes: Some(data.valid_set().bits()),
+            attributes: Some(data.valid_set()),
             sender: Some(HOST_ID),
             sent_time: Some(now_timepoint()),
             server_sent_time: Some(now_timepoint()),
@@ -1327,7 +1327,7 @@ fn handle_descriptor_request(
     };
     let header = DotsHeader {
         type_name: Some("DotsCacheInfo".into()),
-        attributes: Some(info.valid_set().bits()),
+        attributes: Some(info.valid_set()),
         sender: Some(HOST_ID),
         sent_time: Some(now_timepoint()),
         server_sent_time: Some(now_timepoint()),
@@ -1497,7 +1497,7 @@ where
 {
     let header = DotsHeader {
         type_name: Some(type_name.into()),
-        attributes: Some(value.valid_set().bits()),
+        attributes: Some(value.valid_set()),
         sender: Some(HOST_ID),
         ..Default::default()
     };

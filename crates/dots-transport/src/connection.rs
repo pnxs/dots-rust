@@ -353,7 +353,7 @@ where
         // header field is mandatory at the protocol level.
         let header = DotsHeader {
             type_name: Some(type_name.into()),
-            attributes: Some(payload.valid_set().bits()),
+            attributes: Some(payload.valid_set()),
             sender: self.client_id,
             ..Default::default()
         };
@@ -408,7 +408,7 @@ where
         let mask = (included | key_set(value)) & value.valid_set();
         let header = DotsHeader {
             type_name: Some(type_name.into()),
-            attributes: Some(mask.bits()),
+            attributes: Some(mask),
             sender: self.client_id,
             ..Default::default()
         };

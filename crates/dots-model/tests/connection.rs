@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use dots_core::{DynamicStruct, Timepoint, decode_typed_from_slice, encode_to_vec};
+use dots_core::{DynamicStruct, PropertySet, Timepoint, decode_typed_from_slice, encode_to_vec};
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgError,
     DotsMsgHello, Registry, StructDescriptorData,
@@ -16,7 +16,7 @@ fn dots_header_roundtrip() {
         type_name: Some("MyType".into()),
         sent_time: Some(Timepoint(1_700_000_000.0)),
         server_sent_time: Some(Timepoint(1_700_000_000.5)),
-        attributes: Some(0b0000_0000_0000_1011),
+        attributes: Some(PropertySet::from_bits(0b0000_0000_0000_1011)),
         sender: Some(42),
         from_cache: Some(7),
         remove_obj: Some(false),

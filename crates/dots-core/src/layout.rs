@@ -455,11 +455,16 @@ impl_dots_field_via_minicbor!(
     alloc::string::String,
 );
 
-/// Fixed-size byte arrays — the wire format for DOTS `uuid` (16 bytes)
-/// and any other `.dots` `uuid`-shaped alias. Encoded as a CBOR
-/// ByteString, matching dots-cpp's
-/// `CborWriter::write(std::array<uint8_t, N>)`.
-impl<const N: usize> DotsField for [u8; N] {
+/// DOTS `uuid` — exactly 16 raw bytes, encoded as a CBOR ByteString.
+/// Matches dots-cpp's `CborWriter::write(std::array<uint8_t, 16>)`.
+///
+/// `uuid` is the *only* fixed-byte type in DOTS. For arbitrary binary
+/// blobs use `Vec<u8>`, which encodes as DOTS `vector<uint8>` (a CBOR
+/// array of `uint8`) — the same convention dots-cpp uses. Other
+/// `[u8; N]` sizes intentionally have no `DotsField` impl: they would
+/// share the uuid wire format but mean something different, and that
+/// ambiguity is what we want to prevent at the type level.
+impl DotsField for [u8; 16] {
     #[inline]
     fn dots_encode(&self, e: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
         e.bytes(self)?;
@@ -474,8 +479,8 @@ impl<const N: usize> DotsField for [u8; N] {
     }
 }
 
-impl<const N: usize> crate::DotsTypeKind for [u8; N] {
-    const KIND: crate::FieldKind = crate::FieldKind::Bytes;
+impl crate::DotsTypeKind for [u8; 16] {
+    const KIND: crate::FieldKind = crate::FieldKind::Uuid;
 }
 
 /// Safe wrapper used by the manual `DotsField` impl that the proc-macro

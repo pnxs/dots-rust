@@ -81,7 +81,7 @@ async fn push_pinger(
 ) {
     let header = DotsHeader {
         type_name: Some("Pinger".into()),
-        attributes: Some(pinger.valid_set().bits()),
+        attributes: Some(pinger.valid_set()),
         sender,
         sent_time: sent_time.map(Timepoint),
         remove_obj: Some(remove),

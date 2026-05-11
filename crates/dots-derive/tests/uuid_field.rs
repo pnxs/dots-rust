@@ -1,11 +1,11 @@
-//! `[u8; N]` fields — wire format for DOTS `uuid` (and any other
-//! fixed-size byte array used in a `.dots` schema).
+//! `[u8; 16]` fields — wire format for DOTS `uuid`.
 //!
 //! `uuid` in `.dots` lowers to `[u8; 16]` (see
 //! `dots-build/src/codegen.rs::map_primitive`). On the wire it's a
 //! CBOR ByteString of length 16 — matching dots-cpp's
-//! `CborWriter::write(std::array<uint8_t, N>)`, which writes a
-//! ByteString rather than the array path used by `vector_t<T>`.
+//! `CborWriter::write(std::array<uint8_t, 16>)`, which writes a
+//! ByteString rather than the array path used by `vector_t<T>`. For
+//! arbitrary binary blobs use `Vec<u8>` (DOTS `vector<uint8>`).
 
 use dots_core::{FieldKind, decode_typed_from_slice, encode_to_vec};
 use dots_derive::DotsStruct;
@@ -20,9 +20,9 @@ struct Token {
 }
 
 #[test]
-fn uuid_field_kind_is_bytes() {
+fn uuid_field_kind_is_uuid() {
     let p = Token::DESCRIPTOR.property(2).unwrap();
-    assert!(matches!(p.kind, FieldKind::Bytes));
+    assert!(matches!(p.kind, FieldKind::Uuid));
 }
 
 #[test]

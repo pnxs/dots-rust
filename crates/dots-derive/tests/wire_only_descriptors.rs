@@ -95,8 +95,8 @@ fn vec_of_primitives_cross_roundtrip() {
 fn vec_of_bytes_cross_roundtrip() {
     // `Vec<u8>` encodes as a CBOR array of u8 (matching dots-cpp), so
     // the dynamic decoder yields `DynamicValue::Vec` of `U8` items —
-    // not `DynamicValue::Bytes`. (Bytes is reserved for `uuid`, the
-    // only DOTS type that uses a CBOR byte string on the wire.)
+    // not `DynamicValue::Uuid`. (`Uuid` is the only DOTS type that
+    // uses a CBOR byte string on the wire, and it's always 16 bytes.)
     let original = Wire {
         id: Some(2),
         raw: Some(vec![0xde, 0xad, 0xbe, 0xef]),

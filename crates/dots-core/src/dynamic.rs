@@ -24,7 +24,7 @@ use alloc::{
 };
 
 use crate::{
-    EnumDescriptor, FieldKind, PropertySet, StructDescriptor, StructFlags,
+    DotsField, EnumDescriptor, FieldKind, PropertySet, StructDescriptor, StructFlags,
     layout::{CborDecoder, CborEncoder, DecodeError, EncodeError},
 };
 
@@ -40,8 +40,16 @@ pub enum DynamicFieldKind {
     U8, U16, U32, U64,
     I8, I16, I32, I64,
     F32, F64,
+    /// DOTS `property_set` — wire payload is the bitmask encoded by
+    /// [`PropertySet`]'s `DotsField` impl. Kept distinct from the
+    /// raw-integer kinds so the dynamic side doesn't bind to
+    /// `PropertySet`'s current storage width.
+    PropertySet,
     String,
-    Bytes,
+    /// DOTS `uuid` — wire payload is a CBOR ByteString of exactly 16
+    /// bytes. For arbitrary binary blobs use `Vec(Box::new(U8))`
+    /// (DOTS `vector<uint8>`).
+    Uuid,
     Timepoint,
     Duration,
     Vec(Box<DynamicFieldKind>),
@@ -159,8 +167,9 @@ impl DynamicFieldKind {
             FieldKind::I64 => Self::I64,
             FieldKind::F32 => Self::F32,
             FieldKind::F64 => Self::F64,
+            FieldKind::PropertySet => Self::PropertySet,
             FieldKind::String => Self::String,
-            FieldKind::Bytes => Self::Bytes,
+            FieldKind::Uuid => Self::Uuid,
             FieldKind::Timepoint => Self::Timepoint,
             FieldKind::Duration => Self::Duration,
             FieldKind::Vec(inner) => Self::Vec(Box::new(Self::from_static(inner))),
@@ -190,7 +199,12 @@ pub enum DynamicValue {
     F32(f32),
     F64(f64),
     String(String),
-    Bytes(Vec<u8>),
+    /// DOTS `property_set` — wrapped [`PropertySet`] rather than its
+    /// raw integer so consumers don't depend on the storage width.
+    PropertySet(PropertySet),
+    /// DOTS `uuid` — exactly 16 raw bytes. For arbitrary binary blobs
+    /// use `Vec(Vec<DynamicValue::U8(_)>)` (DOTS `vector<uint8>`).
+    Uuid([u8; 16]),
     Vec(Vec<DynamicValue>),
     /// Nested struct value. Boxed to keep `DynamicValue`'s size bounded
     /// independently of `DynamicStruct`'s growth.
@@ -354,7 +368,8 @@ fn encode_value(value: &DynamicValue, e: &mut CborEncoder<'_>) -> Result<(), Enc
         DynamicValue::F32(v) => e.f32(*v).map(|_| ()),
         DynamicValue::F64(v) => e.f64(*v).map(|_| ()),
         DynamicValue::String(s) => e.str(s).map(|_| ()),
-        DynamicValue::Bytes(b) => e.bytes(b).map(|_| ()),
+        DynamicValue::PropertySet(p) => p.dots_encode(e),
+        DynamicValue::Uuid(b) => e.bytes(b).map(|_| ()),
         DynamicValue::Vec(items) => {
             e.array(items.len() as u64)?;
             for item in items {
@@ -413,7 +428,14 @@ fn decode_value(
         DynamicFieldKind::F32 => Ok(DynamicValue::F32(d.f32()?)),
         DynamicFieldKind::F64 => Ok(DynamicValue::F64(d.f64()?)),
         DynamicFieldKind::String => Ok(DynamicValue::String(d.str()?.to_string())),
-        DynamicFieldKind::Bytes => Ok(DynamicValue::Bytes(d.bytes()?.to_vec())),
+        DynamicFieldKind::PropertySet => Ok(DynamicValue::PropertySet(PropertySet::dots_decode(d)?)),
+        DynamicFieldKind::Uuid => {
+            let bytes = d.bytes()?;
+            let arr: [u8; 16] = bytes.try_into().map_err(|_| {
+                DecodeError::message("uuid byte-string length mismatch")
+            })?;
+            Ok(DynamicValue::Uuid(arr))
+        }
         DynamicFieldKind::Vec(inner) => {
             let len = d.array()?.ok_or_else(|| {
                 DecodeError::message("indefinite-length arrays are not supported")
@@ -462,7 +484,8 @@ impl core::fmt::Display for DynamicValue {
             DynamicValue::F32(v) => write!(f, "{v}"),
             DynamicValue::F64(v) => write!(f, "{v}"),
             DynamicValue::String(s) => write!(f, "{s:?}"),
-            DynamicValue::Bytes(b) => {
+            DynamicValue::PropertySet(p) => write!(f, "{p:?}"),
+            DynamicValue::Uuid(b) => {
                 f.write_str("0x")?;
                 for byte in b {
                     write!(f, "{byte:02x}")?;

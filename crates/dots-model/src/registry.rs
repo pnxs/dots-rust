@@ -305,14 +305,8 @@ impl Registry {
             "timepoint" => return Ok(DynamicFieldKind::Timepoint),
             "duration" => return Ok(DynamicFieldKind::Duration),
             "steady_timepoint" => return Ok(DynamicFieldKind::Timepoint),
-            // `.dots` source-level aliases. dots-cpp emits these names
-            // verbatim in `StructDescriptorData.properties[].type_name`;
-            // dots-rust's own codegen rewrites them to `uint64` /
-            // `vector<uint8>` so we never see them on the wire from a
-            // Rust peer — but we must still accept them from a dots-cpp
-            // peer publishing its descriptors.
-            "property_set" => return Ok(DynamicFieldKind::U32),
-            "uuid" => return Ok(DynamicFieldKind::Bytes),
+            "property_set" => return Ok(DynamicFieldKind::PropertySet),
+            "uuid" => return Ok(DynamicFieldKind::Uuid),
             _ => {}
         }
 

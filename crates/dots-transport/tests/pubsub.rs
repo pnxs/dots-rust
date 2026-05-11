@@ -402,6 +402,6 @@ async fn publish_with_mask_drops_excluded_properties_keeps_keys() {
     assert_eq!(decoded.sequence, Some(99));
 
     // Header attributes mask should match: bit 1 (key) | bit 3 (sequence).
-    let expected_bits = PropertySet::EMPTY.with_tag(1).with_tag(3).bits();
-    assert_eq!(header.attributes, Some(expected_bits));
+    let expected = PropertySet::EMPTY.with_tag(1).with_tag(3);
+    assert_eq!(header.attributes, Some(expected));
 }

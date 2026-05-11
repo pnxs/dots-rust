@@ -1,8 +1,10 @@
 use core::fmt;
+use crate::{DecodeError, DotsField, DotsTypeKind, EncodeError, FieldKind};
+use crate::layout::{CborDecoder, CborEncoder};
 
 /// Bitmask of valid properties, indexed by property tag.
 ///
-/// **Wire layout matches C++ DOTS:** bit `n` of the underlying `u64`
+/// **Wire layout matches C++ DOTS:** bit `n` of the underlying `u32`
 /// represents tag `n`. Tag `0` is unused (DOTS tags are 1-based, so
 /// bit 0 is always zero in valid encodings); tag `1` is bit `1`,
 /// up to tag `63` at bit `63`.
@@ -13,7 +15,22 @@ use core::fmt;
 /// peer would read our bitmask one bit "off", treat properties at the
 /// wrong tags as valid/invalid, and propagate broken cache merges.
 #[derive(Copy, Clone, PartialEq, Eq, Default)]
-pub struct PropertySet(u64);
+pub struct PropertySet(u32);
+
+impl DotsTypeKind for PropertySet {
+    const KIND: FieldKind = FieldKind::PropertySet;
+}
+
+impl DotsField for PropertySet {
+    #[inline]
+    fn dots_encode(&self, e: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
+        <u32 as DotsField>::dots_encode(&self.0, e)
+    }
+    #[inline]
+    fn dots_decode(d: &mut CborDecoder<'_>) -> Result<Self, DecodeError> {
+        <u32 as DotsField>::dots_decode(d).map(Self)
+    }
+}
 
 impl PropertySet {
     /// All properties invalid.
@@ -21,18 +38,18 @@ impl PropertySet {
 
     /// Maximum tag value supported by this representation.
     /// Tag = bit-position, so we lose tag 0 (unused in DOTS) and the
-    /// max usable tag is 63.
-    pub const MAX_TAG: u32 = 63;
+    /// max usable tag is 31.
+    pub const MAX_TAG: u32 = 31;
 
     /// Construct from a raw bitmask. Bit `n` corresponds to tag `n`.
     #[inline]
-    pub const fn from_bits(bits: u64) -> Self {
+    pub const fn from_bits(bits: u32) -> Self {
         Self(bits)
     }
 
     /// Raw bitmask access.
     #[inline]
-    pub const fn bits(self) -> u64 {
+    pub const fn bits(self) -> u32 {
         self.0
     }
 
@@ -42,7 +59,7 @@ impl PropertySet {
         if tag == 0 || tag > Self::MAX_TAG {
             return false;
         }
-        (self.0 & (1u64 << tag)) != 0
+        (self.0 & (1u32 << tag)) != 0
     }
 
     /// Return a new set with `tag` added.
@@ -50,7 +67,7 @@ impl PropertySet {
     #[must_use]
     pub const fn with_tag(self, tag: u32) -> Self {
         debug_assert!(tag != 0 && tag <= Self::MAX_TAG);
-        Self(self.0 | (1u64 << tag))
+        Self(self.0 | (1u32 << tag))
     }
 
     /// Return a new set with `tag` removed.
@@ -58,7 +75,7 @@ impl PropertySet {
     #[must_use]
     pub const fn without_tag(self, tag: u32) -> Self {
         debug_assert!(tag != 0 && tag <= Self::MAX_TAG);
-        Self(self.0 & !(1u64 << tag))
+        Self(self.0 & !(1u32 << tag))
     }
 
     /// True if no tags are set.
@@ -139,15 +156,15 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
         assert!(!s.has(1));
-        assert!(!s.has(63));
+        assert!(!s.has(31));
     }
 
     #[test]
     fn add_and_query_tags() {
-        let s = PropertySet::EMPTY.with_tag(1).with_tag(7).with_tag(63);
+        let s = PropertySet::EMPTY.with_tag(1).with_tag(7).with_tag(31);
         assert!(s.has(1));
         assert!(s.has(7));
-        assert!(s.has(63));
+        assert!(s.has(31));
         assert!(!s.has(2));
         assert_eq!(s.len(), 3);
     }
@@ -163,7 +180,7 @@ mod tests {
     fn out_of_range_tags_are_not_set() {
         let s = PropertySet::EMPTY;
         assert!(!s.has(0));
-        assert!(!s.has(64));
+        assert!(!s.has(32));
         assert!(!s.has(u32::MAX));
     }
 

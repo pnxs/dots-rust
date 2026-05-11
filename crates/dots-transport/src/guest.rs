@@ -418,7 +418,7 @@ impl GuestTransceiver {
         let mask = (included | key_set(value)) & value.valid_set();
         let header = DotsHeader {
             type_name: Some(value.descriptor().name.into()),
-            attributes: Some(mask.bits()),
+            attributes: Some(mask),
             sender: self.client_id(),
             sent_time: Some(now_timepoint()),
             ..Default::default()
@@ -442,7 +442,7 @@ impl GuestTransceiver {
     pub fn publish_dynamic(&self, value: &DynamicStruct) -> Result<(), ClientClosed> {
         let header = DotsHeader {
             type_name: Some(value.descriptor.name.clone().into()),
-            attributes: Some(value.valid.bits()),
+            attributes: Some(value.valid),
             sender: self.client_id(),
             sent_time: Some(now_timepoint()),
             ..Default::default()
@@ -466,7 +466,7 @@ impl GuestTransceiver {
         let mask = key_set(value);
         let header = DotsHeader {
             type_name: Some(value.descriptor().name.into()),
-            attributes: Some(mask.bits()),
+            attributes: Some(mask),
             sender: self.client_id(),
             sent_time: Some(now_timepoint()),
             remove_obj: Some(true),
@@ -607,7 +607,7 @@ impl GuestTransceiver {
         let type_name = value.descriptor().name;
         let header = DotsHeader {
             type_name: Some(type_name.into()),
-            attributes: Some(value.valid_set().bits()),
+            attributes: Some(value.valid_set()),
             sender: self.client_id(),
             sent_time: Some(now_timepoint()),
             ..Default::default()

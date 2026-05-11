@@ -10,13 +10,12 @@
 //!
 //! The `.dots` model uses `timepoint` and `property_set` — semantic
 //! types backed by `f64` (seconds since Unix epoch) and `u64` on the
-//! wire respectively. This iteration represents them as `Option<f64>`
-//! and `Option<u64>` directly, with the wire encoding matching DOTS.
-//! Typed wrappers (a `Timepoint` newtype, reusing
-//! [`dots_core::PropertySet`]) can come later without any wire-format
-//! change.
+//! wire respectively. They are represented here as typed wrappers
+//! ([`dots_core::Timepoint`] and [`dots_core::PropertySet`]) so that
+//! callers cannot accidentally pass a raw bitmask where a property
+//! set is expected. The wire encoding is unchanged.
 
-use dots_core::Timepoint;
+use dots_core::{PropertySet, Timepoint};
 use dots_derive::{DotsEnum, DotsStruct};
 
 /// Per-transmission metadata envelope.
@@ -60,7 +59,7 @@ pub struct DotsHeader {
     /// the payload's CBOR map (sparse already), but explicit for
     /// peers that prefer to consult a single field.
     #[dots(tag = 3)]
-    pub attributes: Option<u64>,
+    pub attributes: Option<PropertySet>,
     /// Originating client id.
     #[dots(tag = 5)]
     pub sender: Option<u32>,
