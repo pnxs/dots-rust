@@ -91,6 +91,11 @@ struct DotsField<'a> {
     tag: u32,
     is_key: bool,
     kind: TokenStream2,
+    /// `///` doc-comment lines on the field, with the leading `=`
+    /// stripped. Used to populate the generated `new`-constructor's
+    /// `# Arguments` section so IDE hover on `Foo::new(...)` shows
+    /// what each parameter means.
+    doc_lines: Vec<String>,
 }
 
 fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
@@ -201,6 +206,71 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     });
 
+    // Key-only `new` constructor — emitted iff the struct has at
+    // least one `#[dots(key)]` field. Takes one parameter per key in
+    // declaration order, each `impl Into<inner_ty>`; everything else
+    // is left `None`. Types with no keys don't get a `new()` since
+    // it'd just be `Self::default()` and would risk colliding with a
+    // hand-written `new` on the same type.
+    let key_fields: Vec<&DotsField<'_>> = fields.iter().filter(|f| f.is_key).collect();
+    let new_constructor = if key_fields.is_empty() {
+        quote! {}
+    } else {
+        let params = key_fields.iter().map(|f| {
+            let ident = f.ident;
+            let inner = f.inner_ty;
+            quote! { #ident: impl ::core::convert::Into<#inner> }
+        });
+        let new_inits = key_fields.iter().map(|f| {
+            let ident = f.ident;
+            quote! { #ident: ::core::option::Option::Some(#ident.into()) }
+        });
+
+        // Build a per-key argument doc list. Each `///` line on a key
+        // field flows into the `# Arguments` section so IDE hover on
+        // `Foo::new(...)` shows what each parameter represents.
+        let arg_doc_lines = key_fields.iter().map(|f| {
+            let name = f.ident.to_string();
+            let summary = if f.doc_lines.is_empty() {
+                String::new()
+            } else {
+                let joined = f
+                    .doc_lines
+                    .iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if joined.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {joined}")
+                }
+            };
+            format!("* `{name}`{summary}")
+        });
+        let arg_doc_attrs = arg_doc_lines.map(|line| quote! { #[doc = #line] });
+
+        quote! {
+            #[doc = "Build an instance with the `#[dots(key)]` properties set and every other property `None`."]
+            #[doc = ""]
+            #[doc = "Convenient for container lookups (where only the keys matter for `get`) and key-only publishes (`remove`-shaped messages)."]
+            #[doc = ""]
+            #[doc = "# Arguments"]
+            #[doc = ""]
+            #( #arg_doc_attrs )*
+            #[doc = ""]
+            #[doc = "All other properties are left `None`."]
+            #[inline]
+            pub fn new(#( #params ),*) -> Self {
+                Self {
+                    #( #new_inits, )*
+                    ..::core::default::Default::default()
+                }
+            }
+        }
+    };
+
     let valid_set_arms = fields.iter().map(|f| {
         let ident = f.ident;
         let tag = f.tag;
@@ -287,6 +357,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         };
 
         impl #struct_ident {
+            #new_constructor
             #( #accessors )*
         }
 
@@ -473,6 +544,7 @@ fn parse_field(field: &Field) -> syn::Result<DotsField<'_>> {
     }
 
     let kind = field_kind_for(inner_ty);
+    let doc_lines = extract_doc_lines(&field.attrs);
 
     Ok(DotsField {
         ident,
@@ -480,7 +552,35 @@ fn parse_field(field: &Field) -> syn::Result<DotsField<'_>> {
         tag,
         is_key: attrs.is_key,
         kind,
+        doc_lines,
     })
+}
+
+/// Extract `#[doc = "..."]` attribute text from a field. Rust's
+/// `///` doc comments are surface syntax for `#[doc = "..."]`, so
+/// reading these recovers the comment text the user wrote (with the
+/// leading space the compiler inserts).
+fn extract_doc_lines(attrs: &[syn::Attribute]) -> Vec<String> {
+    let mut out = Vec::new();
+    for attr in attrs {
+        if !attr.path().is_ident("doc") {
+            continue;
+        }
+        if let syn::Meta::NameValue(nv) = &attr.meta {
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) = &nv.value
+            {
+                // Compiler inserts a single leading space — strip it
+                // so the rendered doc looks like the user's source.
+                let raw = s.value();
+                let trimmed = raw.strip_prefix(' ').unwrap_or(&raw);
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerAttrs> {
