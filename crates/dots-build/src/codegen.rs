@@ -7,7 +7,7 @@
 use core::fmt::Write;
 use std::collections::HashMap;
 
-use crate::ast::{EnumDef, EnumItem, File, Item, Property, PropertyType, StructDef};
+use crate::ast::{EnumDef, EnumItem, File, Item, Opt, OptValue, Property, PropertyType, StructDef};
 
 /// Render a parsed file as Rust source. `import` directives are
 /// recorded but produce no `use` statements — the resulting code
@@ -32,7 +32,18 @@ pub fn generate_with_imports(
     type_locations: &HashMap<String, String>,
 ) -> String {
     let mut out = String::new();
-    out.push_str("use dots_derive::{DotsEnum, DotsStruct};\n");
+    // Import only the derive macros this file actually needs — emitting
+    // both unconditionally produces an `unused_imports` warning in the
+    // consuming crate when the file has structs but no enums (or vice
+    // versa).
+    let has_struct = file.items.iter().any(|i| matches!(i, Item::Struct(_)));
+    let has_enum = file.items.iter().any(|i| matches!(i, Item::Enum(_)));
+    match (has_struct, has_enum) {
+        (true, true) => out.push_str("use dots_derive::{DotsEnum, DotsStruct};\n"),
+        (true, false) => out.push_str("use dots_derive::DotsStruct;\n"),
+        (false, true) => out.push_str("use dots_derive::DotsEnum;\n"),
+        (false, false) => {}
+    }
 
     // Emit `use super::<other_mod>::<Type>;` for each `import T`
     // directive whose target is defined in another generated module.
@@ -63,6 +74,7 @@ fn emit_struct(out: &mut String, s: &StructDef) {
     for line in &s.doc {
         let _ = writeln!(out, "/// {line}");
     }
+    emit_struct_wire_shape(out, s);
     let _ = writeln!(out, "#[derive(DotsStruct, Default, Debug, Clone, PartialEq)]");
 
     // Build the #[dots(...)] container attribute: name, plus flags.
@@ -118,6 +130,7 @@ fn emit_enum(out: &mut String, e: &EnumDef) {
     for line in &e.doc {
         let _ = writeln!(out, "/// {line}");
     }
+    emit_enum_wire_shape(out, e);
     let _ = writeln!(
         out,
         "#[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]"
@@ -142,6 +155,87 @@ fn emit_enum_item(out: &mut String, item: &EnumItem, is_first: bool) {
     }
     let _ = writeln!(out, "    #[dots(tag = {})]", item.tag);
     let _ = writeln!(out, "    {},", rustify_variant_name(&item.name));
+}
+
+/// Emit a `///`-doc fenced block reconstructing the `.dots` source
+/// of `s`. Mirrors the `@code` block dots-cpp puts on each generated
+/// header, so IDE hover (RustRover Ctrl-Q, rust-analyzer, etc.)
+/// shows the wire shape — tags, flags, type names, and any trailing
+/// per-property comments — verbatim.
+fn emit_struct_wire_shape(out: &mut String, s: &StructDef) {
+    let _ = writeln!(out, "///");
+    let _ = writeln!(out, "/// # Wire shape");
+    let _ = writeln!(out, "///");
+    let _ = writeln!(out, "/// ```text");
+    let opts = render_dots_options(&s.options);
+    let _ = writeln!(out, "/// struct {}{} {{", s.name, opts);
+    for prop in &s.properties {
+        let _ = writeln!(out, "/// {}", render_dots_property(prop));
+    }
+    let _ = writeln!(out, "/// }}");
+    let _ = writeln!(out, "/// ```");
+}
+
+fn emit_enum_wire_shape(out: &mut String, e: &EnumDef) {
+    let _ = writeln!(out, "///");
+    let _ = writeln!(out, "/// # Wire shape");
+    let _ = writeln!(out, "///");
+    let _ = writeln!(out, "/// ```text");
+    let _ = writeln!(out, "/// enum {} {{", e.name);
+    for item in &e.items {
+        let _ = writeln!(out, "/// {}", render_dots_enum_item(item));
+    }
+    let _ = writeln!(out, "/// }}");
+    let _ = writeln!(out, "/// ```");
+}
+
+fn render_dots_options(opts: &[Opt]) -> String {
+    if opts.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = opts.iter().map(render_dots_opt).collect();
+    format!(" [{}]", parts.join(", "))
+}
+
+fn render_dots_opt(o: &Opt) -> String {
+    match &o.value {
+        OptValue::Bool(true) => o.name.clone(),
+        OptValue::Bool(false) => format!("{}=false", o.name),
+        OptValue::Str(s) => format!("{}=\"{}\"", o.name, s),
+    }
+}
+
+fn render_dots_property(prop: &Property) -> String {
+    let opts = render_dots_options(&prop.options);
+    let ty = render_dots_type(&prop.ty);
+    let trailing = if prop.trailing_doc.is_empty() {
+        String::new()
+    } else {
+        format!(" // {}", prop.trailing_doc.join(" "))
+    };
+    format!(
+        "    {}:{} {} {};{}",
+        prop.tag, opts, ty, prop.name, trailing
+    )
+}
+
+fn render_dots_enum_item(item: &EnumItem) -> String {
+    let trailing = if item.trailing_doc.is_empty() {
+        String::new()
+    } else {
+        format!(" // {}", item.trailing_doc.join(" "))
+    };
+    match item.value {
+        Some(v) => format!("    {}: {} = {};{}", item.tag, item.name, v, trailing),
+        None => format!("    {}: {};{}", item.tag, item.name, trailing),
+    }
+}
+
+fn render_dots_type(ty: &PropertyType) -> String {
+    match ty {
+        PropertyType::Named(n) => n.clone(),
+        PropertyType::Vector(inner) => format!("vector<{}>", render_dots_type(inner)),
+    }
 }
 
 /// Map a `.dots` type name to a Rust type name.
