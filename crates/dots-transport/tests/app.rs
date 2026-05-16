@@ -77,6 +77,7 @@ async fn handshake_with_preload(
         server_name: Some("test-dotsd".into()),
         auth_challenge: Some(0),
         authentication_required: Some(false),
+        capabilities: None,
     };
     framed
         .send(dynamic_for(reg, "DotsMsgHello", &hello))

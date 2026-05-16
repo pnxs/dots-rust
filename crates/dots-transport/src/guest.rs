@@ -606,6 +606,7 @@ impl GuestTransceiver {
                 group_name: Some(group_name.into()),
                 event: Some(DotsMemberEvent::Join),
                 client: self.client_id(),
+                ..Default::default()
             };
             self.publish_typed(&member);
         }
@@ -635,6 +636,7 @@ impl GuestTransceiver {
                 group_name: Some(group_name.into()),
                 event: Some(DotsMemberEvent::Leave),
                 client: self.client_id(),
+                ..Default::default()
             };
             self.publish_typed(&member);
         }

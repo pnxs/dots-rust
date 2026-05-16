@@ -72,6 +72,7 @@ async fn run_handshake_server(
         server_name: Some("test-dotsd".into()),
         auth_challenge: Some(0),
         authentication_required: Some(false),
+        capabilities: None,
     };
     framed
         .send(dynamic_for(reg, "DotsMsgHello", &hello))

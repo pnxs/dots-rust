@@ -20,13 +20,18 @@
 pub mod connection;
 pub mod daemon;
 pub mod descriptors;
+pub mod filter;
 pub mod framing;
 pub mod registry;
 
 pub use connection::{
     DotsCacheInfo, DotsClearCache, DotsCloneInformation, DotsConnectionState, DotsDescriptorRequest,
     DotsEcho, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect, DotsMsgConnectResponse,
-    DotsMsgError, DotsMsgHello, DotsMt,
+    DotsMsgError, DotsMsgHello, DotsMt, DotsServerCapabilities,
+};
+pub use filter::{
+    DotsCompareOp, DotsFilter, DotsPredicate, DotsPredicateKind, DotsPredicateLeaf,
+    DotsPredicateNode, DotsPredicateValue,
 };
 pub use daemon::{
     DotsCacheStatus, DotsClient, DotsDaemonStatus, DotsResourceUsage, DotsStatistics,
@@ -54,11 +59,21 @@ pub use registry::{DescriptorEntry, Registry, RegistryError};
 pub fn register_dots_internal_types(reg: &mut Registry) {
     // Connection / handshake.
     reg.register_struct_static(DotsHeader::DESCRIPTOR);
+    reg.register_struct_static(DotsServerCapabilities::DESCRIPTOR);
     reg.register_struct_static(DotsMsgHello::DESCRIPTOR);
     reg.register_struct_static(DotsMsgConnect::DESCRIPTOR);
     reg.register_struct_static(DotsMsgConnectResponse::DESCRIPTOR);
     reg.register_struct_static(DotsMsgError::DESCRIPTOR);
     reg.register_enum_static(DotsConnectionState::DESCRIPTOR);
+
+    // Filtered subscriptions (filter.dots).
+    reg.register_enum_static(DotsPredicateKind::DESCRIPTOR);
+    reg.register_enum_static(DotsCompareOp::DESCRIPTOR);
+    reg.register_struct_static(DotsPredicateValue::DESCRIPTOR);
+    reg.register_struct_static(DotsPredicateLeaf::DESCRIPTOR);
+    reg.register_struct_static(DotsPredicateNode::DESCRIPTOR);
+    reg.register_struct_static(DotsPredicate::DESCRIPTOR);
+    reg.register_struct_static(DotsFilter::DESCRIPTOR);
 
     // Group membership / events / cache metadata.
     reg.register_enum_static(DotsMemberEvent::DESCRIPTOR);

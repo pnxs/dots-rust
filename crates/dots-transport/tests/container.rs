@@ -53,6 +53,7 @@ async fn run_no_preload_handshake(
         server_name: Some("s".into()),
         auth_challenge: Some(0),
         authentication_required: Some(false),
+        capabilities: None,
     };
     framed
         .send(dynamic_for(reg, "DotsMsgHello", &hello))

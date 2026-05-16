@@ -21,6 +21,7 @@ fn dots_header_roundtrip() {
         from_cache: Some(7),
         remove_obj: Some(false),
         is_from_myself: Some(false),
+        subscription_id: Some(13),
     };
     let bytes = encode_to_vec(&original);
     let decoded: DotsHeader = decode_typed_from_slice(&bytes).unwrap();
@@ -47,6 +48,7 @@ fn hello_roundtrip() {
         server_name: Some("dotsd".into()),
         auth_challenge: Some(0xdeadbeef_cafef00d_u64),
         authentication_required: Some(true),
+        capabilities: None,
     };
     let bytes = encode_to_vec(&hello);
     let decoded: DotsMsgHello = decode_typed_from_slice(&bytes).unwrap();
@@ -182,6 +184,10 @@ fn handshake_descriptors_resolve_through_registry_from_wire() {
     // the handshake structs entirely from the wire can decode them.
     let reg = Registry::new();
     for static_desc in [
+        // DotsMsgHello references DotsServerCapabilities as a nested
+        // struct field; register the nested type first so the reverse
+        // conversion can resolve it.
+        dots_model::DotsServerCapabilities::DESCRIPTOR,
         DotsMsgHello::DESCRIPTOR,
         DotsMsgConnect::DESCRIPTOR,
         DotsMsgConnectResponse::DESCRIPTOR,
@@ -198,6 +204,7 @@ fn handshake_descriptors_resolve_through_registry_from_wire() {
         server_name: Some("dotsd".into()),
         auth_challenge: Some(42),
         authentication_required: Some(false),
+        capabilities: None,
     };
     let typed_bytes = encode_to_vec(&hello);
 

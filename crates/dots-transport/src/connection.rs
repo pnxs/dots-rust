@@ -28,8 +28,8 @@ use dots_core::{
 };
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
-    EnumDescriptorData, Registry, StructDescriptorData, Transmission, encode_transmission_into,
-    encode_transmission_with_mask_into,
+    DotsServerCapabilities, EnumDescriptorData, Registry, StructDescriptorData, Transmission,
+    encode_transmission_into, encode_transmission_with_mask_into,
 };
 use futures_util::{SinkExt, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -118,6 +118,11 @@ pub struct Connection<S> {
     state: DotsConnectionState,
     server_name: Option<String>,
     client_id: Option<u32>,
+    /// Capabilities the peer advertised in its [`DotsMsgHello`].
+    /// Populated during the initial handshake; `None` means the
+    /// peer's Hello didn't carry a capabilities field — treat every
+    /// optional capability as unsupported.
+    peer_capabilities: Option<DotsServerCapabilities>,
     /// Reused encode buffer for typed sends — avoids per-message allocation.
     scratch: Vec<u8>,
     /// Type-erased dispatch table for subscriptions. Behind a `Mutex` so
@@ -166,6 +171,7 @@ where
             state: DotsConnectionState::Connecting,
             server_name: None,
             client_id: None,
+            peer_capabilities: None,
             scratch: Vec::with_capacity(256),
             dispatch: Arc::new(Mutex::new(DispatchState::default())),
         }
@@ -196,6 +202,7 @@ where
         let auth_required = hello.authentication_required == Some(true);
         let auth_challenge = hello.auth_challenge.unwrap_or(0);
         self.server_name = hello.server_name;
+        self.peer_capabilities = hello.capabilities;
 
         let mut connect = DotsMsgConnect {
             client_name: Some(client_name.into()),
@@ -506,6 +513,21 @@ where
     /// Client id assigned by the server in `DotsMsgConnectResponse`.
     pub fn client_id(&self) -> Option<u32> {
         self.client_id
+    }
+
+    /// Capabilities the peer advertised in its [`DotsMsgHello`].
+    ///
+    /// `None` for two distinct reasons:
+    ///
+    /// - The handshake hasn't reached the `Hello` exchange yet
+    ///   (`state` is still `Connecting`).
+    /// - The peer is a legacy server that didn't populate the
+    ///   `capabilities` field at all.
+    ///
+    /// Callers treating any optional capability as supported only
+    /// when explicitly set get clean degradation in both cases.
+    pub fn peer_capabilities(&self) -> Option<&DotsServerCapabilities> {
+        self.peer_capabilities.as_ref()
     }
 
     /// Consume the connection, returning the wrapped stream. Useful

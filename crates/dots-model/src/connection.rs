@@ -18,6 +18,8 @@
 use dots_core::{PropertySet, Timepoint};
 use dots_derive::{DotsEnum, DotsStruct};
 
+use crate::filter::DotsFilter;
+
 /// Per-transmission metadata envelope.
 ///
 /// Every published value is preceded by a `DotsHeader` carrying the
@@ -74,6 +76,12 @@ pub struct DotsHeader {
     /// this client (i.e. the publication is a loopback of one's own).
     #[dots(tag = 6)]
     pub is_from_myself: Option<bool>,
+    /// When set, identifies the filtered subscription this event is
+    /// destined for. Absent for unfiltered traffic. Used by the
+    /// broker to tag transmissions delivered through a `View<T>` and
+    /// by the guest to demux them to the correct view.
+    #[dots(tag = 9)]
+    pub subscription_id: Option<u32>,
 }
 
 /// Server → guest, opening message of the connection handshake.
@@ -84,6 +92,7 @@ pub struct DotsHeader {
 ///     1: string serverName;
 ///     2: uint64 authChallenge;
 ///     3: bool authenticationRequired;
+///     4: DotsServerCapabilities capabilities;
 /// }
 /// ```
 #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
@@ -97,6 +106,34 @@ pub struct DotsMsgHello {
     pub auth_challenge: Option<u64>,
     #[dots(tag = 3)]
     pub authentication_required: Option<bool>,
+    /// Capabilities advertised by the server. Absent on legacy
+    /// servers; new clients degrade gracefully when this is `None` —
+    /// any not-explicitly-set capability is treated as unsupported.
+    #[dots(tag = 4)]
+    pub capabilities: Option<DotsServerCapabilities>,
+}
+
+/// Server-side capability advertisement carried in [`DotsMsgHello`].
+///
+/// Old servers don't populate this; old clients ignore unknown
+/// fields. Future capabilities are added as new optional bool fields
+/// with new tags — both directions degrade cleanly when a flag is
+/// absent.
+///
+/// Mirrors `.dots`:
+/// ```text
+/// struct DotsServerCapabilities [internal,cached=false] {
+///     1: bool filteredSubscriptions;
+/// }
+/// ```
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+#[dots(name = "DotsServerCapabilities", internal)]
+pub struct DotsServerCapabilities {
+    /// Server understands `DotsMember.filter` / `DotsMember.subscription_id`
+    /// for filtered subscriptions and routes filtered transmissions
+    /// with `DotsHeader.subscription_id`.
+    #[dots(tag = 1)]
+    pub filtered_subscriptions: Option<bool>,
 }
 
 /// Guest → server, sent twice during the handshake:
@@ -245,6 +282,8 @@ pub enum DotsMemberEvent {
 ///     1: string groupName;
 ///     2: DotsMemberEvent event;
 ///     3: uint32 client;
+///     4: uint32 subscriptionId;
+///     5: DotsFilter filter;
 /// }
 /// ```
 #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
@@ -256,6 +295,17 @@ pub struct DotsMember {
     pub event: Option<DotsMemberEvent>,
     #[dots(tag = 3)]
     pub client: Option<u32>,
+    /// Client-allocated id for filtered subscriptions. Absent on
+    /// unfiltered joins/leaves; required when [`Self::filter`] is
+    /// set, and used to address one View's teardown without
+    /// affecting siblings on the same type.
+    #[dots(tag = 4)]
+    pub subscription_id: Option<u32>,
+    /// Optional row predicate + column projection. Present only on
+    /// filtered `join` events; when set, [`Self::subscription_id`]
+    /// must also be set.
+    #[dots(tag = 5)]
+    pub filter: Option<DotsFilter>,
 }
 
 /// Operation kind for a value-cache event — what kind of change just

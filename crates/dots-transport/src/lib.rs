@@ -26,6 +26,7 @@ mod connection;
 mod container;
 mod endpoint;
 mod error;
+pub mod filter;
 mod guest;
 mod host;
 #[cfg(feature = "tracing-init")]

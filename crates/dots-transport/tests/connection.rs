@@ -49,6 +49,7 @@ async fn happy_server(server_stream: DuplexStream, reg: Arc<Registry>) {
         server_name: Some("test-dotsd".into()),
         auth_challenge: Some(0x4242),
         authentication_required: Some(false),
+        capabilities: None,
     };
     framed
         .send(dynamic_for(&reg, "DotsMsgHello", &hello))
@@ -102,6 +103,7 @@ async fn establish_passes_client_name_to_server() {
             server_name: Some("greeter".into()),
             auth_challenge: Some(1),
             authentication_required: Some(false),
+            capabilities: None,
         };
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
@@ -148,6 +150,7 @@ async fn establish_rejects_when_server_demands_auth() {
             server_name: Some("auth-required".into()),
             auth_challenge: Some(123),
             authentication_required: Some(true),
+            capabilities: None,
         };
         let _ = framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
@@ -180,6 +183,7 @@ async fn establish_with_auth_secret_completes_handshake() {
             server_name: Some("auth-server".into()),
             auth_challenge: Some(nonce),
             authentication_required: Some(true),
+            capabilities: None,
         };
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
@@ -252,6 +256,7 @@ async fn establish_rejects_when_server_says_not_accepted() {
             server_name: Some("strict".into()),
             auth_challenge: Some(0),
             authentication_required: Some(false),
+            capabilities: None,
         };
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
@@ -362,6 +367,7 @@ async fn send_typed_after_handshake_reaches_server() {
             server_name: Some("s".into()),
             auth_challenge: Some(0),
             authentication_required: Some(false),
+            capabilities: None,
         };
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
@@ -417,6 +423,7 @@ async fn next_after_handshake_yields_server_traffic() {
             server_name: Some("s".into()),
             auth_challenge: Some(0),
             authentication_required: Some(false),
+            capabilities: None,
         };
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))

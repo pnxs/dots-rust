@@ -26,9 +26,9 @@ use dots_core::{
 };
 use dots_model::{
     DotsCacheInfo, DotsConnectionState, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect,
-    DotsMsgConnectResponse, DotsMsgHello, EnumDescriptorData, RawTransmission, Registry,
-    StructDescriptorData, Transmission, daemon::DotsClient, encode_frame_with_header,
-    encode_transmission_into, encode_transmission_with_mask_into,
+    DotsMsgConnectResponse, DotsMsgHello, DotsServerCapabilities, EnumDescriptorData,
+    RawTransmission, Registry, StructDescriptorData, Transmission, daemon::DotsClient,
+    encode_frame_with_header, encode_transmission_into, encode_transmission_with_mask_into,
 };
 use futures_util::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -766,6 +766,7 @@ impl HostTransceiver {
                                 from_cache: Some(from_cache),
                                 remove_obj: Some(false),
                                 is_from_myself: Some(false),
+                                subscription_id: None,
                             };
                             (header, e.payload.clone())
                         })
@@ -980,6 +981,9 @@ where
         server_name: Some(host.self_name.clone()),
         auth_challenge: Some(0),
         authentication_required: Some(false),
+        capabilities: Some(DotsServerCapabilities {
+            filtered_subscriptions: Some(true),
+        }),
     };
     write_typed(&writer, "DotsMsgHello", &hello);
     tracing::debug!(client_id, "sent Hello");

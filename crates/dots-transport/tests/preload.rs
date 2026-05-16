@@ -78,6 +78,7 @@ async fn preload_server(
         server_name: Some("preload-test".into()),
         auth_challenge: Some(0),
         authentication_required: Some(false),
+        capabilities: None,
     };
     framed
         .send(dynamic_for(&reg, "DotsMsgHello", &hello))
@@ -162,6 +163,7 @@ async fn builder_no_preload_lands_directly_in_connected() {
             server_name: Some("s".into()),
             auth_challenge: Some(0),
             authentication_required: Some(false),
+            capabilities: None,
         };
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
@@ -254,6 +256,7 @@ async fn finish_preload_errors_when_not_in_early_subscribe() {
             server_name: Some("s".into()),
             auth_challenge: Some(0),
             authentication_required: Some(false),
+            capabilities: None,
         };
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
@@ -318,6 +321,7 @@ async fn builder_publishes_struct_and_enum_descriptors_in_order() {
             server_name: Some("s".into()),
             auth_challenge: Some(0),
             authentication_required: Some(false),
+            capabilities: None,
         };
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
