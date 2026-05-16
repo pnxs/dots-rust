@@ -121,6 +121,7 @@ name = "dots-derive"
 version = "0.1.0"
 dependencies = [
  "dots-core",
+ "dots-model",
  "proc-macro2",
  "quote",
  "syn",

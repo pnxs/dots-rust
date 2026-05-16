@@ -17,6 +17,9 @@ syn.workspace = true
 
 [dev-dependencies]
 dots-core.workspace = true
+# Derived code references `::dots_model::filter::Attr` constants per
+# scalar field; integration tests therefore need dots-model in scope.
+dots-model.workspace = true
 
 [lints]
 workspace = true
