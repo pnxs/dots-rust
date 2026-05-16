@@ -15,7 +15,7 @@
 //! listener. Tests can also feed an in-memory duplex stream into
 //! [`accept`](HostTransceiver::accept) directly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -29,7 +29,10 @@ use dots_model::{
     DotsMsgConnectResponse, DotsMsgHello, DotsServerCapabilities, EnumDescriptorData,
     RawTransmission, Registry, StructDescriptorData, Transmission, daemon::DotsClient,
     encode_frame_with_header, encode_transmission_into, encode_transmission_with_mask_into,
+    filter::DotsFilter,
 };
+
+use crate::filter::CompiledPredicate;
 use futures_util::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -270,8 +273,8 @@ pub struct HostTransceiver {
 }
 
 struct HostInner {
-    /// Per-type-name → set of guest ids that have joined the group.
-    groups: FxHashMap<String, FxHashSet<u32>>,
+    /// Per-type-name → membership state for the group.
+    groups: FxHashMap<String, Group>,
     /// Per-guest state, keyed by client id.
     guests: FxHashMap<u32, GuestRecord>,
     /// Monotonic id allocator for new guests. Starts at 2 since 1 is
@@ -283,9 +286,60 @@ struct HostInner {
     pool: FxHashMap<String, BTreeMap<Vec<u8>, CachedEntry>>,
 }
 
+/// Per-type membership state — kept as a struct rather than a bare
+/// set so unfiltered subscribers can take the byte-fan-out hot path
+/// and filtered subscribers can apply the four-cases dispatch in the
+/// same critical section.
+///
+/// The two halves are independent: a single guest may hold both an
+/// unfiltered subscription on `T` (a regular `subscribe::<T>`) and
+/// any number of filtered subscriptions on `T` (multiple
+/// `view::<T>(filter)` opens with distinct `subscription_id`s).
+#[derive(Default)]
+struct Group {
+    /// Guest ids that have unfiltered membership in this group.
+    /// Receives transmissions byte-verbatim from the publish path.
+    unfiltered_subs: FxHashSet<u32>,
+    /// Filtered subscriptions keyed by `(client_id, subscription_id)`.
+    /// One guest may hold multiple filtered subs distinguished by id.
+    filtered_subs: FxHashMap<(u32, u32), FilteredSub>,
+}
+
+impl Group {
+    fn is_empty(&self) -> bool {
+        self.unfiltered_subs.is_empty() && self.filtered_subs.is_empty()
+    }
+
+    fn subscriber_count(&self) -> usize {
+        self.unfiltered_subs.len() + self.filtered_subs.len()
+    }
+}
+
+/// One filtered subscription. Holds the original wire [`DotsFilter`]
+/// (echoed in fan-out for debugging / tracing), the
+/// [`CompiledPredicate`] for fast per-event evaluation, and the
+/// "visible shadow" — the set of cache key-bytes currently in this
+/// view.
+///
+/// The shadow is what makes the four-cases dispatch fire correctly:
+/// comparing pre-merge membership against the post-merge predicate
+/// outcome classifies each publish as `enter / in-view-update /
+/// leave / silent-drop`.
+struct FilteredSub {
+    filter: DotsFilter,
+    compiled: CompiledPredicate,
+    /// Cache key-bytes of instances currently in this view. Mapped
+    /// from the C++ side's `unordered_set<const Struct*>` to Rust's
+    /// stable identity for cached instances (since BTreeMap nodes
+    /// may relocate on insert, pointer-equality isn't safe — but the
+    /// CBOR-encoded key bytes are deterministic and stable).
+    visible: HashSet<Vec<u8>>,
+}
+
 /// One cached instance held in the pool. The payload is stored as the
 /// dynamic struct that arrived on the wire; on replay we re-encode it
 /// with a fresh `header.from_cache` countdown.
+#[derive(Clone)]
 struct CachedEntry {
     payload: DynamicStruct,
     /// Last-update sender (the publisher's `client_id`, or `HOST_ID`
@@ -347,14 +401,17 @@ impl HostTransceiver {
         self.inner.lock().expect("host mutex poisoned").guests.len()
     }
 
-    /// Number of guests subscribed to a given type group.
+    /// Number of subscriptions on a given type group. Counts each
+    /// filtered subscription separately (a single guest holding two
+    /// filtered subs on `T` contributes 2 to the count) plus each
+    /// unfiltered subscriber once.
     pub fn group_size(&self, type_name: &str) -> usize {
         self.inner
             .lock()
             .expect("host mutex poisoned")
             .groups
             .get(type_name)
-            .map(FxHashSet::len)
+            .map(Group::subscriber_count)
             .unwrap_or(0)
     }
 
@@ -585,11 +642,10 @@ impl HostTransceiver {
             server_sent_time: Some(now_timepoint()),
             ..Default::default()
         };
-        self.cache_merge(&type_name, &header, value, mask);
-
+        let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_into(&header, value, &mut bytes);
-        self.fan_out_bytes(&type_name, &bytes, /*exclude*/ HOST_ID);
+        self.cache_and_fan_out(&type_name, &header, &bytes, dyn_payload.as_ref(), HOST_ID);
     }
 
     /// Publish a partial update from the host. Same masking rules as
@@ -607,11 +663,10 @@ impl HostTransceiver {
             server_sent_time: Some(now_timepoint()),
             ..Default::default()
         };
-        self.cache_merge(&type_name, &header, value, mask);
-
+        let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.fan_out_bytes(&type_name, &bytes, /*exclude*/ HOST_ID);
+        self.cache_and_fan_out(&type_name, &header, &bytes, dyn_payload.as_ref(), HOST_ID);
     }
 
     /// Publish a removal from the host. Routes to every guest
@@ -630,38 +685,30 @@ impl HostTransceiver {
             remove_obj: Some(true),
             ..Default::default()
         };
-        self.cache_merge(&type_name, &header, value, mask);
-
+        let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.fan_out_bytes(&type_name, &bytes, /*exclude*/ HOST_ID);
+        self.cache_and_fan_out(&type_name, &header, &bytes, dyn_payload.as_ref(), HOST_ID);
     }
 
-    /// Fold a host-originated value into the cache pool. No-op for
-    /// non-cached types or types not in the registry. Round-trips the
-    /// value through CBOR so `update_cache` sees a `DynamicStruct`
-    /// (whose `key_bytes()` matches the shape used by guest publishes).
-    fn cache_merge<T: Transmittable + ?Sized>(
+    /// Round-trip a typed value through CBOR with the given mask to
+    /// build the matching `DynamicStruct`. Returns `None` for
+    /// unregistered types or when the decode fails (which it
+    /// shouldn't for descriptor-driven encodes — this is the
+    /// belt-and-braces guard).
+    fn payload_as_dynamic<T: Transmittable + ?Sized>(
         &self,
         type_name: &str,
-        header: &DotsHeader,
         value: &T,
         mask: PropertySet,
-    ) {
+    ) -> Option<DynamicStruct> {
         let Some(dots_model::DescriptorEntry::Struct(d)) = self.registry.lookup(type_name) else {
-            return;
+            return None;
         };
-        if !d.flags.is_cached() {
-            return;
-        }
         let mut payload_bytes = Vec::with_capacity(64);
         let mut enc = dots_core::minicbor::Encoder::new(&mut payload_bytes);
-        value
-            .encode_into(mask, &mut enc)
-            .expect("encode infallible");
-        if let Ok(payload) = DynamicStruct::decode(d.clone(), &payload_bytes) {
-            self.update_cache(type_name, header, &payload);
-        }
+        value.encode_into(mask, &mut enc).expect("encode infallible");
+        DynamicStruct::decode(d.clone(), &payload_bytes).ok()
     }
 
     /// Enqueue `bytes` to every subscriber of `type_name` (excluding
@@ -671,12 +718,198 @@ impl HostTransceiver {
     /// async state machine the previous design needed for awaiting
     /// per-subscriber writes — actual socket I/O happens later in
     /// each guest's drainer task.
-    fn fan_out_bytes(&self, type_name: &str, bytes: &[u8], exclude_client_id: u32) {
-        let inner = self.inner.lock().expect("host mutex poisoned");
-        let Some(targets) = inner.groups.get(type_name) else {
+    /// Atomic cache mutation + fan-out, including four-cases
+    /// dispatch to filtered subscribers.
+    ///
+    /// Holds [`Self::inner`] for a single critical section so the
+    /// pre-merge snapshot, cache mutation, and filtered fan-out all
+    /// see the same view of the world. The unfiltered hot path is
+    /// byte-identical to the legacy `fan_out_bytes` flow when no
+    /// filtered subs exist for `type_name` — the per-fan-out
+    /// overhead is one branch on `group.filtered_subs.is_empty()`.
+    ///
+    /// `payload` is the post-merge `DynamicStruct` form of the
+    /// publish (`None` for non-cached types whose group has no
+    /// filtered subs, since no decode is needed in that case). The
+    /// host's own publish helpers pre-decode via CBOR round-trip;
+    /// the guest-fan-out path decodes from the raw payload bytes
+    /// when it sees a cached type or filtered subs.
+    fn cache_and_fan_out(
+        &self,
+        type_name: &str,
+        header: &DotsHeader,
+        raw_frame: &[u8],
+        payload: Option<&DynamicStruct>,
+        exclude_client_id: u32,
+    ) {
+        let mut inner = self.inner.lock().expect("host mutex poisoned");
+
+        let descriptor = match self.registry.lookup(type_name) {
+            Some(dots_model::DescriptorEntry::Struct(d)) => Some(d.clone()),
+            _ => None,
+        };
+        let is_cached = descriptor.as_ref().is_some_and(|d| d.flags.is_cached());
+        let is_remove = header.remove_obj == Some(true);
+        let has_filtered_subs = inner
+            .groups
+            .get(type_name)
+            .is_some_and(|g| !g.filtered_subs.is_empty());
+
+        // Pre-merge snapshot — only needed when at least one filtered
+        // sub exists. For the all-unfiltered case the four-cases
+        // branch is skipped entirely and we pay zero clone cost.
+        let pre_merge_payload: Option<DynamicStruct> = if is_cached && has_filtered_subs {
+            payload.and_then(|p| {
+                let key = p.key_bytes();
+                inner.pool.get(type_name).and_then(|m| m.get(&key)).map(|e| e.payload.clone())
+            })
+        } else {
+            None
+        };
+
+        // Mutate the cache.
+        if is_cached {
+            if let Some(p) = payload {
+                let key = p.key_bytes();
+                let map = inner.pool.entry(type_name.to_string()).or_default();
+                if is_remove {
+                    map.remove(&key);
+                    if map.is_empty() {
+                        inner.pool.remove(type_name);
+                    }
+                } else {
+                    map.insert(
+                        key,
+                        CachedEntry {
+                            payload: p.clone(),
+                            last_update_sender: header.sender,
+                            last_update_time: header.sent_time,
+                            attributes: header.attributes.unwrap_or_default(),
+                        },
+                    );
+                }
+            }
+        }
+
+        // Filtered fan-out: build per-sub outbound bytes while
+        // holding a mutable borrow on the group (we mutate
+        // `visible`). Borrow-check splits `inner.groups` mutably
+        // from `inner.guests` immutably via separate field access
+        // — collect (client_id, bytes) pairs and enqueue after.
+        let mut filtered_outbound: Vec<(u32, Vec<u8>)> = Vec::new();
+        let key_set = descriptor
+            .as_ref()
+            .map(|d| {
+                let mut s = PropertySet::EMPTY;
+                for p in &d.properties {
+                    if p.is_key {
+                        s = s.with_tag(p.tag);
+                    }
+                }
+                s
+            })
+            .unwrap_or(PropertySet::EMPTY);
+        let key_bytes_post = payload.map(|p| p.key_bytes());
+        let key_bytes_pre = pre_merge_payload.as_ref().map(|p| p.key_bytes());
+        // No group entry → no subscribers → cache already mutated
+        // above; nothing more to do.
+        let HostInner { groups, guests, .. } = &mut *inner;
+        let Some(group) = groups.get_mut(type_name) else {
             return;
         };
-        for &id in targets {
+
+        if !group.filtered_subs.is_empty() && payload.is_some() {
+            for ((cid, sub_id), sub) in &mut group.filtered_subs {
+                if *cid == exclude_client_id {
+                    continue;
+                }
+                let post = payload.expect("checked above");
+                let was_visible = key_bytes_pre
+                    .as_ref()
+                    .is_some_and(|k| sub.visible.contains(k));
+                let now_matches = !is_remove && sub.compiled.matches(post);
+
+                match (now_matches, was_visible) {
+                    (true, _) => {
+                        if !was_visible {
+                            if let Some(k) = &key_bytes_post {
+                                sub.visible.insert(k.clone());
+                            }
+                        }
+                        let mask_proj = sub.filter.property_mask.unwrap_or(post.valid_set());
+                        let attrs = header.attributes.unwrap_or(post.valid_set());
+                        let effective = (mask_proj | key_set) & attrs;
+                        let mut h = header.clone();
+                        h.attributes = Some(effective);
+                        h.subscription_id = Some(*sub_id);
+                        // For "enter view" we want the full
+                        // post-merge state projected; we send only
+                        // the bits in `effective`, which already
+                        // excludes anything outside `attrs`. The
+                        // payload encode below honours that mask.
+                        let mut bytes = Vec::with_capacity(64);
+                        encode_transmission_with_mask_into(&h, post, effective, &mut bytes);
+                        filtered_outbound.push((*cid, bytes));
+                    }
+                    (false, true) => {
+                        if let Some(k) = &key_bytes_post {
+                            sub.visible.remove(k);
+                        }
+                        // Leave-view: synthesize a key-only remove
+                        // using the post-merge keys (which equal
+                        // pre-merge keys under the DOTS contract).
+                        // Use the post-merge payload if available;
+                        // otherwise fall back to pre-merge.
+                        let p = payload.or(pre_merge_payload.as_ref()).expect("checked above");
+                        let mut h = header.clone();
+                        h.attributes = Some(key_set);
+                        h.remove_obj = Some(true);
+                        h.subscription_id = Some(*sub_id);
+                        let mut bytes = Vec::with_capacity(64);
+                        encode_transmission_with_mask_into(&h, p, key_set, &mut bytes);
+                        filtered_outbound.push((*cid, bytes));
+                    }
+                    (false, false) => {}
+                }
+            }
+        }
+
+        // Unfiltered fan-out (byte-verbatim).
+        for &id in &group.unfiltered_subs {
+            if id == exclude_client_id {
+                continue;
+            }
+            if let Some(record) = guests.get(&id) {
+                record.write_half.enqueue(raw_frame);
+            }
+        }
+
+        for (cid, bytes) in filtered_outbound {
+            if let Some(record) = guests.get(&cid) {
+                record.write_half.enqueue(&bytes);
+            }
+        }
+    }
+
+    /// Enqueue `bytes` to every unfiltered subscriber of `type_name`
+    /// (excluding `exclude_client_id`). **Synchronous**: holds the
+    /// host inner mutex while iterating subscribers and calling
+    /// each writer's `enqueue` (which takes its own short-held
+    /// mutex). Avoids the async state machine the previous design
+    /// needed for awaiting per-subscriber writes — actual socket
+    /// I/O happens later in each guest's drainer task.
+    ///
+    /// Filtered subscribers are NOT touched here. They are addressed
+    /// by [`Self::cache_and_fan_out`] which evaluates the
+    /// four-cases transition logic and re-encodes the payload with
+    /// each subscription's projection mask.
+    #[allow(dead_code)] // retained for tests / callers that don't need filtering
+    fn fan_out_bytes(&self, type_name: &str, bytes: &[u8], exclude_client_id: u32) {
+        let inner = self.inner.lock().expect("host mutex poisoned");
+        let Some(group) = inner.groups.get(type_name) else {
+            return;
+        };
+        for &id in &group.unfiltered_subs {
             if id == exclude_client_id {
                 continue;
             }
@@ -699,35 +932,8 @@ impl HostTransceiver {
             .groups
             .entry(group_name.to_string())
             .or_default()
+            .unfiltered_subs
             .insert(client_id);
-    }
-
-    /// Update the cache pool for a `cached` type. Called after the
-    /// host has decided to fan out a transmission. Insert/update on
-    /// normal publish, remove on `header.remove_obj == Some(true)`.
-    fn update_cache(&self, type_name: &str, header: &DotsHeader, payload: &DynamicStruct) {
-        if !payload.descriptor.flags.is_cached() {
-            return;
-        }
-        let key = payload.key_bytes();
-        let mut inner = self.inner.lock().expect("host mutex poisoned");
-        let map = inner.pool.entry(type_name.to_string()).or_default();
-        if header.remove_obj == Some(true) {
-            map.remove(&key);
-            if map.is_empty() {
-                inner.pool.remove(type_name);
-            }
-            return;
-        }
-        map.insert(
-            key,
-            CachedEntry {
-                payload: payload.clone(),
-                last_update_sender: header.sender,
-                last_update_time: header.sent_time,
-                attributes: header.attributes.unwrap_or_default(),
-            },
-        );
     }
 
     /// Replay the cached entries for `type_name` to the guest with
@@ -818,11 +1024,166 @@ impl HostTransceiver {
     fn leave_group(&self, client_id: u32, group_name: &str) {
         let mut inner = self.inner.lock().expect("host mutex poisoned");
         if let Some(g) = inner.groups.get_mut(group_name) {
-            g.remove(&client_id);
+            g.unfiltered_subs.remove(&client_id);
             if g.is_empty() {
                 inner.groups.remove(group_name);
             }
         }
+    }
+
+    /// Remove a single filtered subscription identified by
+    /// `(client_id, subscription_id)`. Prunes the enclosing group
+    /// entry when no unfiltered or filtered subscribers remain.
+    fn leave_filtered_sub(&self, client_id: u32, group_name: &str, subscription_id: u32) {
+        let mut inner = self.inner.lock().expect("host mutex poisoned");
+        if let Some(g) = inner.groups.get_mut(group_name) {
+            g.filtered_subs.remove(&(client_id, subscription_id));
+            if g.is_empty() {
+                inner.groups.remove(group_name);
+            }
+        }
+    }
+
+    /// Compile the predicate for a filtered-join request, install
+    /// the [`FilteredSub`], and preload matching cache entries to
+    /// the requesting guest.
+    ///
+    /// On validation failure (unknown property, type mismatch, etc.)
+    /// the join is logged and dropped — the guest's View<T> never
+    /// sees any traffic and will time out / detect the failure via
+    /// its own preload-completion expectations.
+    fn handle_filtered_join(
+        &self,
+        client_id: u32,
+        group_name: &str,
+        subscription_id: u32,
+        filter: DotsFilter,
+    ) {
+        let descriptor = match self.registry.lookup(group_name) {
+            Some(dots_model::DescriptorEntry::Struct(d)) => d.clone(),
+            _ => {
+                tracing::warn!(
+                    client_id,
+                    group_name,
+                    subscription_id,
+                    "filtered join for unknown type; dropping"
+                );
+                return;
+            }
+        };
+        let empty_predicate = dots_model::DotsPredicate::default();
+        let predicate = filter.predicate.as_ref().unwrap_or(&empty_predicate);
+        let compiled = match CompiledPredicate::compile(predicate, &descriptor) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    client_id,
+                    group_name,
+                    subscription_id,
+                    error = %e,
+                    "filtered join failed predicate compilation; dropping"
+                );
+                return;
+            }
+        };
+
+        // Build the FilteredSub, populate `visible` during preload.
+        let mut sub = FilteredSub {
+            filter: filter.clone(),
+            compiled,
+            visible: HashSet::new(),
+        };
+
+        // Compute the key-set + projection mask once.
+        let mut key_set = PropertySet::EMPTY;
+        for p in &descriptor.properties {
+            if p.is_key {
+                key_set = key_set.with_tag(p.tag);
+            }
+        }
+        let project = filter.property_mask.unwrap_or(PropertySet::from_bits(u32::MAX));
+
+        // Snapshot matching cache entries (two-pass so the
+        // `from_cache` countdown is accurate). Also grab the
+        // guest's writer.
+        let (writer, matches): (Option<SharedWriter>, Vec<(DotsHeader, DynamicStruct, Vec<u8>)>) = {
+            let inner = self.inner.lock().expect("host mutex poisoned");
+            let writer = inner.guests.get(&client_id).map(|r| r.write_half.clone());
+            let mut out = Vec::new();
+            if let Some(map) = inner.pool.get(group_name) {
+                for (k, e) in map.iter() {
+                    if sub.compiled.matches(&e.payload) {
+                        let attrs = e.attributes;
+                        let effective = (project | key_set) & attrs;
+                        let header = DotsHeader {
+                            type_name: Some(group_name.to_string()),
+                            sent_time: e.last_update_time,
+                            server_sent_time: Some(now_timepoint()),
+                            attributes: Some(effective),
+                            sender: e.last_update_sender,
+                            from_cache: Some(0),
+                            remove_obj: Some(false),
+                            is_from_myself: Some(false),
+                            subscription_id: Some(subscription_id),
+                        };
+                        out.push((header, e.payload.clone(), k.clone()));
+                    }
+                }
+            }
+            (writer, out)
+        };
+
+        // Populate `visible` to reflect what we just preloaded.
+        for (_, _, k) in &matches {
+            sub.visible.insert(k.clone());
+        }
+
+        // Insert the sub now (so any concurrent publish on this
+        // type is dispatched to it). Insertion happens AFTER the
+        // preload snapshot so we don't double-deliver in the
+        // unlikely race where a publish lands between snapshot and
+        // insert — those are picked up by the publish path's
+        // four-cases logic instead.
+        {
+            let mut inner = self.inner.lock().expect("host mutex poisoned");
+            inner
+                .groups
+                .entry(group_name.to_string())
+                .or_default()
+                .filtered_subs
+                .insert((client_id, subscription_id), sub);
+        }
+
+        let Some(writer) = writer else {
+            return;
+        };
+
+        // Stream matched entries with descending `from_cache`
+        // countdown, terminated by `DotsCacheInfo{end_transmission}`.
+        let total = matches.len();
+        let mut buf = Vec::with_capacity(128 + total * 96);
+        for (i, (mut header, payload, _k)) in matches.into_iter().enumerate() {
+            header.from_cache = Some((total - 1 - i) as u32);
+            let mask = header.attributes.unwrap_or(payload.valid_set());
+            encode_transmission_with_mask_into(&header, &payload, mask, &mut buf);
+        }
+        let info = DotsCacheInfo {
+            type_name: Some(group_name.into()),
+            end_transmission: Some(true),
+            ..Default::default()
+        };
+        // Terminator carries no subscription_id — matches dots-cpp
+        // wire (the receiver routes it through the global
+        // dispatcher, not through the View). See HostTransceiver.cpp
+        // in dots-cpp branch server-side-filtering.
+        let header = DotsHeader {
+            type_name: Some("DotsCacheInfo".into()),
+            attributes: Some(Transmittable::valid_set(&info)),
+            sender: Some(HOST_ID),
+            ..Default::default()
+        };
+        encode_transmission_into(&header, &info, &mut buf);
+        writer.enqueue(&buf);
     }
 
     fn remove_guest(&self, client_id: u32) {
@@ -843,7 +1204,8 @@ impl HostTransceiver {
                 .and_then(|r| r.client_name.clone());
             inner.guests.remove(&client_id);
             for g in inner.groups.values_mut() {
-                g.remove(&client_id);
+                g.unfiltered_subs.remove(&client_id);
+                g.filtered_subs.retain(|(cid, _), _| *cid != client_id);
             }
             inner.groups.retain(|_, g| !g.is_empty());
             name
@@ -855,17 +1217,19 @@ impl HostTransceiver {
     }
 
     /// Walk the cache pool for entries owned by `client_id` whose
-    /// type carries the `[cleanup]` flag, drop them from the pool,
-    /// and fan a removal transmission out to existing subscribers.
-    /// Mirrors dots-cpp's "auto-remove instances of cleanup-flagged
-    /// types when their publisher disconnects" semantics.
+    /// type carries the `[cleanup]` flag, build synthetic removal
+    /// transmissions for each, and route them through the standard
+    /// `cache_and_fan_out` path so the pool mutation, unfiltered
+    /// fan-out, and filtered four-cases all happen atomically per
+    /// entry. Mirrors dots-cpp's "auto-remove instances of cleanup-
+    /// flagged types when their publisher disconnects" semantics.
     fn cleanup_entries_for_guest(&self, client_id: u32) {
-        let to_publish: Vec<Transmission> = {
-            let mut inner = self.inner.lock().expect("host mutex poisoned");
-
-            // Find which type-names are `[cleanup]` flagged. Collect
-            // names first (avoid holding the registry lock while we
-            // hold inner).
+        // Pass 1: identify the cleanup-eligible entries without
+        // mutating the pool. We need the payload (for filter
+        // evaluation) snapshot before `cache_and_fan_out` removes
+        // them on our behalf.
+        let to_remove: Vec<(String, CachedEntry)> = {
+            let inner = self.inner.lock().expect("host mutex poisoned");
             let cleanup_types: Vec<String> = inner
                 .pool
                 .keys()
@@ -878,37 +1242,40 @@ impl HostTransceiver {
                 })
                 .cloned()
                 .collect();
-
-            let mut out = Vec::new();
+            let mut out: Vec<(String, CachedEntry)> = Vec::new();
             for type_name in cleanup_types {
-                let Some(map) = inner.pool.get_mut(&type_name) else {
-                    continue;
-                };
-                let keys_to_remove: Vec<Vec<u8>> = map
-                    .iter()
-                    .filter(|(_, e)| e.last_update_sender == Some(client_id))
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                for key in keys_to_remove {
-                    if let Some(entry) = map.remove(&key) {
-                        out.push(removal_txn(&type_name, entry));
+                if let Some(map) = inner.pool.get(&type_name) {
+                    for (_k, entry) in map.iter() {
+                        if entry.last_update_sender == Some(client_id) {
+                            out.push((type_name.clone(), entry.clone()));
+                        }
                     }
-                }
-                if map.is_empty() {
-                    inner.pool.remove(&type_name);
                 }
             }
             out
         };
 
-        if !to_publish.is_empty() {
+        if !to_remove.is_empty() {
             tracing::debug!(
                 client_id,
-                count = to_publish.len(),
+                count = to_remove.len(),
                 "publishing cleanup removals for departing guest"
             );
         }
-        self.fan_out_removals(to_publish);
+        for (type_name, entry) in to_remove {
+            let txn = removal_txn(&type_name, entry);
+            self.route_synthetic_removal(&type_name, txn);
+        }
+    }
+
+    /// Encode a synthetic removal transmission and route it through
+    /// [`Self::cache_and_fan_out`] — does the pool removal,
+    /// unfiltered byte fanout, and filtered four-cases dispatch in
+    /// one critical section per entry.
+    fn route_synthetic_removal(&self, type_name: &str, txn: Transmission) {
+        let mut buf = Vec::with_capacity(64);
+        txn.encode_into(&mut buf);
+        self.cache_and_fan_out(type_name, &txn.header, &buf, Some(&txn.payload), HOST_ID);
     }
 
     /// Snapshot the per-guest writer for `client_id`. Returns `None`
@@ -924,15 +1291,14 @@ impl HostTransceiver {
             .map(|r| r.write_half.clone())
     }
 
-    /// Encode each removal transmission and route it to subscribers,
-    /// excluding the host itself. Shared by `cleanup_entries_for_guest`
-    /// and `handle_clear_cache`.
+    /// Encode each removal transmission and route it through
+    /// `cache_and_fan_out` so both unfiltered and filtered subs see
+    /// the leave. Shared by `cleanup_entries_for_guest` and
+    /// `handle_clear_cache`.
     fn fan_out_removals(&self, txns: Vec<Transmission>) {
         for txn in txns {
             let type_name = txn.header.type_name.clone().unwrap_or_default();
-            let mut buf = Vec::with_capacity(64);
-            txn.encode_into(&mut buf);
-            self.fan_out_bytes(&type_name, &buf, HOST_ID);
+            self.route_synthetic_removal(&type_name, txn);
         }
     }
 
@@ -1186,30 +1552,48 @@ fn handle_connected_message(
         header.is_from_myself = Some(false);
     }
 
-    // Cache merge — only cached types pay the payload-decode cost.
-    // Non-cached types skip the dynamic round-trip entirely.
-    if let Some(dots_model::DescriptorEntry::Struct(d)) = host.registry.lookup(type_name) {
-        if d.flags.is_cached() {
-            match DynamicStruct::decode(d.clone(), &raw.payload) {
-                Ok(payload) => host.update_cache(type_name, &header, &payload),
-                Err(e) => {
-                    tracing::warn!(
-                        client_id,
-                        type_name,
-                        error = %e,
-                        "failed to decode payload for cache update; skipping cache merge",
-                    );
-                }
+    // Decode the payload to `DynamicStruct` only if needed — i.e.
+    // the type is cached (cache merge needs the dynamic form) or
+    // any filtered subscription exists (filter evaluation needs
+    // it). Non-cached types with no filtered subs skip the decode
+    // entirely; their fan-out is purely byte-verbatim.
+    let descriptor = match host.registry.lookup(type_name) {
+        Some(dots_model::DescriptorEntry::Struct(d)) => Some(d.clone()),
+        _ => None,
+    };
+    let is_cached = descriptor.as_ref().is_some_and(|d| d.flags.is_cached());
+    let needs_dynamic = is_cached || {
+        let inner = host.inner.lock().expect("host mutex poisoned");
+        inner
+            .groups
+            .get(type_name)
+            .is_some_and(|g| !g.filtered_subs.is_empty())
+    };
+    let dyn_payload = if needs_dynamic {
+        match (&descriptor, DynamicStruct::decode(descriptor.clone().unwrap_or_else(|| panic!("descriptor present")), &raw.payload)) {
+            (Some(_), Ok(p)) => Some(p),
+            (Some(_), Err(e)) => {
+                tracing::warn!(
+                    client_id,
+                    type_name,
+                    error = %e,
+                    "failed to decode payload for cache/filter dispatch; falling back to unfiltered fan-out",
+                );
+                None
             }
+            _ => None,
         }
-    }
+    } else {
+        None
+    };
 
-    // Fan-out: re-encode the (small) header, splice in the payload
-    // bytes verbatim. No DynamicStruct allocation, no CBOR walk over
-    // the payload.
+    // Encode the framed bytes for the unfiltered fast path: re-encode
+    // the (small) header, splice in the payload bytes verbatim. No
+    // DynamicStruct allocation needed, no CBOR walk over the payload.
     let mut buf = Vec::with_capacity(FRAME_OVERHEAD_HINT + raw.payload.len());
     encode_frame_with_header(&header, &raw.payload, &mut buf);
-    host.fan_out_bytes(type_name, &buf, 0);
+
+    host.cache_and_fan_out(type_name, &header, &buf, dyn_payload.as_ref(), 0);
 }
 
 /// Capacity hint for the per-frame overhead (4-byte size prefix +
@@ -1347,15 +1731,17 @@ fn handle_clear_cache(host: &Arc<HostTransceiver>, raw: &RawTransmission) {
         return;
     };
 
+    // Snapshot the entries to remove (without mutating the pool) —
+    // `route_synthetic_removal` will perform the actual pool
+    // removal + four-cases fan-out atomically per entry.
     let to_publish: Vec<Transmission> = {
-        let mut inner = host.inner.lock().expect("host mutex poisoned");
+        let inner = host.inner.lock().expect("host mutex poisoned");
         let mut out = Vec::new();
         for type_name in &type_names {
-            let Some(map) = inner.pool.remove(type_name) else {
-                continue;
-            };
-            for (_, entry) in map {
-                out.push(removal_txn(type_name, entry));
+            if let Some(map) = inner.pool.get(type_name) {
+                for (_, entry) in map.iter() {
+                    out.push(removal_txn(type_name, entry.clone()));
+                }
             }
         }
         out
@@ -1446,19 +1832,51 @@ fn handle_member(host: &Arc<HostTransceiver>, client_id: u32, raw: &RawTransmiss
             return;
         }
     };
-    let Some(group_name) = member.group_name.as_deref() else {
+    let Some(group_name) = member.group_name.clone() else {
         tracing::warn!(client_id, "DotsMember missing group_name");
         return;
     };
+    let group_name = group_name.as_str();
+    let has_filter = member.filter.is_some();
+    let has_sub_id = member.subscription_id.is_some();
     match member.event {
         Some(DotsMemberEvent::Join) => {
-            host.join_group(client_id, group_name);
-            tracing::debug!(client_id, group_name, "guest joined group");
-            host.replay_cache_to(client_id, group_name);
+            match (member.filter, member.subscription_id) {
+                (Some(filter), Some(sub_id)) => {
+                    host.handle_filtered_join(client_id, group_name, sub_id, filter);
+                }
+                (None, None) => {
+                    host.join_group(client_id, group_name);
+                    tracing::debug!(client_id, group_name, "guest joined group");
+                    host.replay_cache_to(client_id, group_name);
+                }
+                _ => {
+                    tracing::warn!(
+                        client_id,
+                        group_name,
+                        has_filter,
+                        has_sub_id,
+                        "DotsMember(Join) with inconsistent filter/subscription_id; dropped"
+                    );
+                }
+            }
         }
         Some(DotsMemberEvent::Leave) => {
-            host.leave_group(client_id, group_name);
-            tracing::debug!(client_id, group_name, "guest left group");
+            match member.subscription_id {
+                Some(sub_id) => {
+                    host.leave_filtered_sub(client_id, group_name, sub_id);
+                    tracing::debug!(
+                        client_id,
+                        group_name,
+                        sub_id,
+                        "guest left filtered subscription"
+                    );
+                }
+                None => {
+                    host.leave_group(client_id, group_name);
+                    tracing::debug!(client_id, group_name, "guest left group");
+                }
+            }
         }
         Some(DotsMemberEvent::Kill) | None => {
             tracing::warn!(client_id, ?member.event, "ignored DotsMember event");
