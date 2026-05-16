@@ -101,6 +101,7 @@ dependencies = [
 name = "dots-core"
 version = "0.1.0"
 dependencies = [
+ "dots-derive",
  "linkme",
  "minicbor",
 ]

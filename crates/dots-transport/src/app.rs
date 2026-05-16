@@ -13,7 +13,7 @@
 //! tokio::spawn(async move {
 //!     loop {
 //!         tokio::time::sleep(Duration::from_secs(1)).await;
-//!         client.publish(&Pinger { id: Some(1), ..Default::default() }).ok();
+//!         client.publish(&dots!(Pinger { id: 1_u32 })).ok();
 //!     }
 //! });
 //!

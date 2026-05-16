@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use dots_core::dots;
 use dots_derive::DotsStruct;
 use dots_model::{Registry, filter::predicate, registry_with_internal_types};
 use dots_transport::{ConnectionBuilder, GuestTransceiver, HostTransceiver, ViewOp};
@@ -101,11 +102,11 @@ async fn view_four_cases_enter_update_leave_reenter() {
         (42u64, "reenter"),
     ];
     for (seq, _label) in &publishes {
-        gt_b.publish(&Pinger {
-            id: Some(key),
-            message: Some("ignored by projection".into()),
-            sequence: Some(*seq),
-        });
+        gt_b.publish(&dots!(Pinger {
+            id: key,
+            message: "ignored by projection",
+            sequence: *seq,
+        }));
         tokio::time::sleep(Duration::from_millis(80)).await;
     }
 
@@ -227,9 +228,9 @@ async fn view_preload_from_existing_cache() {
     );
     let driver_b_handle = tokio::spawn(driver_b.run());
 
-    gt_b.publish(&Pinger { id: Some(1), message: Some("a".into()), sequence: Some(10) });
-    gt_b.publish(&Pinger { id: Some(2), message: Some("b".into()), sequence: Some(200) }); // out of view
-    gt_b.publish(&Pinger { id: Some(3), message: Some("c".into()), sequence: Some(50) });
+    gt_b.publish(&dots!(Pinger { id: 1_u32, message: "a", sequence: 10_u64 }));
+    gt_b.publish(&dots!(Pinger { id: 2_u32, message: "b", sequence: 200_u64 })); // out of view
+    gt_b.publish(&dots!(Pinger { id: 3_u32, message: "c", sequence: 50_u64 }));
 
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(20)).await;

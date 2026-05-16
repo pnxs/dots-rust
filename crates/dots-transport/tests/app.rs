@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use dots_core::{StructValue, decode_typed_from_slice, encode_to_vec};
+use dots_core::{StructValue, decode_typed_from_slice, dots, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello, Registry,
@@ -38,10 +38,9 @@ fn registry() -> Arc<Registry> {
 }
 
 fn dynamic_for(reg: &Registry, type_name: &str, payload: &dyn StructValue) -> Transmission {
-    let header = DotsHeader {
-        type_name: Some(type_name.into()),
-        ..Default::default()
-    };
+    let header = dots!(DotsHeader {
+        type_name: type_name,
+    });
     let descriptor = match reg.lookup(type_name).expect("type registered") {
         dots_model::DescriptorEntry::Struct(d) => d.clone(),
         _ => panic!(),
@@ -73,12 +72,11 @@ async fn handshake_with_preload(
     reg: &Arc<Registry>,
 ) -> Vec<String> {
     // Hello
-    let hello = DotsMsgHello {
-        server_name: Some("test-dotsd".into()),
-        auth_challenge: Some(0),
-        authentication_required: Some(false),
-        capabilities: None,
-    };
+    let hello = dots!(DotsMsgHello {
+        server_name: "test-dotsd",
+        auth_challenge: 0_u64,
+        authentication_required: false,
+    });
     framed
         .send(dynamic_for(reg, "DotsMsgHello", &hello))
         .await
@@ -91,13 +89,13 @@ async fn handshake_with_preload(
     assert_eq!(connect.preload_cache, Some(true));
 
     // Initial ConnectResponse (preload=true).
-    let response = DotsMsgConnectResponse {
-        server_name: Some("test-dotsd".into()),
-        client_id: Some(42),
-        accepted: Some(true),
-        preload: Some(true),
-        preload_finished: Some(false),
-    };
+    let response = dots!(DotsMsgConnectResponse {
+        server_name: "test-dotsd",
+        client_id: 42_u32,
+        accepted: true,
+        preload: true,
+        preload_finished: false,
+    });
     framed
         .send(dynamic_for(reg, "DotsMsgConnectResponse", &response))
         .await
@@ -129,13 +127,13 @@ async fn handshake_with_preload(
     }
 
     // Final ConnectResponse (preload_finished=true).
-    let response = DotsMsgConnectResponse {
-        server_name: Some("test-dotsd".into()),
-        client_id: Some(42),
-        accepted: Some(true),
-        preload: Some(true),
-        preload_finished: Some(true),
-    };
+    let response = dots!(DotsMsgConnectResponse {
+        server_name: "test-dotsd",
+        client_id: 42_u32,
+        accepted: true,
+        preload: true,
+        preload_finished: true,
+    });
     framed
         .send(dynamic_for(reg, "DotsMsgConnectResponse", &response))
         .await
@@ -204,15 +202,14 @@ async fn callback_subscription_receives_events() {
 
         // Push two Pingers.
         for id in 1..=2u32 {
-            let p = Pinger {
-                id: Some(id),
-                message: Some(format!("msg-{id}")),
-            };
-            let header = DotsHeader {
-                type_name: Some("Pinger".into()),
-                attributes: Some(p.valid_set()),
-                ..Default::default()
-            };
+            let p = dots!(Pinger {
+                id: id,
+                message: format!("msg-{id}"),
+            });
+            let header = dots!(DotsHeader {
+                type_name: "Pinger",
+                attributes: p.valid_set(),
+            });
             framed
                 .get_mut()
                 .write_all(&encode_transmission(&header, &p))
@@ -257,15 +254,14 @@ async fn client_publish_from_handler_reaches_server() {
         handshake_with_preload(&mut framed, &reg).await;
 
         // Trigger event: push a Pinger that the client's handler will react to.
-        let trigger = Pinger {
-            id: Some(1),
-            message: Some("trigger".into()),
-        };
-        let header = DotsHeader {
-            type_name: Some("Pinger".into()),
-            attributes: Some(trigger.valid_set()),
-            ..Default::default()
-        };
+        let trigger = dots!(Pinger {
+            id: 1_u32,
+            message: "trigger",
+        });
+        let header = dots!(DotsHeader {
+            type_name: "Pinger",
+            attributes: trigger.valid_set(),
+        });
         framed
             .get_mut()
             .write_all(&encode_transmission(&header, &trigger))
@@ -298,10 +294,10 @@ async fn client_publish_from_handler_reaches_server() {
     let client_in_handler = client.clone();
     app.subscribe::<Pinger>(move |event| {
         if event.value.id == Some(1) {
-            let _ = client_in_handler.publish(&Pinger {
-                id: Some(2),
-                message: Some("reply".into()),
-            });
+            let _ = client_in_handler.publish(&dots!(Pinger {
+                id: 2_u32,
+                message: "reply",
+            }));
         }
     })
     .discard();
@@ -323,15 +319,14 @@ async fn container_alongside_callback_both_update() {
         handshake_with_preload(&mut framed, &reg).await;
 
         for id in 1..=3u32 {
-            let p = Pinger {
-                id: Some(id),
-                message: Some(format!("msg-{id}")),
-            };
-            let header = DotsHeader {
-                type_name: Some("Pinger".into()),
-                attributes: Some(p.valid_set()),
-                ..Default::default()
-            };
+            let p = dots!(Pinger {
+                id: id,
+                message: format!("msg-{id}"),
+            });
+            let header = dots!(DotsHeader {
+                type_name: "Pinger",
+                attributes: p.valid_set(),
+            });
             framed
                 .get_mut()
                 .write_all(&encode_transmission(&header, &p))
@@ -380,15 +375,14 @@ async fn dropping_subscription_handle_unsubscribes() {
             if delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
-            let p = Pinger {
-                id: Some(id),
-                message: Some(format!("msg-{id}")),
-            };
-            let header = DotsHeader {
-                type_name: Some("Pinger".into()),
-                attributes: Some(p.valid_set()),
-                ..Default::default()
-            };
+            let p = dots!(Pinger {
+                id: id,
+                message: format!("msg-{id}"),
+            });
+            let header = dots!(DotsHeader {
+                type_name: "Pinger",
+                attributes: p.valid_set(),
+            });
             framed
                 .get_mut()
                 .write_all(&encode_transmission(&header, &p))

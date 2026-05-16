@@ -20,7 +20,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use dots_core::{StructValue, decode_typed_from_slice, encode_key_bytes};
+use dots_core::{StructValue, decode_typed_from_slice, dots, encode_key_bytes};
 use dots_model::{DotsHeader, Transmission, filter::DotsFilter};
 
 use crate::connection::ViewDispatch;
@@ -282,17 +282,16 @@ where
         // entries with synthetic Create-shaped events.
         let snapshot: Vec<ContainerEntry<T>> = self.state.container.snapshot();
         for entry in snapshot {
-            let header = DotsHeader {
-                type_name: Some(self.type_name.clone()),
-                attributes: Some(<T as dots_core::Transmittable>::valid_set(&entry.value)),
+            let header = dots!(DotsHeader {
+                type_name: self.type_name.clone(),
+                attributes: <T as dots_core::Transmittable>::valid_set(&entry.value),
                 sender: entry.clone_info.last_update_sender,
                 sent_time: entry.clone_info.last_update_time,
-                from_cache: Some(0),
-                remove_obj: Some(false),
-                is_from_myself: Some(false),
-                subscription_id: Some(self.subscription_id),
-                ..Default::default()
-            };
+                from_cache: 0_u32,
+                remove_obj: false,
+                is_from_myself: false,
+                subscription_id: self.subscription_id,
+            });
             handler(&ViewEvent {
                 header,
                 value: entry.value,

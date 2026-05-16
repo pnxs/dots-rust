@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use dots_core::{StructValue, decode_typed_from_slice, encode_to_vec};
+use dots_core::{StructValue, decode_typed_from_slice, dots, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
@@ -46,11 +46,10 @@ fn registry() -> Arc<Registry> {
 }
 
 fn dynamic_for(reg: &Registry, type_name: &str, payload: &dyn StructValue) -> Transmission {
-    let header = DotsHeader {
-        type_name: Some(type_name.into()),
-        sender: Some(1),
-        ..Default::default()
-    };
+    let header = dots!(DotsHeader {
+        type_name: type_name,
+        sender: 1_u32,
+    });
     let descriptor = match reg.lookup(type_name).expect("type registered") {
         dots_model::DescriptorEntry::Struct(d) => d.clone(),
         _ => panic!("expected struct entry for {type_name}"),
@@ -74,12 +73,11 @@ async fn preload_server(
     let mut framed = Framed::new(server_io, codec);
 
     // Hello.
-    let hello = DotsMsgHello {
-        server_name: Some("preload-test".into()),
-        auth_challenge: Some(0),
-        authentication_required: Some(false),
-        capabilities: None,
-    };
+    let hello = dots!(DotsMsgHello {
+        server_name: "preload-test",
+        auth_challenge: 0_u64,
+        authentication_required: false,
+    });
     framed
         .send(dynamic_for(&reg, "DotsMsgHello", &hello))
         .await
@@ -92,13 +90,13 @@ async fn preload_server(
     assert_eq!(connect.preload_cache, Some(true));
 
     // Initial ConnectResponse (preload=true).
-    let response = DotsMsgConnectResponse {
-        server_name: Some("preload-test".into()),
-        client_id: Some(42),
-        accepted: Some(true),
-        preload: Some(true),
-        preload_finished: Some(false),
-    };
+    let response = dots!(DotsMsgConnectResponse {
+        server_name: "preload-test",
+        client_id: 42_u32,
+        accepted: true,
+        preload: true,
+        preload_finished: false,
+    });
     framed
         .send(dynamic_for(&reg, "DotsMsgConnectResponse", &response))
         .await
@@ -124,24 +122,23 @@ async fn preload_server(
     let total = cached_pingers.len() as u32;
     for (i, pinger) in cached_pingers.iter().enumerate() {
         let remaining = total - 1 - i as u32;
-        let header = DotsHeader {
-            type_name: Some("Pinger".into()),
-            sender: Some(99),
-            from_cache: Some(remaining),
-            ..Default::default()
-        };
+        let header = dots!(DotsHeader {
+            type_name: "Pinger",
+            sender: 99_u32,
+            from_cache: remaining,
+        });
         let frame = encode_transmission(&header, pinger);
         framed.get_mut().write_all(&frame).await.unwrap();
     }
 
     // Final ConnectResponse (preload_finished=true).
-    let response = DotsMsgConnectResponse {
-        server_name: Some("preload-test".into()),
-        client_id: Some(42),
-        accepted: Some(true),
-        preload: Some(true),
-        preload_finished: Some(true),
-    };
+    let response = dots!(DotsMsgConnectResponse {
+        server_name: "preload-test",
+        client_id: 42_u32,
+        accepted: true,
+        preload: true,
+        preload_finished: true,
+    });
     framed
         .send(dynamic_for(&reg, "DotsMsgConnectResponse", &response))
         .await
@@ -159,12 +156,11 @@ async fn builder_no_preload_lands_directly_in_connected() {
     let server = tokio::spawn(async move {
         let codec = TransmissionCodec::new(server_reg.clone());
         let mut framed = Framed::new(server_io, codec);
-        let hello = DotsMsgHello {
-            server_name: Some("s".into()),
-            auth_challenge: Some(0),
-            authentication_required: Some(false),
-            capabilities: None,
-        };
+        let hello = dots!(DotsMsgHello {
+            server_name: "s",
+            auth_challenge: 0_u64,
+            authentication_required: false,
+        });
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
             .await
@@ -174,12 +170,11 @@ async fn builder_no_preload_lands_directly_in_connected() {
         let bytes = txn.payload.encode();
         let connect: DotsMsgConnect = decode_typed_from_slice(&bytes).unwrap();
         assert_eq!(connect.preload_cache, Some(false));
-        let response = DotsMsgConnectResponse {
-            client_id: Some(7),
-            accepted: Some(true),
-            preload: Some(false),
-            ..Default::default()
-        };
+        let response = dots!(DotsMsgConnectResponse {
+            client_id: 7_u32,
+            accepted: true,
+            preload: false,
+        });
         framed
             .send(dynamic_for(
                 &server_reg,
@@ -206,14 +201,14 @@ async fn builder_with_preload_lands_in_early_subscribe_then_finishes() {
     let reg = registry();
 
     let cached = vec![
-        Pinger {
-            id: Some(1),
-            message: Some("cached-1".into()),
-        },
-        Pinger {
-            id: Some(2),
-            message: Some("cached-2".into()),
-        },
+        dots!(Pinger {
+            id: 1_u32,
+            message: "cached-1",
+        }),
+        dots!(Pinger {
+            id: 2_u32,
+            message: "cached-2",
+        }),
     ];
     let server = tokio::spawn(preload_server(server_io, reg.clone(), cached.clone()));
 
@@ -252,23 +247,21 @@ async fn finish_preload_errors_when_not_in_early_subscribe() {
     let server = tokio::spawn(async move {
         let codec = TransmissionCodec::new(server_reg.clone());
         let mut framed = Framed::new(server_io, codec);
-        let hello = DotsMsgHello {
-            server_name: Some("s".into()),
-            auth_challenge: Some(0),
-            authentication_required: Some(false),
-            capabilities: None,
-        };
+        let hello = dots!(DotsMsgHello {
+            server_name: "s",
+            auth_challenge: 0_u64,
+            authentication_required: false,
+        });
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
             .await
             .unwrap();
         let _connect = framed.next().await.unwrap().unwrap();
-        let response = DotsMsgConnectResponse {
-            client_id: Some(1),
-            accepted: Some(true),
-            preload: Some(false),
-            ..Default::default()
-        };
+        let response = dots!(DotsMsgConnectResponse {
+            client_id: 1_u32,
+            accepted: true,
+            preload: false,
+        });
         framed
             .send(dynamic_for(
                 &server_reg,
@@ -317,23 +310,21 @@ async fn builder_publishes_struct_and_enum_descriptors_in_order() {
     let server = tokio::spawn(async move {
         let codec = TransmissionCodec::new(server_reg.clone());
         let mut framed = Framed::new(server_io, codec);
-        let hello = DotsMsgHello {
-            server_name: Some("s".into()),
-            auth_challenge: Some(0),
-            authentication_required: Some(false),
-            capabilities: None,
-        };
+        let hello = dots!(DotsMsgHello {
+            server_name: "s",
+            auth_challenge: 0_u64,
+            authentication_required: false,
+        });
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
             .await
             .unwrap();
         let _connect = framed.next().await.unwrap().unwrap();
-        let response = DotsMsgConnectResponse {
-            client_id: Some(1),
-            accepted: Some(true),
-            preload: Some(false),
-            ..Default::default()
-        };
+        let response = dots!(DotsMsgConnectResponse {
+            client_id: 1_u32,
+            accepted: true,
+            preload: false,
+        });
         framed
             .send(dynamic_for(
                 &server_reg,

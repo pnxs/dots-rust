@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use dots_core::dots;
 use dots_derive::DotsStruct;
 use dots_model::filter::predicate;
 use dots_transport::{App, ViewOp};
@@ -131,11 +132,11 @@ async fn main() -> ExitCode {
     tokio::spawn(async move {
         for (sequence, msg) in publishes {
             println!("publish  id={key}  seq={sequence}  msg='{msg}'");
-            client.publish(&Pinger {
-                id: Some(key),
-                message: Some(msg.into()),
-                sequence: Some(sequence),
-            });
+            client.publish(&dots!(Pinger {
+                id: key,
+                message: msg,
+                sequence: sequence,
+            }));
             // 120 ms is enough for the broker's echo to round-trip on
             // a local TCP loopback. Mirrors the C++ example's
             // `io_context.run_for(100ms)` per publish.

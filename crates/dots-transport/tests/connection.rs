@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use dots_core::{StructValue, encode_to_vec};
+use dots_core::{StructValue, dots, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
@@ -26,10 +26,9 @@ fn registry() -> Arc<Registry> {
 /// using the registry — only used by the fake server side, where we
 /// don't have a `Connection::send_typed`-equivalent to lean on.
 fn dynamic_for(reg: &Registry, type_name: &str, payload: &dyn StructValue) -> Transmission {
-    let header = DotsHeader {
-        type_name: Some(type_name.into()),
-        ..Default::default()
-    };
+    let header = dots!(DotsHeader {
+        type_name: type_name,
+    });
     let descriptor = match reg.lookup(type_name).expect("type registered") {
         dots_model::DescriptorEntry::Struct(d) => d.clone(),
         _ => panic!("expected struct entry for {type_name}"),
@@ -45,12 +44,11 @@ async fn happy_server(server_stream: DuplexStream, reg: Arc<Registry>) {
     let codec = TransmissionCodec::new(reg.clone());
     let mut framed = Framed::new(server_stream, codec);
 
-    let hello = DotsMsgHello {
-        server_name: Some("test-dotsd".into()),
-        auth_challenge: Some(0x4242),
-        authentication_required: Some(false),
-        capabilities: None,
-    };
+    let hello = dots!(DotsMsgHello {
+        server_name: "test-dotsd",
+        auth_challenge: 0x4242_u64,
+        authentication_required: false,
+    });
     framed
         .send(dynamic_for(&reg, "DotsMsgHello", &hello))
         .await
@@ -59,13 +57,13 @@ async fn happy_server(server_stream: DuplexStream, reg: Arc<Registry>) {
     let connect_txn = framed.next().await.unwrap().unwrap();
     assert_eq!(connect_txn.header.type_name.as_deref(), Some("DotsMsgConnect"));
 
-    let response = DotsMsgConnectResponse {
-        server_name: Some("test-dotsd".into()),
-        client_id: Some(101),
-        accepted: Some(true),
-        preload: Some(false),
-        preload_finished: Some(true),
-    };
+    let response = dots!(DotsMsgConnectResponse {
+        server_name: "test-dotsd",
+        client_id: 101_u32,
+        accepted: true,
+        preload: false,
+        preload_finished: true,
+    });
     framed
         .send(dynamic_for(&reg, "DotsMsgConnectResponse", &response))
         .await
@@ -99,12 +97,11 @@ async fn establish_passes_client_name_to_server() {
         let codec = TransmissionCodec::new(server_reg.clone());
         let mut framed = Framed::new(server_io, codec);
 
-        let hello = DotsMsgHello {
-            server_name: Some("greeter".into()),
-            auth_challenge: Some(1),
-            authentication_required: Some(false),
-            capabilities: None,
-        };
+        let hello = dots!(DotsMsgHello {
+            server_name: "greeter",
+            auth_challenge: 1_u64,
+            authentication_required: false,
+        });
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
             .await
@@ -116,11 +113,10 @@ async fn establish_passes_client_name_to_server() {
         let connect: DotsMsgConnect = dots_core::decode_typed_from_slice(&bytes).unwrap();
         assert_eq!(connect.client_name.as_deref(), Some("named-client"));
 
-        let response = DotsMsgConnectResponse {
-            client_id: Some(7),
-            accepted: Some(true),
-            ..Default::default()
-        };
+        let response = dots!(DotsMsgConnectResponse {
+            client_id: 7_u32,
+            accepted: true,
+        });
         framed
             .send(dynamic_for(
                 &server_reg,
@@ -146,12 +142,11 @@ async fn establish_rejects_when_server_demands_auth() {
     let server = tokio::spawn(async move {
         let codec = TransmissionCodec::new(server_reg.clone());
         let mut framed = Framed::new(server_io, codec);
-        let hello = DotsMsgHello {
-            server_name: Some("auth-required".into()),
-            auth_challenge: Some(123),
-            authentication_required: Some(true),
-            capabilities: None,
-        };
+        let hello = dots!(DotsMsgHello {
+            server_name: "auth-required",
+            auth_challenge: 123_u64,
+            authentication_required: true,
+        });
         let _ = framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
             .await;
@@ -179,12 +174,11 @@ async fn establish_with_auth_secret_completes_handshake() {
         let codec = TransmissionCodec::new(server_reg.clone());
         let mut framed = Framed::new(server_io, codec);
 
-        let hello = DotsMsgHello {
-            server_name: Some("auth-server".into()),
-            auth_challenge: Some(nonce),
-            authentication_required: Some(true),
-            capabilities: None,
-        };
+        let hello = dots!(DotsMsgHello {
+            server_name: "auth-server",
+            auth_challenge: nonce,
+            authentication_required: true,
+        });
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
             .await
@@ -218,13 +212,12 @@ async fn establish_with_auth_secret_completes_handshake() {
         let expected: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
         assert_eq!(response, expected);
 
-        let resp = DotsMsgConnectResponse {
-            server_name: Some("auth-server".into()),
-            client_id: Some(13),
-            accepted: Some(true),
-            preload: Some(false),
-            ..Default::default()
-        };
+        let resp = dots!(DotsMsgConnectResponse {
+            server_name: "auth-server",
+            client_id: 13_u32,
+            accepted: true,
+            preload: false,
+        });
         framed
             .send(dynamic_for(&server_reg, "DotsMsgConnectResponse", &resp))
             .await
@@ -252,22 +245,20 @@ async fn establish_rejects_when_server_says_not_accepted() {
         let codec = TransmissionCodec::new(server_reg.clone());
         let mut framed = Framed::new(server_io, codec);
 
-        let hello = DotsMsgHello {
-            server_name: Some("strict".into()),
-            auth_challenge: Some(0),
-            authentication_required: Some(false),
-            capabilities: None,
-        };
+        let hello = dots!(DotsMsgHello {
+            server_name: "strict",
+            auth_challenge: 0_u64,
+            authentication_required: false,
+        });
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
             .await
             .unwrap();
         let _ = framed.next().await.unwrap().unwrap();
-        let response = DotsMsgConnectResponse {
-            server_name: Some("strict".into()),
-            accepted: Some(false),
-            ..Default::default()
-        };
+        let response = dots!(DotsMsgConnectResponse {
+            server_name: "strict",
+            accepted: false,
+        });
         framed
             .send(dynamic_for(
                 &server_reg,
@@ -297,11 +288,10 @@ async fn establish_errors_when_server_sends_unexpected_first_message() {
         let codec = TransmissionCodec::new(server_reg.clone());
         let mut framed = Framed::new(server_io, codec);
         // Send a ConnectResponse before Hello — out of order.
-        let response = DotsMsgConnectResponse {
-            client_id: Some(1),
-            accepted: Some(true),
-            ..Default::default()
-        };
+        let response = dots!(DotsMsgConnectResponse {
+            client_id: 1_u32,
+            accepted: true,
+        });
         let _ = framed
             .send(dynamic_for(
                 &server_reg,
@@ -363,22 +353,20 @@ async fn send_typed_after_handshake_reaches_server() {
         let mut framed = Framed::new(server_io, codec);
 
         // Standard handshake.
-        let hello = DotsMsgHello {
-            server_name: Some("s".into()),
-            auth_challenge: Some(0),
-            authentication_required: Some(false),
-            capabilities: None,
-        };
+        let hello = dots!(DotsMsgHello {
+            server_name: "s",
+            auth_challenge: 0_u64,
+            authentication_required: false,
+        });
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
             .await
             .unwrap();
         let _connect = framed.next().await.unwrap().unwrap();
-        let response = DotsMsgConnectResponse {
-            client_id: Some(1),
-            accepted: Some(true),
-            ..Default::default()
-        };
+        let response = dots!(DotsMsgConnectResponse {
+            client_id: 1_u32,
+            accepted: true,
+        });
         framed
             .send(dynamic_for(
                 &server_reg,
@@ -398,10 +386,10 @@ async fn send_typed_after_handshake_reaches_server() {
     });
 
     let mut conn = Connection::establish(client_io, "publisher", reg).await.unwrap();
-    let demo = Demo {
-        id: Some(42),
-        note: Some("hello dotsd".into()),
-    };
+    let demo = dots!(Demo {
+        id: 42_u32,
+        note: "hello dotsd",
+    });
     conn.send_typed("Demo", &demo).await.unwrap();
 
     drop(conn);
@@ -419,22 +407,20 @@ async fn next_after_handshake_yields_server_traffic() {
     let server = tokio::spawn(async move {
         let codec = TransmissionCodec::new(server_reg.clone());
         let mut framed = Framed::new(server_io, codec);
-        let hello = DotsMsgHello {
-            server_name: Some("s".into()),
-            auth_challenge: Some(0),
-            authentication_required: Some(false),
-            capabilities: None,
-        };
+        let hello = dots!(DotsMsgHello {
+            server_name: "s",
+            auth_challenge: 0_u64,
+            authentication_required: false,
+        });
         framed
             .send(dynamic_for(&server_reg, "DotsMsgHello", &hello))
             .await
             .unwrap();
         let _connect = framed.next().await.unwrap().unwrap();
-        let response = DotsMsgConnectResponse {
-            client_id: Some(2),
-            accepted: Some(true),
-            ..Default::default()
-        };
+        let response = dots!(DotsMsgConnectResponse {
+            client_id: 2_u32,
+            accepted: true,
+        });
         framed
             .send(dynamic_for(
                 &server_reg,
@@ -445,15 +431,14 @@ async fn next_after_handshake_yields_server_traffic() {
             .unwrap();
 
         // Push a Demo at the client.
-        let demo = Demo {
-            id: Some(7),
-            note: Some("from server".into()),
-        };
-        let header = DotsHeader {
-            type_name: Some("Demo".into()),
-            sender: Some(99),
-            ..Default::default()
-        };
+        let demo = dots!(Demo {
+            id: 7_u32,
+            note: "from server",
+        });
+        let header = dots!(DotsHeader {
+            type_name: "Demo",
+            sender: 99_u32,
+        });
         let bytes = encode_transmission(&header, &demo);
         let stream = framed.get_mut();
         stream.write_all(&bytes).await.unwrap();

@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use dots_core::{PropertySet, StructValue, decode_typed_from_slice, encode_to_vec};
+use dots_core::{PropertySet, StructValue, decode_typed_from_slice, dots, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsHeader, DotsMsgConnectResponse, DotsMsgHello, Registry, Transmission,
@@ -49,11 +49,10 @@ fn registry() -> Arc<Registry> {
 }
 
 fn dynamic_for(reg: &Registry, type_name: &str, payload: &dyn StructValue) -> Transmission {
-    let header = DotsHeader {
-        type_name: Some(type_name.into()),
-        sender: Some(99),
-        ..Default::default()
-    };
+    let header = dots!(DotsHeader {
+        type_name: type_name,
+        sender: 99_u32,
+    });
     let descriptor = match reg.lookup(type_name).expect("type registered") {
         dots_model::DescriptorEntry::Struct(d) => d.clone(),
         _ => panic!("expected struct entry for {type_name}"),
@@ -68,24 +67,23 @@ async fn run_handshake_server(
     framed: &mut Framed<DuplexStream, TransmissionCodec>,
     reg: &Arc<Registry>,
 ) {
-    let hello = DotsMsgHello {
-        server_name: Some("test-dotsd".into()),
-        auth_challenge: Some(0),
-        authentication_required: Some(false),
-        capabilities: None,
-    };
+    let hello = dots!(DotsMsgHello {
+        server_name: "test-dotsd",
+        auth_challenge: 0_u64,
+        authentication_required: false,
+    });
     framed
         .send(dynamic_for(reg, "DotsMsgHello", &hello))
         .await
         .unwrap();
     let _connect = framed.next().await.unwrap().unwrap();
-    let response = DotsMsgConnectResponse {
-        server_name: Some("test-dotsd".into()),
-        client_id: Some(1),
-        accepted: Some(true),
-        preload: Some(false),
-        preload_finished: Some(true),
-    };
+    let response = dots!(DotsMsgConnectResponse {
+        server_name: "test-dotsd",
+        client_id: 1_u32,
+        accepted: true,
+        preload: false,
+        preload_finished: true,
+    });
     framed
         .send(dynamic_for(reg, "DotsMsgConnectResponse", &response))
         .await
@@ -105,19 +103,18 @@ async fn subscription_receives_event_pushed_by_server() {
         let mut framed = Framed::new(server_io, codec);
         run_handshake_server(&mut framed, &server_reg).await;
 
-        let pinger = Pinger {
-            id: Some(7),
-            message: Some("hello".into()),
-            sequence: Some(1),
-        };
+        let pinger = dots!(Pinger {
+            id: 7_u32,
+            message: "hello",
+            sequence: 1_u64,
+        });
         // Send via raw bytes through the underlying stream — the
         // codec's encoder takes Transmission and we want to test the
         // typed-payload arrival path on the receive side.
-        let header = DotsHeader {
-            type_name: Some("Pinger".into()),
-            sender: Some(42),
-            ..Default::default()
-        };
+        let header = dots!(DotsHeader {
+            type_name: "Pinger",
+            sender: 42_u32,
+        });
         let frame = encode_transmission(&header, &pinger);
         framed.get_mut().write_all(&frame).await.unwrap();
     });
@@ -150,28 +147,25 @@ async fn subscription_filters_by_type_name() {
         run_handshake_server(&mut framed, &server_reg).await;
 
         // Send a Bonk first (different type), then a Pinger.
-        let bonk_header = DotsHeader {
-            type_name: Some("Bonk".into()),
-            ..Default::default()
-        };
-        let bonk = Bonk {
-            note: Some("noise".into()),
-        };
+        let bonk_header = dots!(DotsHeader {
+            type_name: "Bonk",
+        });
+        let bonk = dots!(Bonk {
+            note: "noise",
+        });
         framed
             .get_mut()
             .write_all(&encode_transmission(&bonk_header, &bonk))
             .await
             .unwrap();
 
-        let pinger_header = DotsHeader {
-            type_name: Some("Pinger".into()),
-            ..Default::default()
-        };
-        let pinger = Pinger {
-            id: Some(1),
-            message: Some("only-this".into()),
-            ..Default::default()
-        };
+        let pinger_header = dots!(DotsHeader {
+            type_name: "Pinger",
+        });
+        let pinger = dots!(Pinger {
+            id: 1_u32,
+            message: "only-this",
+        });
         framed
             .get_mut()
             .write_all(&encode_transmission(&pinger_header, &pinger))
@@ -207,15 +201,13 @@ async fn multiple_subscriptions_to_same_type_each_receive() {
         let mut framed = Framed::new(server_io, codec);
         run_handshake_server(&mut framed, &server_reg).await;
 
-        let header = DotsHeader {
-            type_name: Some("Pinger".into()),
-            ..Default::default()
-        };
-        let pinger = Pinger {
-            id: Some(2),
-            message: Some("broadcast".into()),
-            ..Default::default()
-        };
+        let header = dots!(DotsHeader {
+            type_name: "Pinger",
+        });
+        let pinger = dots!(Pinger {
+            id: 2_u32,
+            message: "broadcast",
+        });
         framed
             .get_mut()
             .write_all(&encode_transmission(&header, &pinger))
@@ -250,15 +242,13 @@ async fn dropping_subscription_stops_receiving() {
         run_handshake_server(&mut framed, &server_reg).await;
 
         // Two Pingers.
-        for i in 1..=2 {
-            let header = DotsHeader {
-                type_name: Some("Pinger".into()),
-                ..Default::default()
-            };
-            let pinger = Pinger {
-                id: Some(i),
-                ..Default::default()
-            };
+        for i in 1..=2u32 {
+            let header = dots!(DotsHeader {
+                type_name: "Pinger",
+            });
+            let pinger = dots!(Pinger {
+                id: i,
+            });
             framed
                 .get_mut()
                 .write_all(&encode_transmission(&header, &pinger))
@@ -303,11 +293,11 @@ async fn publish_sends_typed_value_to_server() {
     });
 
     let mut conn = Connection::establish(client_io, "publisher", reg).await.unwrap();
-    let pinger = Pinger {
-        id: Some(123),
-        message: Some("from publish".into()),
-        sequence: Some(0),
-    };
+    let pinger = dots!(Pinger {
+        id: 123_u32,
+        message: "from publish",
+        sequence: 0_u64,
+    });
     conn.publish(&pinger).await.unwrap();
 
     drop(conn);
@@ -334,11 +324,10 @@ async fn publish_then_server_echoes_then_subscription_receives() {
         let bytes = txn.payload.encode();
         let pinger: Pinger = decode_typed_from_slice(&bytes).unwrap();
         // ... and echo it back.
-        let header = DotsHeader {
-            type_name: Some("Pinger".into()),
-            sender: Some(999),
-            ..Default::default()
-        };
+        let header = dots!(DotsHeader {
+            type_name: "Pinger",
+            sender: 999_u32,
+        });
         framed
             .get_mut()
             .write_all(&encode_transmission(&header, &pinger))
@@ -349,11 +338,11 @@ async fn publish_then_server_echoes_then_subscription_receives() {
     let mut conn = Connection::establish(client_io, "echo-client", reg).await.unwrap();
     let mut sub = conn.subscribe::<Pinger>();
 
-    let original = Pinger {
-        id: Some(11),
-        message: Some("echo me".into()),
-        sequence: Some(7),
-    };
+    let original = dots!(Pinger {
+        id: 11_u32,
+        message: "echo me",
+        sequence: 7_u64,
+    });
     conn.publish(&original).await.unwrap();
     conn.next().await.unwrap().unwrap();
 
@@ -386,11 +375,11 @@ async fn publish_with_mask_drops_excluded_properties_keeps_keys() {
     });
 
     let mut conn = Connection::establish(client_io, "mask-client", reg).await.unwrap();
-    let pinger = Pinger {
-        id: Some(42),
-        message: Some("dropped".into()),
-        sequence: Some(99),
-    };
+    let pinger = dots!(Pinger {
+        id: 42_u32,
+        message: "dropped",
+        sequence: 99_u64,
+    });
     let mask = PropertySet::EMPTY.with_tag(3);
     conn.publish_with_mask(&pinger, mask).await.unwrap();
 

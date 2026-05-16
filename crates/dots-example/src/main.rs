@@ -74,8 +74,8 @@ fn main() {
         payload: "hello",
         counter: 9000_u64,
         home: Address {
-            street: Some("Lovelace Lane".into()),
-            number: Some(11_u32),
+            street: "Lovelace Lane",
+            number: 11_u32,
         },
         raw: vec![0xde_u8, 0xad, 0xbe, 0xef],
         counters: vec![1_u32, 2, 3],

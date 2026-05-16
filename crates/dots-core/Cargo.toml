@@ -10,6 +10,7 @@ description = "Core types for dots-rust: PropertySet, descriptors, StructValue, 
 [dependencies]
 minicbor.workspace = true
 linkme.workspace = true
+dots-derive.workspace = true
 
 [lints]
 workspace = true

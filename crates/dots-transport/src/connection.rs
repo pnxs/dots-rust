@@ -24,7 +24,7 @@ use std::task::{Context, Poll};
 use bytes::BufMut;
 use dots_core::{
     EnumDescriptor, PropertySet, Publishable, StructDescriptor, StructValue, Transmittable,
-    decode_typed_from_slice,
+    decode_typed_from_slice, dots,
 };
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
@@ -204,11 +204,10 @@ where
         self.server_name = hello.server_name;
         self.peer_capabilities = hello.capabilities;
 
-        let mut connect = DotsMsgConnect {
-            client_name: Some(client_name.into()),
-            preload_cache: Some(request_preload),
-            ..Default::default()
-        };
+        let mut connect = dots!(DotsMsgConnect {
+            client_name: client_name,
+            preload_cache: request_preload,
+        });
         if auth_required {
             let Some(secret) = auth_secret else {
                 return Err(ConnectionError::AuthenticationNotSupported);
@@ -268,10 +267,9 @@ where
         }
         tracing::debug!("signalling preload_client_finished and draining cache");
 
-        let connect = DotsMsgConnect {
-            preload_client_finished: Some(true),
-            ..Default::default()
-        };
+        let connect = dots!(DotsMsgConnect {
+            preload_client_finished: true,
+        });
         self.send_typed("DotsMsgConnect", &connect).await?;
 
         // Stream cache transmissions. Cache events have header.from_cache
@@ -358,12 +356,11 @@ where
         // the bitmask of payload properties that are valid. The CBOR
         // map is already sparse with the same information, but the
         // header field is mandatory at the protocol level.
-        let header = DotsHeader {
-            type_name: Some(type_name.into()),
-            attributes: Some(payload.valid_set()),
+        let header = dots!(DotsHeader {
+            type_name: type_name,
+            attributes: payload.valid_set(),
             sender: self.client_id,
-            ..Default::default()
-        };
+        });
         self.scratch.clear();
         encode_transmission_into(&header, payload, &mut self.scratch);
 
@@ -407,12 +404,11 @@ where
         included: PropertySet,
     ) -> Result<(), ConnectionError> {
         let mask = (included | value.key_set()) & value.valid_set();
-        let header = DotsHeader {
-            type_name: Some(value.type_name().into()),
-            attributes: Some(mask),
+        let header = dots!(DotsHeader {
+            type_name: value.type_name(),
+            attributes: mask,
             sender: self.client_id,
-            ..Default::default()
-        };
+        });
         self.scratch.clear();
         encode_transmission_with_mask_into(&header, value, mask, &mut self.scratch);
 

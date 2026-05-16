@@ -68,6 +68,63 @@ pub fn derive_dots_enum(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Function-like macro `dots!` — terse constructor for DOTS structs.
+///
+/// Doc lives on the re-export in `dots-core::dots`.
+#[proc_macro]
+pub fn dots(input: TokenStream) -> TokenStream {
+    let expr = parse_macro_input!(input as syn::ExprStruct);
+    expand_dots_struct(&expr).into()
+}
+
+fn expand_dots_struct(expr: &syn::ExprStruct) -> TokenStream2 {
+    if let Some(qself) = &expr.qself {
+        return syn::Error::new_spanned(
+            &qself.ty,
+            "dots! does not support qualified self paths (<T as Trait>::...)",
+        )
+        .to_compile_error();
+    }
+
+    let path = &expr.path;
+    let field_assignments = expr.fields.iter().map(|fv| {
+        let member = &fv.member;
+        let value_tokens = expand_dots_field_value(&fv.expr);
+        quote! { #member: #value_tokens }
+    });
+    let rest_tokens = match &expr.rest {
+        Some(rest) => quote! { ..#rest },
+        None => quote! { ..::core::default::Default::default() },
+    };
+
+    quote! {
+        {
+            #[allow(clippy::needless_update)]
+            #path {
+                #(#field_assignments,)*
+                #rest_tokens
+            }
+        }
+    }
+}
+
+fn expand_dots_field_value(expr: &syn::Expr) -> TokenStream2 {
+    // A nested struct literal is rewritten recursively; the result is
+    // then wrapped in `Some(_)` by the same `DotsAssign` path the
+    // top-level fields use.
+    let inner = match expr {
+        syn::Expr::Struct(inner) => expand_dots_struct(inner),
+        other => quote! { #other },
+    };
+    quote! {
+        {
+            #[allow(unused_imports)]
+            use ::dots_core::DotsAssignGeneric as _;
+            ::dots_core::DotsAssign(#inner).into_dots_field()
+        }
+    }
+}
+
 #[derive(Default)]
 struct ContainerAttrs {
     name: Option<String>,

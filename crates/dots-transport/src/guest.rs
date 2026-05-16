@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use dots_core::{
     DynamicStruct, DynamicStructDescriptor, EnumDescriptor, PropertySet, Publishable,
-    StructDescriptor, StructValue, Timepoint, Transmittable, decode_typed_from_slice,
+    StructDescriptor, StructValue, Timepoint, Transmittable, decode_typed_from_slice, dots,
 };
 use dots_model::{
     DotsHeader, DotsMember, DotsMemberEvent, DotsServerCapabilities, EnumDescriptorData, Registry,
@@ -285,25 +285,24 @@ impl GuestTransceiver {
         subscription_id: u32,
         filter: DotsFilter,
     ) {
-        let member = DotsMember {
-            group_name: Some(type_name.into()),
-            event: Some(DotsMemberEvent::Join),
+        let member = dots!(DotsMember {
+            group_name: type_name,
+            event: DotsMemberEvent::Join,
             client: self.client_id(),
-            subscription_id: Some(subscription_id),
-            filter: Some(filter),
-        };
+            subscription_id: subscription_id,
+            filter: filter,
+        });
         self.publish_typed(&member);
     }
 
     /// Send a filtered `DotsMember(Leave)` for one subscription.
     pub(crate) fn publish_filtered_leave(&self, type_name: &str, subscription_id: u32) {
-        let member = DotsMember {
-            group_name: Some(type_name.into()),
-            event: Some(DotsMemberEvent::Leave),
+        let member = dots!(DotsMember {
+            group_name: type_name,
+            event: DotsMemberEvent::Leave,
             client: self.client_id(),
-            subscription_id: Some(subscription_id),
-            filter: None,
-        };
+            subscription_id: subscription_id,
+        });
         self.publish_typed(&member);
     }
 
@@ -540,13 +539,12 @@ impl GuestTransceiver {
         if let Some(d) = value.static_descriptor() {
             self.register_struct_descriptor(d);
         }
-        let header = DotsHeader {
-            type_name: Some(value.type_name().into()),
-            attributes: Some(value.valid_set()),
+        let header = dots!(DotsHeader {
+            type_name: value.type_name(),
+            attributes: value.valid_set(),
             sender: self.client_id(),
-            sent_time: Some(now_timepoint()),
-            ..Default::default()
-        };
+            sent_time: now_timepoint(),
+        });
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_into(&header, value, &mut bytes);
         self.enqueue_publish(bytes, value.type_name());
@@ -567,13 +565,12 @@ impl GuestTransceiver {
             self.register_struct_descriptor(d);
         }
         let mask = (included | value.key_set()) & value.valid_set();
-        let header = DotsHeader {
-            type_name: Some(value.type_name().into()),
-            attributes: Some(mask),
+        let header = dots!(DotsHeader {
+            type_name: value.type_name(),
+            attributes: mask,
             sender: self.client_id(),
-            sent_time: Some(now_timepoint()),
-            ..Default::default()
-        };
+            sent_time: now_timepoint(),
+        });
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
         self.enqueue_publish(bytes, value.type_name());
@@ -591,14 +588,13 @@ impl GuestTransceiver {
             self.register_struct_descriptor(d);
         }
         let mask = value.key_set();
-        let header = DotsHeader {
-            type_name: Some(value.type_name().into()),
-            attributes: Some(mask),
+        let header = dots!(DotsHeader {
+            type_name: value.type_name(),
+            attributes: mask,
             sender: self.client_id(),
-            sent_time: Some(now_timepoint()),
-            remove_obj: Some(true),
-            ..Default::default()
-        };
+            sent_time: now_timepoint(),
+            remove_obj: true,
+        });
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
         self.enqueue_publish(bytes, value.type_name());
@@ -724,12 +720,11 @@ impl GuestTransceiver {
             *c
         };
         if count == 1 {
-            let member = DotsMember {
-                group_name: Some(group_name.into()),
-                event: Some(DotsMemberEvent::Join),
+            let member = dots!(DotsMember {
+                group_name: group_name,
+                event: DotsMemberEvent::Join,
                 client: self.client_id(),
-                ..Default::default()
-            };
+            });
             self.publish_typed(&member);
         }
     }
@@ -754,25 +749,23 @@ impl GuestTransceiver {
             }
         }
         if should_publish_leave {
-            let member = DotsMember {
-                group_name: Some(group_name.into()),
-                event: Some(DotsMemberEvent::Leave),
+            let member = dots!(DotsMember {
+                group_name: group_name,
+                event: DotsMemberEvent::Leave,
                 client: self.client_id(),
-                ..Default::default()
-            };
+            });
             self.publish_typed(&member);
         }
     }
 
     fn publish_typed<T: StructValue>(&self, value: &T) {
         let type_name = <T as Transmittable>::type_name(value);
-        let header = DotsHeader {
-            type_name: Some(type_name.into()),
-            attributes: Some(<T as Transmittable>::valid_set(value)),
+        let header = dots!(DotsHeader {
+            type_name: type_name,
+            attributes: <T as Transmittable>::valid_set(value),
             sender: self.client_id(),
-            sent_time: Some(now_timepoint()),
-            ..Default::default()
-        };
+            sent_time: now_timepoint(),
+        });
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_into(&header, value, &mut bytes);
         self.enqueue_publish(bytes, type_name);

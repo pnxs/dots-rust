@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use dots_core::{StructValue, Timepoint, encode_to_vec};
+use dots_core::{StructValue, Timepoint, dots, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsHeader, DotsMsgConnectResponse, DotsMsgHello, Registry, Transmission,
@@ -32,10 +32,9 @@ fn registry() -> Arc<Registry> {
 }
 
 fn dynamic_for(reg: &Registry, type_name: &str, payload: &dyn StructValue) -> Transmission {
-    let header = DotsHeader {
-        type_name: Some(type_name.into()),
-        ..Default::default()
-    };
+    let header = dots!(DotsHeader {
+        type_name: type_name,
+    });
     let descriptor = match reg.lookup(type_name).expect("type registered") {
         dots_model::DescriptorEntry::Struct(d) => d.clone(),
         _ => panic!(),
@@ -49,23 +48,21 @@ async fn run_no_preload_handshake(
     framed: &mut Framed<DuplexStream, TransmissionCodec>,
     reg: &Arc<Registry>,
 ) {
-    let hello = DotsMsgHello {
-        server_name: Some("s".into()),
-        auth_challenge: Some(0),
-        authentication_required: Some(false),
-        capabilities: None,
-    };
+    let hello = dots!(DotsMsgHello {
+        server_name: "s",
+        auth_challenge: 0_u64,
+        authentication_required: false,
+    });
     framed
         .send(dynamic_for(reg, "DotsMsgHello", &hello))
         .await
         .unwrap();
     let _connect = framed.next().await.unwrap().unwrap();
-    let response = DotsMsgConnectResponse {
-        client_id: Some(1),
-        accepted: Some(true),
-        preload: Some(false),
-        ..Default::default()
-    };
+    let response = dots!(DotsMsgConnectResponse {
+        client_id: 1_u32,
+        accepted: true,
+        preload: false,
+    });
     framed
         .send(dynamic_for(reg, "DotsMsgConnectResponse", &response))
         .await
@@ -80,14 +77,13 @@ async fn push_pinger(
     sent_time: Option<f64>,
     remove: bool,
 ) {
-    let header = DotsHeader {
-        type_name: Some("Pinger".into()),
-        attributes: Some(pinger.valid_set()),
-        sender,
+    let header = dots!(DotsHeader {
+        type_name: "Pinger",
+        attributes: pinger.valid_set(),
+        sender: sender,
         sent_time: sent_time.map(Timepoint),
-        remove_obj: Some(remove),
-        ..Default::default()
-    };
+        remove_obj: remove,
+    });
     let frame = encode_transmission(&header, pinger);
     framed.get_mut().write_all(&frame).await.unwrap();
 }
@@ -125,19 +121,19 @@ async fn container_create_then_update_preserves_created_metadata() {
         run_no_preload_handshake(&mut framed, &server_reg).await;
 
         // First publish — Create.
-        let p1 = Pinger {
-            id: Some(7),
-            message: Some("first".into()),
-            sequence: Some(1),
-        };
+        let p1 = dots!(Pinger {
+            id: 7_u32,
+            message: "first",
+            sequence: 1_u64,
+        });
         push_pinger(&mut framed, &p1, Some(11), Some(100.0), false).await;
 
         // Second publish, same key — Update.
-        let p2 = Pinger {
-            id: Some(7),
-            message: Some("second".into()),
-            sequence: Some(2),
-        };
+        let p2 = dots!(Pinger {
+            id: 7_u32,
+            message: "second",
+            sequence: 2_u64,
+        });
         push_pinger(&mut framed, &p2, Some(22), Some(200.0), false).await;
     });
 
@@ -149,10 +145,9 @@ async fn container_create_then_update_preserves_created_metadata() {
     conn.next().await.unwrap().unwrap();
 
     assert_eq!(pingers.len(), 1);
-    let query = Pinger {
-        id: Some(7),
-        ..Default::default()
-    };
+    let query = dots!(Pinger {
+        id: 7_u32,
+    });
     let entry = pingers.get(&query).expect("entry exists");
     assert_eq!(entry.value.message.as_deref(), Some("second"));
     assert_eq!(entry.clone_info.last_operation, Operation::Update);
@@ -177,11 +172,10 @@ async fn container_remove_deletes_entry() {
         let mut framed = Framed::new(server_io, codec);
         run_no_preload_handshake(&mut framed, &server_reg).await;
 
-        let p = Pinger {
-            id: Some(5),
-            message: Some("alive".into()),
-            ..Default::default()
-        };
+        let p = dots!(Pinger {
+            id: 5_u32,
+            message: "alive",
+        });
         push_pinger(&mut framed, &p, None, None, false).await;
         // Same key, remove_obj = true.
         push_pinger(&mut framed, &p, None, None, true).await;
@@ -212,16 +206,16 @@ async fn container_indexes_by_key_only() {
         let mut framed = Framed::new(server_io, codec);
         run_no_preload_handshake(&mut framed, &server_reg).await;
 
-        let p1 = Pinger {
-            id: Some(99),
-            message: Some("one".into()),
-            sequence: Some(1),
-        };
-        let p2 = Pinger {
-            id: Some(99),
-            message: Some("two".into()),
-            sequence: Some(2),
-        };
+        let p1 = dots!(Pinger {
+            id: 99_u32,
+            message: "one",
+            sequence: 1_u64,
+        });
+        let p2 = dots!(Pinger {
+            id: 99_u32,
+            message: "two",
+            sequence: 2_u64,
+        });
         push_pinger(&mut framed, &p1, None, None, false).await;
         push_pinger(&mut framed, &p2, None, None, false).await;
     });
@@ -235,12 +229,11 @@ async fn container_indexes_by_key_only() {
 
     // Lookup by example.
     let entry = pingers
-        .get(&Pinger {
-            id: Some(99),
+        .get(&dots!(Pinger {
+            id: 99_u32,
             // Other fields irrelevant for key lookup.
-            sequence: Some(99999),
-            ..Default::default()
-        })
+            sequence: 99999_u64,
+        }))
         .expect("found by id");
     assert_eq!(entry.value.sequence, Some(2));
 
@@ -260,11 +253,10 @@ async fn container_holds_multiple_distinct_keys() {
         run_no_preload_handshake(&mut framed, &server_reg).await;
 
         for id in 1..=3u32 {
-            let p = Pinger {
-                id: Some(id),
-                message: Some(format!("entry-{id}")),
-                ..Default::default()
-            };
+            let p = dots!(Pinger {
+                id: id,
+                message: format!("entry-{id}"),
+            });
             push_pinger(&mut framed, &p, None, None, false).await;
         }
     });
@@ -302,11 +294,10 @@ async fn container_and_subscription_both_receive() {
         let mut framed = Framed::new(server_io, codec);
         run_no_preload_handshake(&mut framed, &server_reg).await;
 
-        let p = Pinger {
-            id: Some(1),
-            message: Some("dual".into()),
-            ..Default::default()
-        };
+        let p = dots!(Pinger {
+            id: 1_u32,
+            message: "dual",
+        });
         push_pinger(&mut framed, &p, None, None, false).await;
     });
 
@@ -336,10 +327,9 @@ async fn dropping_container_stops_updating() {
         run_no_preload_handshake(&mut framed, &server_reg).await;
 
         for id in 1..=2u32 {
-            let p = Pinger {
-                id: Some(id),
-                ..Default::default()
-            };
+            let p = dots!(Pinger {
+                id: id,
+            });
             push_pinger(&mut framed, &p, None, None, false).await;
         }
     });
@@ -372,10 +362,9 @@ async fn with_entries_iterates_in_place() {
         run_no_preload_handshake(&mut framed, &server_reg).await;
 
         for id in 1..=2u32 {
-            let p = Pinger {
-                id: Some(id),
-                ..Default::default()
-            };
+            let p = dots!(Pinger {
+                id: id,
+            });
             push_pinger(&mut framed, &p, None, None, false).await;
         }
     });

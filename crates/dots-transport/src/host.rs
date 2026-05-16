@@ -21,9 +21,7 @@ use std::sync::{Arc, Mutex};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::Mutex as AsyncMutex;
 
-use dots_core::{
-    DynamicStruct, PropertySet, Publishable, StructValue, Transmittable, decode_typed_from_slice,
-};
+use dots_core::{DynamicStruct, PropertySet, Publishable, StructValue, Transmittable, decode_typed_from_slice, dots};
 use dots_model::{
     DotsCacheInfo, DotsConnectionState, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect,
     DotsMsgConnectResponse, DotsMsgHello, DotsServerCapabilities, EnumDescriptorData,
@@ -634,14 +632,13 @@ impl HostTransceiver {
     pub fn publish<P: Publishable>(&self, value: &P) {
         let type_name = value.type_name().to_string();
         let mask = value.valid_set();
-        let header = DotsHeader {
-            type_name: Some(type_name.clone()),
-            attributes: Some(mask),
-            sender: Some(HOST_ID),
-            sent_time: Some(now_timepoint()),
-            server_sent_time: Some(now_timepoint()),
-            ..Default::default()
-        };
+        let header = dots!(DotsHeader {
+            type_name: type_name.clone(),
+            attributes: mask,
+            sender: HOST_ID,
+            sent_time: now_timepoint(),
+            server_sent_time: now_timepoint(),
+        });
         let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_into(&header, value, &mut bytes);
@@ -655,14 +652,13 @@ impl HostTransceiver {
     pub fn publish_with_mask<P: Publishable>(&self, value: &P, included: PropertySet) {
         let type_name = value.type_name().to_string();
         let mask = (included | value.key_set()) & value.valid_set();
-        let header = DotsHeader {
-            type_name: Some(type_name.clone()),
-            attributes: Some(mask),
-            sender: Some(HOST_ID),
-            sent_time: Some(now_timepoint()),
-            server_sent_time: Some(now_timepoint()),
-            ..Default::default()
-        };
+        let header = dots!(DotsHeader {
+            type_name: type_name.clone(),
+            attributes: mask,
+            sender: HOST_ID,
+            sent_time: now_timepoint(),
+            server_sent_time: now_timepoint(),
+        });
         let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
@@ -676,15 +672,14 @@ impl HostTransceiver {
     pub fn remove<P: Publishable>(&self, value: &P) {
         let type_name = value.type_name().to_string();
         let mask = value.key_set();
-        let header = DotsHeader {
-            type_name: Some(type_name.clone()),
-            attributes: Some(mask),
-            sender: Some(HOST_ID),
-            sent_time: Some(now_timepoint()),
-            server_sent_time: Some(now_timepoint()),
-            remove_obj: Some(true),
-            ..Default::default()
-        };
+        let header = dots!(DotsHeader {
+            type_name: type_name.clone(),
+            attributes: mask,
+            sender: HOST_ID,
+            sent_time: now_timepoint(),
+            server_sent_time: now_timepoint(),
+            remove_obj: true,
+        });
         let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
@@ -963,17 +958,16 @@ impl HostTransceiver {
                         .enumerate()
                         .map(|(i, e)| {
                             let from_cache = (total - 1 - i) as u32;
-                            let header = DotsHeader {
-                                type_name: Some(type_name.to_string()),
+                            let header = dots!(DotsHeader {
+                                type_name: type_name.to_string(),
                                 sent_time: e.last_update_time,
-                                server_sent_time: Some(now_timepoint()),
-                                attributes: Some(e.attributes),
+                                server_sent_time: now_timepoint(),
+                                attributes: e.attributes,
                                 sender: e.last_update_sender,
-                                from_cache: Some(from_cache),
-                                remove_obj: Some(false),
-                                is_from_myself: Some(false),
-                                subscription_id: None,
-                            };
+                                from_cache: from_cache,
+                                remove_obj: false,
+                                is_from_myself: false,
+                            });
                             (header, e.payload.clone())
                         })
                         .collect()
@@ -1006,17 +1000,15 @@ impl HostTransceiver {
             }
             .encode_into(&mut buf);
         }
-        let info = DotsCacheInfo {
-            type_name: Some(type_name.into()),
-            end_transmission: Some(true),
-            ..Default::default()
-        };
-        let header = DotsHeader {
-            type_name: Some("DotsCacheInfo".into()),
-            attributes: Some(Transmittable::valid_set(&info)),
-            sender: Some(HOST_ID),
-            ..Default::default()
-        };
+        let info = dots!(DotsCacheInfo {
+            type_name: type_name,
+            end_transmission: true,
+        });
+        let header = dots!(DotsHeader {
+            type_name: "DotsCacheInfo",
+            attributes: Transmittable::valid_set(&info),
+            sender: HOST_ID,
+        });
         encode_transmission_into(&header, &info, &mut buf);
         writer.enqueue(&buf);
     }
@@ -1115,17 +1107,17 @@ impl HostTransceiver {
                     if sub.compiled.matches(&e.payload) {
                         let attrs = e.attributes;
                         let effective = (project | key_set) & attrs;
-                        let header = DotsHeader {
-                            type_name: Some(group_name.to_string()),
+                        let header = dots!(DotsHeader {
+                            type_name: group_name.to_string(),
                             sent_time: e.last_update_time,
-                            server_sent_time: Some(now_timepoint()),
-                            attributes: Some(effective),
+                            server_sent_time: now_timepoint(),
+                            attributes: effective,
                             sender: e.last_update_sender,
-                            from_cache: Some(0),
-                            remove_obj: Some(false),
-                            is_from_myself: Some(false),
-                            subscription_id: Some(subscription_id),
-                        };
+                            from_cache: 0_u32,
+                            remove_obj: false,
+                            is_from_myself: false,
+                            subscription_id: subscription_id,
+                        });
                         out.push((header, e.payload.clone(), k.clone()));
                     }
                 }
@@ -1167,21 +1159,19 @@ impl HostTransceiver {
             let mask = header.attributes.unwrap_or(payload.valid_set());
             encode_transmission_with_mask_into(&header, &payload, mask, &mut buf);
         }
-        let info = DotsCacheInfo {
-            type_name: Some(group_name.into()),
-            end_transmission: Some(true),
-            ..Default::default()
-        };
+        let info = dots!(DotsCacheInfo {
+            type_name: group_name,
+            end_transmission: true,
+        });
         // Terminator carries no subscription_id — matches dots-cpp
         // wire (the receiver routes it through the global
         // dispatcher, not through the View). See HostTransceiver.cpp
         // in dots-cpp branch server-side-filtering.
-        let header = DotsHeader {
-            type_name: Some("DotsCacheInfo".into()),
-            attributes: Some(Transmittable::valid_set(&info)),
-            sender: Some(HOST_ID),
-            ..Default::default()
-        };
+        let header = dots!(DotsHeader {
+            type_name: "DotsCacheInfo",
+            attributes: Transmittable::valid_set(&info),
+            sender: HOST_ID,
+        });
         encode_transmission_into(&header, &info, &mut buf);
         writer.enqueue(&buf);
     }
@@ -1313,13 +1303,12 @@ impl HostTransceiver {
         state: DotsConnectionState,
         running: bool,
     ) {
-        let record = DotsClient {
-            id: Some(client_id),
-            name,
-            running: Some(running),
-            connection_state: Some(state),
-            ..Default::default()
-        };
+        let record = dots!(DotsClient {
+            id: client_id,
+            name: name,
+            running: running,
+            connection_state: state,
+        });
         self.publish(&record);
     }
 }
@@ -1343,14 +1332,14 @@ where
         FramedRead::new(read_half, RawTransmissionCodec::new(host.registry.clone()));
 
     // ----- Phase 1: Hello -----
-    let hello = DotsMsgHello {
-        server_name: Some(host.self_name.clone()),
-        auth_challenge: Some(0),
-        authentication_required: Some(false),
-        capabilities: Some(DotsServerCapabilities {
-            filtered_subscriptions: Some(true),
-        }),
-    };
+    let hello = dots!(DotsMsgHello {
+        server_name: host.self_name.clone(),
+        auth_challenge: 0_u64,
+        authentication_required: false,
+        capabilities: DotsServerCapabilities {
+            filtered_subscriptions: true,
+        },
+    });
     write_typed(&writer, "DotsMsgHello", &hello);
     tracing::debug!(client_id, "sent Hello");
 
@@ -1366,13 +1355,12 @@ where
         "Connect received"
     );
 
-    let resp = DotsMsgConnectResponse {
-        server_name: Some(host.self_name.clone()),
-        client_id: Some(client_id),
-        accepted: Some(true),
-        preload: Some(preload_requested),
-        ..Default::default()
-    };
+    let resp = dots!(DotsMsgConnectResponse {
+        server_name: host.self_name.clone(),
+        client_id: client_id,
+        accepted: true,
+        preload: preload_requested,
+    });
     write_typed(&writer, "DotsMsgConnectResponse", &resp);
     let initial_state = if preload_requested {
         DotsConnectionState::EarlySubscribe
@@ -1443,13 +1431,12 @@ fn handle_preload_message(
     if type_name == "DotsMsgConnect" {
         let connect: DotsMsgConnect = decode_handshake(raw, "DotsMsgConnect")?;
         if connect.preload_client_finished == Some(true) {
-            let resp = DotsMsgConnectResponse {
-                server_name: Some(host.self_name.clone()),
-                client_id: Some(client_id),
-                accepted: Some(true),
-                preload_finished: Some(true),
-                ..Default::default()
-            };
+            let resp = dots!(DotsMsgConnectResponse {
+                server_name: host.self_name.clone(),
+                client_id: client_id,
+                accepted: true,
+                preload_finished: true,
+            });
             write_typed(writer, "DotsMsgConnectResponse", &resp);
             return Ok(true);
         }
@@ -1616,18 +1603,17 @@ fn handle_echo(host: &Arc<HostTransceiver>, client_id: u32, raw: &RawTransmissio
         // peers (we don't currently send our own echo requests).
         return;
     }
-    let reply = dots_model::DotsEcho {
-        request: Some(false),
+    let reply = dots!(dots_model::DotsEcho {
+        request: false,
         ..echo
-    };
-    let header = DotsHeader {
-        type_name: Some("DotsEcho".into()),
-        attributes: Some(Transmittable::valid_set(&reply)),
-        sender: Some(HOST_ID),
-        sent_time: Some(now_timepoint()),
-        server_sent_time: Some(now_timepoint()),
-        ..Default::default()
-    };
+    });
+    let header = dots!(DotsHeader {
+        type_name: "DotsEcho",
+        attributes: Transmittable::valid_set(&reply),
+        sender: HOST_ID,
+        sent_time: now_timepoint(),
+        server_sent_time: now_timepoint(),
+    });
     let mut buf = Vec::with_capacity(64);
     encode_transmission_into(&header, &reply, &mut buf);
     if let Some(writer) = host.writer_for(client_id) {
@@ -1688,29 +1674,26 @@ fn handle_descriptor_request(
     let mut buf = Vec::with_capacity(128 + descriptors.len() * 96);
     for d in &descriptors {
         let data = StructDescriptorData::from_dynamic(d);
-        let header = DotsHeader {
-            type_name: Some("StructDescriptorData".into()),
-            attributes: Some(Transmittable::valid_set(&data)),
-            sender: Some(HOST_ID),
-            sent_time: Some(now_timepoint()),
-            server_sent_time: Some(now_timepoint()),
-            ..Default::default()
-        };
+        let header = dots!(DotsHeader {
+            type_name: "StructDescriptorData",
+            attributes: Transmittable::valid_set(&data),
+            sender: HOST_ID,
+            sent_time: now_timepoint(),
+            server_sent_time: now_timepoint(),
+        });
         encode_transmission_into(&header, &data, &mut buf);
     }
 
-    let info = DotsCacheInfo {
-        end_descriptor_request: Some(true),
-        ..Default::default()
-    };
-    let header = DotsHeader {
-        type_name: Some("DotsCacheInfo".into()),
-        attributes: Some(Transmittable::valid_set(&info)),
-        sender: Some(HOST_ID),
-        sent_time: Some(now_timepoint()),
-        server_sent_time: Some(now_timepoint()),
-        ..Default::default()
-    };
+    let info = dots!(DotsCacheInfo {
+        end_descriptor_request: true,
+    });
+    let header = dots!(DotsHeader {
+        type_name: "DotsCacheInfo",
+        attributes: Transmittable::valid_set(&info),
+        sender: HOST_ID,
+        sent_time: now_timepoint(),
+        server_sent_time: now_timepoint(),
+    });
     encode_transmission_into(&header, &info, &mut buf);
     writer.enqueue(&buf);
 }
@@ -1762,16 +1745,15 @@ fn handle_clear_cache(host: &Arc<HostTransceiver>, raw: &RawTransmission) {
 /// because the publisher disconnected (`cleanup` flag) or a guest
 /// asked to clear the type via `DotsClearCache`.
 fn removal_txn(type_name: &str, entry: CachedEntry) -> Transmission {
-    let header = DotsHeader {
-        type_name: Some(type_name.to_string()),
+    let header = dots!(DotsHeader {
+        type_name: type_name,
         sent_time: entry.last_update_time,
-        server_sent_time: Some(now_timepoint()),
-        attributes: Some(entry.attributes),
-        sender: Some(HOST_ID),
-        remove_obj: Some(true),
-        is_from_myself: Some(false),
-        ..Default::default()
-    };
+        server_sent_time: now_timepoint(),
+        attributes: entry.attributes,
+        sender: HOST_ID,
+        remove_obj: true,
+        is_from_myself: false,
+    });
     Transmission {
         header,
         payload: entry.payload,
@@ -1907,12 +1889,11 @@ fn write_typed<T>(writer: &SharedWriter, type_name: &str, value: &T)
 where
     T: StructValue,
 {
-    let header = DotsHeader {
-        type_name: Some(type_name.into()),
-        attributes: Some(<T as Transmittable>::valid_set(value)),
-        sender: Some(HOST_ID),
-        ..Default::default()
-    };
+    let header = dots!(DotsHeader {
+        type_name: type_name,
+        attributes: <T as Transmittable>::valid_set(value),
+        sender: HOST_ID,
+    });
     let mut buf = Vec::with_capacity(64);
     encode_transmission_into(&header, value, &mut buf);
     writer.enqueue(&buf);

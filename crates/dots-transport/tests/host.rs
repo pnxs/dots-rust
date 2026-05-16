@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use dots_core::dots;
 use dots_derive::DotsStruct;
 use dots_model::{Registry, registry_with_internal_types};
 use dots_transport::{Connection, ConnectionBuilder, GuestTransceiver, HostTransceiver};
@@ -101,11 +102,11 @@ async fn host_routes_pinger_between_two_guests() {
     );
 
     // B publishes a Pinger.
-    gt_b.publish(&Pinger {
-        id: Some(7),
-        message: Some("hi from B".into()),
-        sequence: Some(1),
-    });
+    gt_b.publish(&dots!(Pinger {
+        id: 7_u32,
+        message: "hi from B",
+        sequence: 1_u64,
+    }));
 
     // A should receive it.
     let event = tokio::time::timeout(Duration::from_secs(2), sub_a.recv())
@@ -154,11 +155,11 @@ async fn host_publish_reaches_subscribed_guest() {
     assert_eq!(host.group_size("Pinger"), 1);
 
     // Host publishes directly.
-    host.publish(&Pinger {
-        id: Some(99),
-        message: Some("from host".into()),
-        sequence: Some(42),
-    });
+    host.publish(&dots!(Pinger {
+        id: 99_u32,
+        message: "from host",
+        sequence: 42_u64,
+    }));
 
     let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
         .await
@@ -194,16 +195,16 @@ async fn host_replays_cached_pingers_to_late_subscriber() {
     );
     let driver_a_handle = tokio::spawn(driver_a.run());
 
-    gt_a.publish(&Pinger {
-        id: Some(1),
-        message: Some("first".into()),
-        sequence: Some(1),
-    });
-    gt_a.publish(&Pinger {
-        id: Some(2),
-        message: Some("second".into()),
-        sequence: Some(1),
-    });
+    gt_a.publish(&dots!(Pinger {
+        id: 1_u32,
+        message: "first",
+        sequence: 1_u64,
+    }));
+    gt_a.publish(&dots!(Pinger {
+        id: 2_u32,
+        message: "second",
+        sequence: 1_u64,
+    }));
 
     // Wait for the host to record both in its cache.
     for _ in 0..30 {
@@ -399,16 +400,16 @@ async fn guest_remove_drops_entry_from_host_cache() {
     );
     let driver_a_handle = tokio::spawn(driver_a.run());
 
-    gt_a.publish(&Pinger {
-        id: Some(1),
-        message: Some("first".into()),
-        sequence: Some(1),
-    });
-    gt_a.publish(&Pinger {
-        id: Some(2),
-        message: Some("second".into()),
-        sequence: Some(1),
-    });
+    gt_a.publish(&dots!(Pinger {
+        id: 1_u32,
+        message: "first",
+        sequence: 1_u64,
+    }));
+    gt_a.publish(&dots!(Pinger {
+        id: 2_u32,
+        message: "second",
+        sequence: 1_u64,
+    }));
 
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -419,10 +420,9 @@ async fn guest_remove_drops_entry_from_host_cache() {
     assert_eq!(host.cache_size("Pinger"), 2);
 
     // Remove id=1.
-    gt_a.remove(&Pinger {
-        id: Some(1),
-        ..Default::default()
-    });
+    gt_a.remove(&dots!(Pinger {
+        id: 1_u32,
+    }));
 
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -469,12 +469,12 @@ async fn host_replies_to_dots_echo_request() {
         }
     }
 
-    gt.publish(&DotsEcho {
-        request: Some(true),
-        identifier: Some(7),
-        sequence_number: Some(42),
-        data: Some("ping".into()),
-    });
+    gt.publish(&dots!(DotsEcho {
+        request: true,
+        identifier: 7_u32,
+        sequence_number: 42_u32,
+        data: "ping",
+    }));
 
     let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
         .await
@@ -622,11 +622,11 @@ async fn host_serve_unix_routes_pinger_round_trip() {
     assert_eq!(host.group_size("Pinger"), 1);
 
     // Host publishes; client receives over UDS.
-    host.publish(&Pinger {
-        id: Some(1),
-        message: Some("hi over uds".into()),
-        sequence: Some(7),
-    });
+    host.publish(&dots!(Pinger {
+        id: 1_u32,
+        message: "hi over uds",
+        sequence: 7_u64,
+    }));
     let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
         .await
         .expect("timed out")
@@ -758,10 +758,10 @@ async fn cleanup_flag_drops_publisher_entries_on_disconnect() {
     let driver_pub_handle = tokio::spawn(driver_pub.run());
 
     gt_pub
-        .publish(&TempClient {
-            id: Some(7),
-            label: Some("hi".into()),
-        });
+        .publish(&dots!(TempClient {
+            id: 7_u32,
+            label: "hi",
+        }));
 
     // Observer should receive the create.
     let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
@@ -934,15 +934,13 @@ async fn dots_clear_cache_drops_named_types_and_publishes_removals() {
     let driver_pub_handle = tokio::spawn(driver_pub.run());
 
     gt_pub
-        .publish(&Pinger {
-            id: Some(1),
-            ..Default::default()
-        });
+        .publish(&dots!(Pinger {
+            id: 1_u32,
+        }));
     gt_pub
-        .publish(&Pinger {
-            id: Some(2),
-            ..Default::default()
-        });
+        .publish(&dots!(Pinger {
+            id: 2_u32,
+        }));
 
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -954,9 +952,9 @@ async fn dots_clear_cache_drops_named_types_and_publishes_removals() {
 
     // Clearer publishes DotsClearCache for "Pinger".
     gt_pub
-        .publish(&DotsClearCache {
-            type_names: Some(vec!["Pinger".into()]),
-        });
+        .publish(&dots!(DotsClearCache {
+            type_names: vec!["Pinger".into()],
+        }));
 
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1048,11 +1046,11 @@ async fn dynamic_subscribe_receives_event_with_runtime_descriptor() {
     }
     assert_eq!(host.group_size("Pinger"), 1);
 
-    host.publish(&Pinger {
-        id: Some(7),
-        message: Some("dynamic".into()),
-        sequence: Some(123),
-    });
+    host.publish(&dots!(Pinger {
+        id: 7_u32,
+        message: "dynamic",
+        sequence: 123_u64,
+    }));
 
     // Spin until the handler captured the properties.
     let mut props = Vec::new();
@@ -1313,15 +1311,15 @@ async fn subscribe_all_types_funnels_events_for_distinct_types() {
     assert!(host.group_size("Pinger") >= 1);
     assert!(host.group_size("Bonk") >= 1);
 
-    host.publish(&Pinger {
-        id: Some(7),
-        message: Some("hi".into()),
-        sequence: Some(1),
-    });
-    host.publish(&Bonk {
-        id: Some(2),
-        label: Some("tagged".into()),
-    });
+    host.publish(&dots!(Pinger {
+        id: 7_u32,
+        message: "hi",
+        sequence: 1_u64,
+    }));
+    host.publish(&dots!(Bonk {
+        id: 2_u32,
+        label: "tagged",
+    }));
 
     // Wait until both types have at least one captured event.
     let mut events: Vec<(String, Option<u32>)> = Vec::new();

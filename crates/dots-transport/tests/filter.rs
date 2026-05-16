@@ -1,7 +1,7 @@
 //! Predicate evaluator: compile + matches against a synthetic
 //! `Sample` type.
 
-use dots_core::{DynamicStruct, DynamicStructDescriptor, DynamicValue, PropertySet, Timepoint};
+use dots_core::{DynamicStruct, DynamicStructDescriptor, DynamicValue, PropertySet, Timepoint, dots};
 use dots_derive::DotsStruct;
 use dots_model::filter::{
     DotsCompareOp, DotsPredicate, DotsPredicateKind, DotsPredicateLeaf, DotsPredicateNode,
@@ -38,23 +38,21 @@ fn payload_of(s: &Sample) -> DynamicStruct {
 }
 
 fn leaf(tag: u32, op: DotsCompareOp, value: Option<DotsPredicateValue>) -> DotsPredicateNode {
-    DotsPredicateNode {
-        kind: Some(DotsPredicateKind::Leaf),
-        leaf: Some(DotsPredicateLeaf {
-            property_tag: Some(tag),
-            op: Some(op),
-            value,
-        }),
-        ..Default::default()
-    }
+    dots!(DotsPredicateNode {
+        kind: DotsPredicateKind::Leaf,
+        leaf: DotsPredicateLeaf {
+            property_tag: tag,
+            op: op,
+            value: value,
+        },
+    })
 }
 
 fn op_node(kind: DotsPredicateKind, arity: u32) -> DotsPredicateNode {
-    DotsPredicateNode {
-        kind: Some(kind),
-        arity: Some(arity),
-        ..Default::default()
-    }
+    dots!(DotsPredicateNode {
+        kind: kind,
+        arity: arity,
+    })
 }
 
 #[test]
@@ -68,71 +66,59 @@ fn empty_predicate_matches_everything() {
 
 #[test]
 fn eq_on_u32_key() {
-    let pred = DotsPredicate {
-        nodes: Some(vec![leaf(
+    let pred = dots!(DotsPredicate {
+        nodes: vec![leaf(
             1,
             DotsCompareOp::Eq,
-            Some(DotsPredicateValue {
-                uint_val: Some(42),
-                ..Default::default()
-            }),
-        )]),
-    };
+            Some(dots!(DotsPredicateValue { uint_val: 42_u64 })),
+        )],
+    });
     let compiled = CompiledPredicate::compile(&pred, &descriptor()).unwrap();
-    assert!(compiled.matches(&payload_of(&Sample { id: Some(42), ..Default::default() })));
-    assert!(!compiled.matches(&payload_of(&Sample { id: Some(7), ..Default::default() })));
+    assert!(compiled.matches(&payload_of(&dots!(Sample { id: 42_u32 }))));
+    assert!(!compiled.matches(&payload_of(&dots!(Sample { id: 7_u32 }))));
 }
 
 #[test]
 fn lt_on_i64_score() {
-    let pred = DotsPredicate {
-        nodes: Some(vec![leaf(
+    let pred = dots!(DotsPredicate {
+        nodes: vec![leaf(
             3,
             DotsCompareOp::Lt,
-            Some(DotsPredicateValue {
-                int_val: Some(100),
-                ..Default::default()
-            }),
-        )]),
-    };
+            Some(dots!(DotsPredicateValue { int_val: 100_i64 })),
+        )],
+    });
     let compiled = CompiledPredicate::compile(&pred, &descriptor()).unwrap();
-    assert!(compiled.matches(&payload_of(&Sample { score: Some(99), ..Default::default() })));
-    assert!(!compiled.matches(&payload_of(&Sample { score: Some(100), ..Default::default() })));
-    assert!(!compiled.matches(&payload_of(&Sample { score: Some(101), ..Default::default() })));
+    assert!(compiled.matches(&payload_of(&dots!(Sample { score: 99_i64 }))));
+    assert!(!compiled.matches(&payload_of(&dots!(Sample { score: 100_i64 }))));
+    assert!(!compiled.matches(&payload_of(&dots!(Sample { score: 101_i64 }))));
 }
 
 #[test]
 fn neq_string() {
-    let pred = DotsPredicate {
-        nodes: Some(vec![leaf(
+    let pred = dots!(DotsPredicate {
+        nodes: vec![leaf(
             2,
             DotsCompareOp::Neq,
-            Some(DotsPredicateValue {
-                string_val: Some("alice".into()),
-                ..Default::default()
-            }),
-        )]),
-    };
+            Some(dots!(DotsPredicateValue { string_val: "alice" })),
+        )],
+    });
     let compiled = CompiledPredicate::compile(&pred, &descriptor()).unwrap();
-    assert!(compiled.matches(&payload_of(&Sample { name: Some("bob".into()), ..Default::default() })));
-    assert!(!compiled.matches(&payload_of(&Sample {
-        name: Some("alice".into()),
-        ..Default::default()
-    })));
+    assert!(compiled.matches(&payload_of(&dots!(Sample { name: "bob" }))));
+    assert!(!compiled.matches(&payload_of(&dots!(Sample { name: "alice" }))));
 }
 
 #[test]
 fn is_null_and_not_null() {
-    let is_null = DotsPredicate {
-        nodes: Some(vec![leaf(2, DotsCompareOp::IsNull, None)]),
-    };
-    let not_null = DotsPredicate {
-        nodes: Some(vec![leaf(2, DotsCompareOp::NotNull, None)]),
-    };
+    let is_null = dots!(DotsPredicate {
+        nodes: vec![leaf(2, DotsCompareOp::IsNull, None)],
+    });
+    let not_null = dots!(DotsPredicate {
+        nodes: vec![leaf(2, DotsCompareOp::NotNull, None)],
+    });
     let c_null = CompiledPredicate::compile(&is_null, &descriptor()).unwrap();
     let c_notnull = CompiledPredicate::compile(&not_null, &descriptor()).unwrap();
     let empty = Sample::default();
-    let filled = Sample { name: Some("x".into()), ..Default::default() };
+    let filled = dots!(Sample { name: "x" });
     assert!(c_null.matches(&payload_of(&empty)));
     assert!(!c_null.matches(&payload_of(&filled)));
     assert!(!c_notnull.matches(&payload_of(&empty)));
@@ -141,231 +127,188 @@ fn is_null_and_not_null() {
 
 #[test]
 fn is_in_on_u32() {
-    let pred = DotsPredicate {
-        nodes: Some(vec![leaf(
+    let pred = dots!(DotsPredicate {
+        nodes: vec![leaf(
             1,
             DotsCompareOp::IsIn,
-            Some(DotsPredicateValue {
-                uint_list: Some(vec![10, 20, 30]),
-                ..Default::default()
-            }),
-        )]),
-    };
+            Some(dots!(DotsPredicateValue {
+                uint_list: vec![10_u64, 20, 30],
+            })),
+        )],
+    });
     let compiled = CompiledPredicate::compile(&pred, &descriptor()).unwrap();
-    assert!(compiled.matches(&payload_of(&Sample { id: Some(20), ..Default::default() })));
-    assert!(!compiled.matches(&payload_of(&Sample { id: Some(40), ..Default::default() })));
+    assert!(compiled.matches(&payload_of(&dots!(Sample { id: 20_u32 }))));
+    assert!(!compiled.matches(&payload_of(&dots!(Sample { id: 40_u32 }))));
 }
 
 #[test]
 fn n_ary_and_or_not() {
     // (id == 1 && score < 100) — n-ary And with arity 2
-    let pred = DotsPredicate {
-        nodes: Some(vec![
+    let pred = dots!(DotsPredicate {
+        nodes: vec![
             op_node(DotsPredicateKind::AndOp, 2),
             leaf(
                 1,
                 DotsCompareOp::Eq,
-                Some(DotsPredicateValue {
-                    uint_val: Some(1),
-                    ..Default::default()
-                }),
+                Some(dots!(DotsPredicateValue { uint_val: 1_u64 })),
             ),
             leaf(
                 3,
                 DotsCompareOp::Lt,
-                Some(DotsPredicateValue {
-                    int_val: Some(100),
-                    ..Default::default()
-                }),
+                Some(dots!(DotsPredicateValue { int_val: 100_i64 })),
             ),
-        ]),
-    };
+        ],
+    });
     let compiled = CompiledPredicate::compile(&pred, &descriptor()).unwrap();
-    assert!(compiled.matches(&payload_of(&Sample {
-        id: Some(1),
-        score: Some(50),
-        ..Default::default()
-    })));
-    assert!(!compiled.matches(&payload_of(&Sample {
-        id: Some(2),
-        score: Some(50),
-        ..Default::default()
-    })));
-    assert!(!compiled.matches(&payload_of(&Sample {
-        id: Some(1),
-        score: Some(200),
-        ..Default::default()
-    })));
+    assert!(compiled.matches(&payload_of(&dots!(Sample {
+        id: 1_u32,
+        score: 50_i64,
+    }))));
+    assert!(!compiled.matches(&payload_of(&dots!(Sample {
+        id: 2_u32,
+        score: 50_i64,
+    }))));
+    assert!(!compiled.matches(&payload_of(&dots!(Sample {
+        id: 1_u32,
+        score: 200_i64,
+    }))));
 
     // !(id == 1) — NotOp with arity 1
-    let pred = DotsPredicate {
-        nodes: Some(vec![
+    let pred = dots!(DotsPredicate {
+        nodes: vec![
             op_node(DotsPredicateKind::NotOp, 1),
             leaf(
                 1,
                 DotsCompareOp::Eq,
-                Some(DotsPredicateValue {
-                    uint_val: Some(1),
-                    ..Default::default()
-                }),
+                Some(dots!(DotsPredicateValue { uint_val: 1_u64 })),
             ),
-        ]),
-    };
+        ],
+    });
     let compiled = CompiledPredicate::compile(&pred, &descriptor()).unwrap();
-    assert!(!compiled.matches(&payload_of(&Sample { id: Some(1), ..Default::default() })));
-    assert!(compiled.matches(&payload_of(&Sample { id: Some(2), ..Default::default() })));
+    assert!(!compiled.matches(&payload_of(&dots!(Sample { id: 1_u32 }))));
+    assert!(compiled.matches(&payload_of(&dots!(Sample { id: 2_u32 }))));
 }
 
 #[test]
 fn n_ary_collapsed_and() {
     // (a & b & c) → arity-3 And, not nested 2,2
-    let pred = DotsPredicate {
-        nodes: Some(vec![
+    let pred = dots!(DotsPredicate {
+        nodes: vec![
             op_node(DotsPredicateKind::AndOp, 3),
             leaf(
                 1,
                 DotsCompareOp::Eq,
-                Some(DotsPredicateValue {
-                    uint_val: Some(7),
-                    ..Default::default()
-                }),
+                Some(dots!(DotsPredicateValue { uint_val: 7_u64 })),
             ),
             leaf(
                 3,
                 DotsCompareOp::Gt,
-                Some(DotsPredicateValue {
-                    int_val: Some(0),
-                    ..Default::default()
-                }),
+                Some(dots!(DotsPredicateValue { int_val: 0_i64 })),
             ),
             leaf(
                 2,
                 DotsCompareOp::Eq,
-                Some(DotsPredicateValue {
-                    string_val: Some("hi".into()),
-                    ..Default::default()
-                }),
+                Some(dots!(DotsPredicateValue { string_val: "hi" })),
             ),
-        ]),
-    };
+        ],
+    });
     let compiled = CompiledPredicate::compile(&pred, &descriptor()).unwrap();
-    assert!(compiled.matches(&payload_of(&Sample {
-        id: Some(7),
-        score: Some(10),
-        name: Some("hi".into()),
-        ..Default::default()
-    })));
-    assert!(!compiled.matches(&payload_of(&Sample {
-        id: Some(7),
-        score: Some(10),
-        name: Some("nope".into()),
-        ..Default::default()
-    })));
+    assert!(compiled.matches(&payload_of(&dots!(Sample {
+        id: 7_u32,
+        score: 10_i64,
+        name: "hi",
+    }))));
+    assert!(!compiled.matches(&payload_of(&dots!(Sample {
+        id: 7_u32,
+        score: 10_i64,
+        name: "nope",
+    }))));
 }
 
 #[test]
 fn rejects_unknown_property_tag() {
-    let pred = DotsPredicate {
-        nodes: Some(vec![leaf(
+    let pred = dots!(DotsPredicate {
+        nodes: vec![leaf(
             99,
             DotsCompareOp::Eq,
-            Some(DotsPredicateValue {
-                uint_val: Some(0),
-                ..Default::default()
-            }),
-        )]),
-    };
+            Some(dots!(DotsPredicateValue { uint_val: 0_u64 })),
+        )],
+    });
     assert!(CompiledPredicate::compile(&pred, &descriptor()).is_err());
 }
 
 #[test]
 fn rejects_wrong_value_slot() {
     // u32 property compared against an int_val slot (should be uint_val)
-    let pred = DotsPredicate {
-        nodes: Some(vec![leaf(
+    let pred = dots!(DotsPredicate {
+        nodes: vec![leaf(
             1,
             DotsCompareOp::Eq,
-            Some(DotsPredicateValue {
-                int_val: Some(1),
-                ..Default::default()
-            }),
-        )]),
-    };
+            Some(dots!(DotsPredicateValue { int_val: 1_i64 })),
+        )],
+    });
     assert!(CompiledPredicate::compile(&pred, &descriptor()).is_err());
 }
 
 #[test]
 fn rejects_ordered_op_on_bool() {
-    let pred = DotsPredicate {
-        nodes: Some(vec![leaf(
+    let pred = dots!(DotsPredicate {
+        nodes: vec![leaf(
             4,
             DotsCompareOp::Lt,
-            Some(DotsPredicateValue {
-                bool_val: Some(true),
-                ..Default::default()
-            }),
-        )]),
-    };
+            Some(dots!(DotsPredicateValue { bool_val: true })),
+        )],
+    });
     assert!(CompiledPredicate::compile(&pred, &descriptor()).is_err());
 }
 
 #[test]
 fn rejects_truncated_tree() {
     // AndOp arity=2 with only one child
-    let pred = DotsPredicate {
-        nodes: Some(vec![
+    let pred = dots!(DotsPredicate {
+        nodes: vec![
             op_node(DotsPredicateKind::AndOp, 2),
             leaf(
                 1,
                 DotsCompareOp::Eq,
-                Some(DotsPredicateValue {
-                    uint_val: Some(0),
-                    ..Default::default()
-                }),
+                Some(dots!(DotsPredicateValue { uint_val: 0_u64 })),
             ),
-        ]),
-    };
+        ],
+    });
     assert!(CompiledPredicate::compile(&pred, &descriptor()).is_err());
 }
 
 #[test]
 fn rejects_bad_not_arity() {
-    let pred = DotsPredicate {
-        nodes: Some(vec![
+    let pred = dots!(DotsPredicate {
+        nodes: vec![
             op_node(DotsPredicateKind::NotOp, 2),
             leaf(
                 1,
                 DotsCompareOp::Eq,
-                Some(DotsPredicateValue {
-                    uint_val: Some(0),
-                    ..Default::default()
-                }),
+                Some(dots!(DotsPredicateValue { uint_val: 0_u64 })),
             ),
             leaf(
                 1,
                 DotsCompareOp::Eq,
-                Some(DotsPredicateValue {
-                    uint_val: Some(0),
-                    ..Default::default()
-                }),
+                Some(dots!(DotsPredicateValue { uint_val: 0_u64 })),
             ),
-        ]),
-    };
+        ],
+    });
     assert!(CompiledPredicate::compile(&pred, &descriptor()).is_err());
 }
 
 #[test]
 fn rejects_empty_list() {
-    let pred = DotsPredicate {
-        nodes: Some(vec![leaf(
+    let pred = dots!(DotsPredicate {
+        nodes: vec![leaf(
             1,
             DotsCompareOp::IsIn,
-            Some(DotsPredicateValue {
-                uint_list: Some(vec![]),
-                ..Default::default()
-            }),
-        )]),
-    };
+            Some(dots!(DotsPredicateValue {
+                uint_list: Vec::<u64>::new(),
+            })),
+        )],
+    });
     assert!(CompiledPredicate::compile(&pred, &descriptor()).is_err());
 }
 
@@ -373,66 +316,54 @@ fn rejects_empty_list() {
 fn uuid_eq_and_is_in() {
     let a: [u8; 16] = [1; 16];
     let b: [u8; 16] = [2; 16];
-    let pred_eq = DotsPredicate {
-        nodes: Some(vec![leaf(
+    let pred_eq = dots!(DotsPredicate {
+        nodes: vec![leaf(
             7,
             DotsCompareOp::Eq,
-            Some(DotsPredicateValue {
-                uuid_val: Some(a),
-                ..Default::default()
-            }),
-        )]),
-    };
+            Some(dots!(DotsPredicateValue { uuid_val: a })),
+        )],
+    });
     let c = CompiledPredicate::compile(&pred_eq, &descriptor()).unwrap();
-    assert!(c.matches(&payload_of(&Sample { badge: Some(a), ..Default::default() })));
-    assert!(!c.matches(&payload_of(&Sample { badge: Some(b), ..Default::default() })));
+    assert!(c.matches(&payload_of(&dots!(Sample { badge: a }))));
+    assert!(!c.matches(&payload_of(&dots!(Sample { badge: b }))));
 
     // is_in
-    let pred_in = DotsPredicate {
-        nodes: Some(vec![leaf(
+    let pred_in = dots!(DotsPredicate {
+        nodes: vec![leaf(
             7,
             DotsCompareOp::IsIn,
-            Some(DotsPredicateValue {
-                uuid_list: Some(vec![a, b]),
-                ..Default::default()
-            }),
-        )]),
-    };
+            Some(dots!(DotsPredicateValue { uuid_list: vec![a, b] })),
+        )],
+    });
     let c = CompiledPredicate::compile(&pred_in, &descriptor()).unwrap();
-    assert!(c.matches(&payload_of(&Sample { badge: Some(a), ..Default::default() })));
-    assert!(c.matches(&payload_of(&Sample { badge: Some(b), ..Default::default() })));
-    assert!(!c.matches(&payload_of(&Sample { badge: Some([3; 16]), ..Default::default() })));
+    assert!(c.matches(&payload_of(&dots!(Sample { badge: a }))));
+    assert!(c.matches(&payload_of(&dots!(Sample { badge: b }))));
+    assert!(!c.matches(&payload_of(&dots!(Sample { badge: [3_u8; 16] }))));
 
     // ordered op on uuid — rejected at compile time
-    let pred_bad = DotsPredicate {
-        nodes: Some(vec![leaf(
+    let pred_bad = dots!(DotsPredicate {
+        nodes: vec![leaf(
             7,
             DotsCompareOp::Lt,
-            Some(DotsPredicateValue {
-                uuid_val: Some(a),
-                ..Default::default()
-            }),
-        )]),
-    };
+            Some(dots!(DotsPredicateValue { uuid_val: a })),
+        )],
+    });
     assert!(CompiledPredicate::compile(&pred_bad, &descriptor()).is_err());
 }
 
 #[test]
 fn float_compares() {
-    let pred = DotsPredicate {
-        nodes: Some(vec![leaf(
+    let pred = dots!(DotsPredicate {
+        nodes: vec![leaf(
             5,
             DotsCompareOp::Ge,
-            Some(DotsPredicateValue {
-                float_val: Some(0.5),
-                ..Default::default()
-            }),
-        )]),
-    };
+            Some(dots!(DotsPredicateValue { float_val: 0.5_f64 })),
+        )],
+    });
     let c = CompiledPredicate::compile(&pred, &descriptor()).unwrap();
-    assert!(c.matches(&payload_of(&Sample { ratio: Some(0.5), ..Default::default() })));
-    assert!(c.matches(&payload_of(&Sample { ratio: Some(0.9), ..Default::default() })));
-    assert!(!c.matches(&payload_of(&Sample { ratio: Some(0.1), ..Default::default() })));
+    assert!(c.matches(&payload_of(&dots!(Sample { ratio: 0.5_f64 }))));
+    assert!(c.matches(&payload_of(&dots!(Sample { ratio: 0.9_f64 }))));
+    assert!(!c.matches(&payload_of(&dots!(Sample { ratio: 0.1_f64 }))));
 }
 
 #[test]

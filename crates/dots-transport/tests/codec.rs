@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use dots_core::{DynamicStruct, decode_typed_from_slice, encode_to_vec};
+use dots_core::{DynamicStruct, decode_typed_from_slice, dots, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
     DotsHeader, FramingError, MAX_BODY_SIZE, Registry, SIZE_PREFIX_MARKER, StructDescriptorData,
@@ -38,16 +38,15 @@ fn populated_registry() -> Arc<Registry> {
 }
 
 fn sample_transmission(id: u32, label: &str) -> Transmission {
-    let header = DotsHeader {
-        type_name: Some("Sample".into()),
-        sender: Some(7),
-        ..Default::default()
-    };
+    let header = dots!(DotsHeader {
+        type_name: "Sample",
+        sender: 7_u32,
+    });
     // Build the dynamic payload by typed-encoding then registry-decoding.
-    let typed = Sample {
-        id: Some(id),
-        label: Some(label.into()),
-    };
+    let typed = dots!(Sample {
+        id: id,
+        label: label,
+    });
     let payload_bytes = encode_to_vec(&typed);
     let registry = populated_registry();
     let descriptor = match registry.lookup("Sample").unwrap() {
@@ -256,15 +255,14 @@ async fn typed_payload_decodes_via_registry_then_back_to_typed() {
     let (mut a, b) = tokio::io::duplex(1024);
     let mut receiver = Framed::new(b, TransmissionCodec::new(registry));
 
-    let header = DotsHeader {
-        type_name: Some("Sample".into()),
-        sender: Some(99),
-        ..Default::default()
-    };
-    let typed_payload = Sample {
-        id: Some(1234),
-        label: Some("typed→dynamic→typed".into()),
-    };
+    let header = dots!(DotsHeader {
+        type_name: "Sample",
+        sender: 99_u32,
+    });
+    let typed_payload = dots!(Sample {
+        id: 1234_u32,
+        label: "typed→dynamic→typed",
+    });
     let frame = dots_model::encode_transmission(&header, &typed_payload);
 
     a.write_all(&frame).await.unwrap();

@@ -17,6 +17,11 @@
 
 extern crate alloc;
 
+// Self-alias so the `dots!` proc macro's `::dots_core::...` paths
+// resolve when the macro is invoked from inside this crate (e.g. the
+// `macro_tests` module below).
+extern crate self as dots_core;
+
 mod descriptor;
 pub mod dynamic;
 pub mod layout;
@@ -106,6 +111,11 @@ impl<T, U: Into<T>> DotsAssignGeneric<T> for DotsAssign<U> {
 /// - An `Option<U>` is passed through verbatim (with `Into` on the
 ///   inner type if needed), so `dots!(Foo { brightness: other.brightness })`
 ///   forwards `None` as `None` and `Some(x)` as `Some(x.into())`.
+/// - A nested struct literal is rewritten recursively, so
+///   `dots!(Outer { inner: Inner { x: 1 } })` works without manually
+///   wrapping the inner fields in `Some(_)`. To opt out of recursion
+///   (e.g. when the inner type is not a DOTS struct), wrap the value
+///   explicitly: `inner: Some(Inner { x: Some(1) })`.
 ///
 /// Unspecified fields fall back to `Default::default()` (which for
 /// DOTS structs is all-`None`).
@@ -117,38 +127,11 @@ impl<T, U: Into<T>> DotsAssignGeneric<T> for DotsAssign<U> {
 /// when the target type is more constrained.
 ///
 /// See the `dots-example` crate for a runnable demonstration.
-#[macro_export]
-macro_rules! dots {
-    ($($ty:ident)::+ { $($field:ident : $value:expr),* $(,)? }) => {
-        {
-            // The trailing `..Default::default()` is always emitted so
-            // the macro works whether the caller listed every field or
-            // not. When all fields are listed clippy flags that as
-            // `needless_update`; suppress here because the macro can't
-            // know in advance whether the caller covered the struct.
-            #[allow(clippy::needless_update)]
-            let __dots_value = $($ty)::+ {
-                $(
-                    $field: {
-                        // Pull `DotsAssignGeneric` into scope so the
-                        // trait method is callable; the inherent
-                        // method on `DotsAssign<Option<_>>` wins for
-                        // `Option` values, the trait method handles
-                        // everything else.
-                        #[allow(unused_imports)]
-                        use $crate::DotsAssignGeneric as _;
-                        $crate::DotsAssign($value).into_dots_field()
-                    },
-                )*
-                ..::core::default::Default::default()
-            };
-            __dots_value
-        }
-    };
-}
+pub use dots_derive::dots;
 
 #[cfg(test)]
 mod macro_tests {
+    use crate::dots;
     use alloc::string::String;
 
     #[derive(Default, Debug, PartialEq)]
@@ -157,6 +140,25 @@ mod macro_tests {
         big_id: Option<u64>,
         name: Option<String>,
         flag: Option<bool>,
+    }
+
+    #[derive(Default, Debug, PartialEq)]
+    struct Wrap {
+        inner: Option<Foo>,
+        tag: Option<String>,
+    }
+
+    #[test]
+    fn dots_macro_recurses_into_nested_struct_literal() {
+        let w = dots!(Wrap {
+            tag: "outer",
+            inner: Foo { id: 7, name: "n" },
+        });
+        assert_eq!(w.tag.as_deref(), Some("outer"));
+        let inner = w.inner.expect("inner set");
+        assert_eq!(inner.id, Some(7));
+        assert_eq!(inner.name.as_deref(), Some("n"));
+        assert_eq!(inner.flag, None);
     }
 
     #[test]
