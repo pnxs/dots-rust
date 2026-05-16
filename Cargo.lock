@@ -145,6 +145,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dots-pinger-filtered"
+version = "0.1.0"
+dependencies = [
+ "dots-core",
+ "dots-derive",
+ "dots-model",
+ "dots-transport",
+ "rand",
+ "tokio",
+]
+
+[[package]]
 name = "dots-smarthome"
 version = "0.1.0"
 dependencies = [
