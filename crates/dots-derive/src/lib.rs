@@ -168,6 +168,37 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let flags_expr = build_flags_expr(&container);
 
+    // Per-field constants for the filter DSL (one PropertySet
+    // projection-bit, plus a typed `Attr<Self, V>` handle for leaf
+    // value types that the wire predicate value-slots support).
+    // Emitted on the struct directly so users can write
+    // `Pinger::PROP_SEQUENCE` and `Pinger::SEQUENCE.eq(value)`.
+    let filter_consts = fields.iter().map(|f| {
+        let upper = Ident::new(
+            &f.ident.to_string().to_uppercase(),
+            f.ident.span(),
+        );
+        let prop_ident = Ident::new(&format!("PROP_{upper}"), f.ident.span());
+        let tag = f.tag;
+        let prop_const = quote! {
+            #[doc = concat!("Single-bit `PropertySet` selecting the `", stringify!(#upper), "` property — useful for `FilterBuilder::project` masks.")]
+            pub const #prop_ident: ::dots_core::PropertySet =
+                ::dots_core::PropertySet::EMPTY.with_tag(#tag);
+        };
+        if is_dsl_leaf_type(f.inner_ty) {
+            let inner_ty = f.inner_ty;
+            quote! {
+                #prop_const
+
+                #[doc = concat!("Filter DSL handle for the `", stringify!(#upper), "` property; compose with `.eq(v)`, `.lt(v)`, etc. to build a `Predicate<Self>`.")]
+                pub const #upper: ::dots_model::filter::Attr<Self, #inner_ty> =
+                    ::dots_model::filter::Attr::new(#tag);
+            }
+        } else {
+            prop_const
+        }
+    });
+
     let accessors = fields.iter().map(|f| {
         let ident = f.ident;
         let inner_ty = f.inner_ty;
@@ -358,6 +389,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
         impl #struct_ident {
             #new_constructor
+            #( #filter_consts )*
             #( #accessors )*
         }
 
@@ -479,6 +511,47 @@ fn vec_element_type(ty: &Type) -> Option<&Type> {
         GenericArgument::Type(t) => Some(t),
         _ => None,
     })
+}
+
+/// True if `ty` is a leaf type the filter DSL supports as the RHS
+/// of a predicate comparison — scalars, String, Timepoint /
+/// Duration, and the `uuid` array `[u8; 16]`. Vec / nested struct /
+/// enum fields are intentionally excluded so emitted constants only
+/// exist where they're actually usable.
+fn is_dsl_leaf_type(ty: &Type) -> bool {
+    if let Type::Path(tp) = ty {
+        if let Some(last) = tp.path.segments.last() {
+            let name = last.ident.to_string();
+            return matches!(
+                name.as_str(),
+                "bool"
+                    | "u8" | "u16" | "u32" | "u64"
+                    | "i8" | "i16" | "i32" | "i64"
+                    | "f32" | "f64"
+                    | "String"
+                    | "Timepoint"
+                    | "Duration"
+            );
+        }
+    }
+    if let Type::Array(arr) = ty {
+        // Match `[u8; 16]` exactly — the only fixed-byte type in
+        // DOTS (`uuid`).
+        if let Type::Path(tp) = &*arr.elem {
+            if tp.path.segments.last().is_some_and(|s| s.ident == "u8") {
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Int(n),
+                    ..
+                }) = &arr.len
+                {
+                    if n.base10_parse::<u32>().ok() == Some(16) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn vtable_ident(field_ident: &Ident) -> Ident {

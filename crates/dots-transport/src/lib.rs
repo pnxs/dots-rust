@@ -29,6 +29,7 @@ mod error;
 pub mod filter;
 mod guest;
 mod host;
+mod view;
 #[cfg(feature = "tracing-init")]
 mod tracing_init;
 
@@ -45,6 +46,7 @@ pub use guest::{
     AllTypesSubscription, GuestDriver, GuestError, GuestTransceiver, SubscriptionHandle,
 };
 pub use host::{EndpointHandle, HOST_ID, HostTransceiver};
+pub use view::{View, ViewError, ViewSubscription};
 #[cfg(feature = "tracing-init")]
 pub use tracing_init::init_tracing;
 

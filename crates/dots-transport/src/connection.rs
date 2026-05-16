@@ -583,6 +583,22 @@ where
 /// no-ops. The retain_mut return value is the canonical way to
 /// drop self-from-dispatch and is unaffected.
 fn dispatch_external(dispatch: &Arc<Mutex<DispatchState>>, txn: &Transmission) {
+    // Filtered subscription demux: if the broker tagged this
+    // transmission with a `subscription_id`, it's destined for a
+    // `View<T>` and bypasses the global type-name dispatcher.
+    // Unknown subscription_ids (in-flight teardown race) silently
+    // drop.
+    if let Some(sub_id) = txn.header.subscription_id {
+        let view = {
+            let state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.views.get(&sub_id).and_then(|w| w.upgrade())
+        };
+        if let Some(v) = view {
+            v.dispatch(txn);
+        }
+        return;
+    }
+
     let Some(type_name) = txn.header.type_name.as_deref() else {
         return;
     };
@@ -710,11 +726,26 @@ impl<T> Drop for Subscription<T> {
 type DispatchEntries = Vec<(u64, Box<dyn DispatchEntry>)>;
 
 /// Type-erased dispatch table: map from wire `type_name` to the list of
-/// active subscribers for that type.
+/// active subscribers for that type. Also carries the filtered-subscription
+/// demux table — incoming transmissions tagged with
+/// `header.subscription_id` route to the matching [`ViewDispatch`]
+/// entry rather than the type-name dispatcher.
 #[derive(Default)]
 pub(crate) struct DispatchState {
     pub(crate) next_id: u64,
     pub(crate) entries: HashMap<String, DispatchEntries>,
+    /// Filtered-subscription demux table. Keyed by client-allocated
+    /// `subscription_id`. Held as `Weak` so the `View<T>` value's
+    /// drop is what actually frees the underlying state — dropping
+    /// the table key here only happens when `_unregister_view` is
+    /// called explicitly (typically from `View<T>::drop`).
+    pub(crate) views: HashMap<u32, std::sync::Weak<dyn ViewDispatch>>,
+}
+
+/// Type-erased view dispatch. Implementations decode the payload
+/// against `T` and route it to the view's container + handler list.
+pub(crate) trait ViewDispatch: Send + Sync {
+    fn dispatch(&self, txn: &Transmission);
 }
 
 impl DispatchState {
@@ -739,6 +770,24 @@ impl DispatchState {
                 self.entries.remove(type_name);
             }
         }
+    }
+
+    /// Register a filtered-subscription dispatcher under
+    /// `subscription_id`. Held as `Weak` so the actual lifecycle is
+    /// pinned by the user's `View<T>` value (this map releases its
+    /// slot when `unregister_view` is called from `View<T>::drop`).
+    pub(crate) fn register_view(
+        &mut self,
+        subscription_id: u32,
+        view: std::sync::Weak<dyn ViewDispatch>,
+    ) {
+        self.views.insert(subscription_id, view);
+    }
+
+    /// Remove a filtered-subscription dispatcher from the demux
+    /// table. No-op if the id isn't present.
+    pub(crate) fn unregister_view(&mut self, subscription_id: u32) {
+        self.views.remove(&subscription_id);
     }
 }
 

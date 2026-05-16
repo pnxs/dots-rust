@@ -354,6 +354,21 @@ impl App {
         self.transceiver.container::<T>()
     }
 
+    /// Open a filtered subscription on `T` — see
+    /// [`GuestTransceiver::view`]. Returns
+    /// [`ViewError::Unsupported`](crate::ViewError::Unsupported) when
+    /// the broker hasn't advertised the filtered-subscriptions
+    /// capability.
+    pub fn view<T>(
+        &self,
+        filter: dots_model::filter::DotsFilter,
+    ) -> Result<crate::View<T>, crate::ViewError>
+    where
+        T: StructValue + Default + Send + Clone + 'static + dots_core::GlobalRegistration,
+    {
+        self.transceiver.view::<T>(filter)
+    }
+
     pub fn register_enum(&self, descriptor: &'static EnumDescriptor) {
         self.transceiver.register_enum(descriptor)
     }

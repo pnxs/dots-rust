@@ -61,7 +61,7 @@ type Entries<T> = BTreeMap<Vec<u8>, ContainerEntry<T>>;
 /// That makes it natural to hand a `Container<T>` into a callback or
 /// spawned task without extra ceremony.
 pub struct Container<T> {
-    entries: Arc<Mutex<Entries<T>>>,
+    pub(crate) entries: Arc<Mutex<Entries<T>>>,
     /// Refcounted lifecycle bits — dispatch handle and optional
     /// group-leaver. The `Drop` impl on the inner struct fires once,
     /// when the last `Container<T>` clone goes out of scope.
@@ -221,41 +221,64 @@ where
     T: StructValue + Default + Send + 'static,
 {
     fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError> {
-        let bytes = txn.payload.encode();
-        let value: T = decode_typed_from_slice(&bytes)?;
-        let key = encode_key_bytes(&value);
-
-        let mut entries = self.entries.lock().expect("container mutex poisoned");
-        if txn.header.remove_obj == Some(true) {
-            entries.remove(&key);
-            return Ok(true);
-        }
-
-        // Determine create vs. update by checking for an existing
-        // entry. If it exists, preserve its created_* metadata.
-        let now_sender = txn.header.sender;
-        let now_time = txn.header.sent_time;
-        let (operation, created_time, created_sender) = match entries.get(&key) {
-            Some(existing) => (
-                Operation::Update,
-                existing.clone_info.created_time,
-                existing.clone_info.created_sender,
-            ),
-            None => (Operation::Create, now_time, now_sender),
-        };
-        entries.insert(
-            key,
-            ContainerEntry {
-                value,
-                clone_info: CloneInfo {
-                    last_operation: operation,
-                    last_update_time: now_time,
-                    last_update_sender: now_sender,
-                    created_time,
-                    created_sender,
-                },
-            },
-        );
+        update_entries_from_txn::<T>(&self.entries, txn)?;
         Ok(true)
     }
+}
+
+/// Shared body of the container's per-event update — used both by
+/// the unfiltered `ContainerDispatchEntry` path and by the
+/// filtered-subscription `View<T>` dispatcher.
+fn update_entries_from_txn<T>(
+    entries: &Arc<Mutex<Entries<T>>>,
+    txn: &Transmission,
+) -> Result<(), dots_core::DecodeError>
+where
+    T: StructValue + Default + Send + 'static,
+{
+    let bytes = txn.payload.encode();
+    let value: T = decode_typed_from_slice(&bytes)?;
+    let key = encode_key_bytes(&value);
+
+    let mut entries = entries.lock().expect("container mutex poisoned");
+    if txn.header.remove_obj == Some(true) {
+        entries.remove(&key);
+        return Ok(());
+    }
+
+    let now_sender = txn.header.sender;
+    let now_time = txn.header.sent_time;
+    let (operation, created_time, created_sender) = match entries.get(&key) {
+        Some(existing) => (
+            Operation::Update,
+            existing.clone_info.created_time,
+            existing.clone_info.created_sender,
+        ),
+        None => (Operation::Create, now_time, now_sender),
+    };
+    entries.insert(
+        key,
+        ContainerEntry {
+            value,
+            clone_info: CloneInfo {
+                last_operation: operation,
+                last_update_time: now_time,
+                last_update_sender: now_sender,
+                created_time,
+                created_sender,
+            },
+        },
+    );
+    Ok(())
+}
+
+/// Apply a transmission to a [`Container<T>`] from the
+/// `View<T>` dispatch path. Decodes the payload, updates the
+/// container, silently drops on decode failure (matches the
+/// unfiltered subscription tolerance).
+pub(crate) fn view_dispatch_update<T>(container: &Container<T>, txn: &Transmission)
+where
+    T: StructValue + Default + Send + 'static,
+{
+    let _ = update_entries_from_txn::<T>(&container.entries, txn);
 }

@@ -13,16 +13,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use dots_core::{
     DynamicStruct, DynamicStructDescriptor, EnumDescriptor, PropertySet, Publishable,
     StructDescriptor, StructValue, Timepoint, Transmittable, decode_typed_from_slice,
 };
 use dots_model::{
-    DotsHeader, DotsMember, DotsMemberEvent, EnumDescriptorData, Registry, StructDescriptorData,
-    Transmission, encode_transmission_into, encode_transmission_with_mask_into,
+    DotsHeader, DotsMember, DotsMemberEvent, DotsServerCapabilities, EnumDescriptorData, Registry,
+    StructDescriptorData, Transmission, encode_transmission_into, encode_transmission_with_mask_into,
+    filter::DotsFilter,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -133,6 +134,15 @@ pub struct GuestTransceiver {
     /// Client id assigned by the broker; populated after handshake
     /// and used to fill `header.sender` on outbound publishes.
     client_id: Mutex<Option<u32>>,
+    /// Peer capabilities advertised in `DotsMsgHello.capabilities`.
+    /// Populated once at construction (from the connected
+    /// [`Connection`]); subsequent reads come from a lock-free
+    /// `OnceLock` so the filtered-subscription View<T> hot path
+    /// doesn't take a mutex.
+    peer_capabilities: OnceLock<Option<DotsServerCapabilities>>,
+    /// Subscription-id allocator for filtered subscriptions
+    /// (`View<T>`). Monotonic, process-local, never reset.
+    next_subscription_id: AtomicU32,
 }
 
 impl GuestTransceiver {
@@ -153,6 +163,7 @@ impl GuestTransceiver {
     {
         let dispatch = conn.dispatch_handle();
         let client_id = conn.client_id();
+        let peer_capabilities = conn.peer_capabilities().cloned();
         let (tx, rx) = mpsc::unbounded_channel();
         let transceiver = Arc::new(GuestTransceiver {
             self_name: self_name.into(),
@@ -166,6 +177,12 @@ impl GuestTransceiver {
             exit_flag: AtomicBool::new(false),
             exit_notify: Notify::new(),
             client_id: Mutex::new(client_id),
+            peer_capabilities: {
+                let lock = OnceLock::new();
+                let _ = lock.set(peer_capabilities);
+                lock
+            },
+            next_subscription_id: AtomicU32::new(1),
         });
         let driver = GuestDriver {
             transceiver: transceiver.clone(),
@@ -183,6 +200,111 @@ impl GuestTransceiver {
     /// Client id assigned by the broker in the handshake.
     pub fn client_id(&self) -> Option<u32> {
         *self.client_id.lock().expect("client_id mutex poisoned")
+    }
+
+    /// Capabilities the broker advertised in its [`DotsMsgHello`].
+    /// Returns `None` either before the handshake completes or
+    /// when the broker didn't include a capabilities field — both
+    /// cases are equivalent for "is feature X supported" checks
+    /// (always return `false` from `unwrap_or_default()`-style
+    /// queries).
+    pub fn peer_capabilities(&self) -> Option<&DotsServerCapabilities> {
+        self.peer_capabilities
+            .get()
+            .and_then(|opt| opt.as_ref())
+    }
+
+    /// True if the broker advertised `filtered_subscriptions =
+    /// true`. Used by [`crate::View`] to fail-fast on construction
+    /// when filtered subscriptions aren't supported.
+    pub fn peer_supports_filtered_subscriptions(&self) -> bool {
+        self.peer_capabilities()
+            .and_then(|c| c.filtered_subscriptions)
+            .unwrap_or(false)
+    }
+
+    /// Open a filtered subscription on `T`.
+    ///
+    /// Errors with `ViewError::Unsupported` if the broker hasn't
+    /// advertised the filtered-subscriptions capability. Returns a
+    /// [`View<T>`] whose drop tears down the subscription.
+    pub fn view<T>(self: &Arc<Self>, filter: DotsFilter) -> Result<crate::View<T>, crate::ViewError>
+    where
+        T: StructValue + Default + Send + Clone + 'static + dots_core::GlobalRegistration,
+    {
+        crate::view::View::open(self, filter)
+    }
+
+    /// Allocate a fresh `subscription_id`. Process-local, monotonic.
+    pub(crate) fn allocate_subscription_id(&self) -> u32 {
+        self.next_subscription_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Register T's descriptor so the host can decode T's payload —
+    /// needed by `View<T>` which is opened after the early-handshake
+    /// descriptor exchange has ended.
+    pub(crate) fn ensure_struct_descriptor<T: StructValue>(&self) {
+        self.register_struct::<T>();
+    }
+
+    /// Shared handle on the dispatch state — used by `View<T>`'s
+    /// container construction.
+    pub(crate) fn dispatch_handle_ref(&self) -> &Arc<Mutex<DispatchState>> {
+        &self.dispatch
+    }
+
+    /// Insert a `Weak<dyn ViewDispatch>` into the demux table under
+    /// `subscription_id`. The dispatcher uses this to route
+    /// transmissions tagged with `header.subscription_id` directly
+    /// to the view, bypassing the type-name path.
+    pub(crate) fn register_view(
+        &self,
+        subscription_id: u32,
+        view: Weak<dyn crate::connection::ViewDispatch>,
+    ) {
+        self.dispatch
+            .lock()
+            .expect("dispatch mutex poisoned")
+            .register_view(subscription_id, view);
+    }
+
+    /// Drop the view's slot from the demux table. Called from
+    /// [`crate::View::drop`].
+    pub(crate) fn unregister_view(&self, subscription_id: u32) {
+        self.dispatch
+            .lock()
+            .expect("dispatch mutex poisoned")
+            .unregister_view(subscription_id);
+    }
+
+    /// Send a filtered `DotsMember(Join)` with the view's
+    /// subscription_id and filter.
+    pub(crate) fn publish_filtered_join(
+        &self,
+        type_name: &str,
+        subscription_id: u32,
+        filter: DotsFilter,
+    ) {
+        let member = DotsMember {
+            group_name: Some(type_name.into()),
+            event: Some(DotsMemberEvent::Join),
+            client: self.client_id(),
+            subscription_id: Some(subscription_id),
+            filter: Some(filter),
+        };
+        self.publish_typed(&member);
+    }
+
+    /// Send a filtered `DotsMember(Leave)` for one subscription.
+    pub(crate) fn publish_filtered_leave(&self, type_name: &str, subscription_id: u32) {
+        let member = DotsMember {
+            group_name: Some(type_name.into()),
+            event: Some(DotsMemberEvent::Leave),
+            client: self.client_id(),
+            subscription_id: Some(subscription_id),
+            filter: None,
+        };
+        self.publish_typed(&member);
     }
 
     /// Type registry shared with the underlying codec.

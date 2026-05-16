@@ -17,6 +17,14 @@
 //!   descriptors back into owned `DynamicStructDescriptor` /
 //!   `DynamicEnumDescriptor` instances.
 
+// `dots-derive` emits absolute paths like `::dots_model::filter::Attr`
+// in the constants it generates for `#[derive(DotsStruct)]` fields.
+// Inside this crate itself those paths don't resolve by default;
+// `extern crate self as dots_model` exposes the crate to itself
+// under its public name so the derive's generated code compiles for
+// internal types (DotsHeader, DotsMember, etc.) too.
+extern crate self as dots_model;
+
 pub mod connection;
 pub mod daemon;
 pub mod descriptors;
