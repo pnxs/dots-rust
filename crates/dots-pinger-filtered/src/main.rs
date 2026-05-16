@@ -1,26 +1,11 @@
-//! End-to-end smoke test of server-side filtered subscriptions.
+//! End-to-end demonstration of server-side filtered subscriptions.
+//! Publishes a deliberately-crafted sequence that crosses the filter
+//! boundary on the same key, exercising all four cases of the
+//! broker's dispatch state machine: enter view, in-view update,
+//! leave view, re-enter.
 //!
-//! Opens a `View<Pinger>` with predicate `(sequence < 100) && (id ==
-//! key)` and projection `{id, sequence}` (message is masked out),
-//! then publishes four `Pinger` instances on a single key with
-//! sequences `{50, 75, 150, 42}`. Each publish is designed to trigger
-//! a different one of the broker's four-cases dispatch transitions:
-//!
-//! ```text
-//! publish | seq | broker decision    | observed event
-//! --------+-----+--------------------+------------------
-//!   1     |  50 | enter view         | create
-//!   2     |  75 | in-view update     | update
-//!   3     | 150 | leave view         | remove (key-only)
-//!   4     |  42 | re-enter view      | create
-//! ```
-//!
-//! Mirrors `bin/examples/pinger-filtered/src/main.cpp` in dots-cpp.
-//!
-//! Verifies the observed events match expectations and exits non-zero
-//! on mismatch — usable as a smoke test. Uses a random `u32` key per
-//! run so reruns against a long-lived broker don't collide with stale
-//! cached entries.
+//! Verifies the events delivered to the View match expectations and
+//! exits non-zero on mismatch — usable as a smoke test.
 //!
 //! ```text
 //! cargo run -p dotsd                                                # in one terminal
@@ -34,7 +19,7 @@ use std::time::Duration;
 
 use dots_derive::DotsStruct;
 use dots_model::filter::predicate;
-use dots_transport::App;
+use dots_transport::{App, ViewOp};
 
 #[derive(DotsStruct, Default, Debug, Clone)]
 #[dots(name = "Pinger", cached)]
@@ -50,9 +35,20 @@ struct Pinger {
 const CLIENT_NAME: &str = "dots-pinger-filtered";
 
 #[derive(Debug, PartialEq)]
-struct Observed {
-    is_remove: bool,
-    sequence: Option<u64>,
+struct ObservedEvent {
+    op: ViewOp,
+    id: u32,
+    /// 0 if absent (the broker masked it off, etc.).
+    sequence: u64,
+    has_message: bool,
+}
+
+fn op_name(op: ViewOp) -> &'static str {
+    match op {
+        ViewOp::Create => "create",
+        ViewOp::Update => "update",
+        ViewOp::Remove => "remove",
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -62,121 +58,143 @@ async fn main() -> ExitCode {
     let app = match App::new(CLIENT_NAME).await {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("failed to connect: {e}");
+            eprintln!("ERROR connecting to dotsd -> {e}");
             return ExitCode::from(2);
         }
     };
 
-    // Random key per run keeps stale cached entries from a previous
-    // run (against a long-lived broker) out of view's predicate.
-    let key: u32 = rand::random();
-    println!("using random key = {key}");
+    let caps_ok = app
+        .transceiver()
+        .peer_capabilities()
+        .and_then(|c| c.filtered_subscriptions)
+        .unwrap_or(false);
+    if !caps_ok {
+        eprintln!("ERROR broker does not advertise filteredSubscriptions capability");
+        return ExitCode::from(1);
+    }
+    println!("== pinger-filtered — server-side filter demo ==");
+    println!("broker advertises filteredSubscriptions: yes\n");
 
+    // Filter: only Pingers with sequence < 100, project to
+    // {id, sequence} (drop the 'message' field on the wire).
     let view = match app.view::<Pinger>(
-        predicate(Pinger::SEQUENCE.lt(100_u64) & Pinger::ID.eq(key))
+        predicate(Pinger::SEQUENCE.lt(100_u64))
             .project(Pinger::PROP_ID | Pinger::PROP_SEQUENCE)
             .build(),
     ) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("could not open View<Pinger>: {e}");
-            return ExitCode::from(2);
+            eprintln!("ERROR opening View<Pinger> -> {e}");
+            return ExitCode::from(1);
         }
     };
+    println!(
+        "opened View (subId={}) with filter:\n  predicate: sequence < 100\n  project:   {{id, sequence}}  (message is masked out)\n",
+        view.subscription_id()
+    );
 
-    let observed: Arc<Mutex<Vec<Observed>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed: Arc<Mutex<Vec<ObservedEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let observed_for_handler = observed.clone();
     let _sub = view.subscribe(move |event| {
-        let is_remove = event.header.remove_obj == Some(true);
-        let seq = event.value.sequence;
-        let msg = event.value.message.as_deref();
+        let o = ObservedEvent {
+            op: event.op,
+            id: event.value.id.unwrap_or(0),
+            sequence: event.value.sequence.unwrap_or(0),
+            has_message: event.value.message.is_some(),
+        };
         println!(
-            "← event  id={:?}  seq={:?}  remove={}  message={:?} (msg should be None under projection)",
-            event.value.id, seq, is_remove, msg
+            "  recv  op={}  id={}  seq={}  msg={}",
+            op_name(o.op),
+            o.id,
+            o.sequence,
+            if o.has_message { "<set>" } else { "<masked>" }
         );
-        observed_for_handler.lock().unwrap().push(Observed {
-            is_remove,
-            sequence: seq,
-        });
+        observed_for_handler.lock().unwrap().push(o);
     });
 
-    // Publisher task runs in parallel with App::run; once all four
-    // publishes are out and observed, it signals the App to exit.
-    let observed_for_publisher = observed.clone();
+    // Use a process-unique key so reruns against a long-lived dotsd
+    // don't collide with stale cached entries from prior runs.
+    let key: u32 = 1000 + (rand::random::<u32>() % (u32::MAX - 1000));
+    println!("using key id={key}");
+
+    // Sequence designed to cross the filter boundary on a single key.
+    let publishes = [
+        (50_u64, "first"),   // matches → enter view → create
+        (75_u64, "second"),  // matches → in-view update
+        (150_u64, "outside"), // does NOT match → leave view → remove
+        (42_u64, "back"),    // matches again → re-enter → create
+    ];
+
     let client = app.client();
-    let app_for_exit = app.transceiver().clone();
+    let observed_for_publisher = observed.clone();
+    let exit_handle = app.transceiver().clone();
     tokio::spawn(async move {
-        let publishes = [
-            (50_u64, "enter view (50 < 100)"),
-            (75_u64, "in-view update (75 < 100)"),
-            (150_u64, "leave view (150 >= 100)"),
-            (42_u64, "re-enter view (42 < 100)"),
-        ];
-        for (seq, label) in publishes {
-            println!("→ publish  id={key} seq={seq}  ({label})");
+        for (sequence, msg) in publishes {
+            println!("publish  id={key}  seq={sequence}  msg='{msg}'");
             client.publish(&Pinger {
                 id: Some(key),
-                message: Some(format!("masked: seq={seq}")),
-                sequence: Some(seq),
+                message: Some(msg.into()),
+                sequence: Some(sequence),
             });
-            // 120 ms gives the broker's echo time to round-trip and
-            // hit our handler before we publish the next case.
+            // 120 ms is enough for the broker's echo to round-trip on
+            // a local TCP loopback. Mirrors the C++ example's
+            // `io_context.run_for(100ms)` per publish.
             tokio::time::sleep(Duration::from_millis(120)).await;
         }
-
-        // Wait briefly for the last event to land.
+        // Wait for the last event to arrive before tearing down.
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if observed_for_publisher.lock().unwrap().len() >= 4 {
                 break;
             }
         }
-
-        // Drop view? Can't from here without ownership transfer.
-        // The view is dropped when main exits; the broker tears
-        // down the subscription either way (via Leave or via
-        // disconnect cleanup). Signal the App to exit.
-        app_for_exit.exit();
+        exit_handle.exit();
     });
 
     let run_result = app.run().await;
 
+    let view_size = view.container().len();
     drop(view);
     if let Err(e) = run_result {
-        eprintln!("app loop ended with error: {e}");
+        eprintln!("ERROR running pinger-filtered -> {e}");
         return ExitCode::from(2);
     }
 
-    // Verify.
-    let got = observed.lock().unwrap();
+    println!("\nview container after sequence: {view_size} entry(ies)");
+
+    // Expected events. On a remove event, the View carries the *last
+    // in-view snapshot* — i.e. the value as it last appeared in the
+    // view, not the key-only wire payload. The seq=75 row below is
+    // that last-known value, not a key fragment. Matches dots-cpp's
+    // `Event<T>::operator()()` semantics on remove.
     let expected = [
-        Observed { is_remove: false, sequence: Some(50) },
-        Observed { is_remove: false, sequence: Some(75) },
-        // Leave-view: key-only remove. The receiver sees `sequence`
-        // masked off because only the key was sent.
-        Observed { is_remove: true, sequence: None },
-        Observed { is_remove: false, sequence: Some(42) },
+        ObservedEvent { op: ViewOp::Create, id: key, sequence: 50, has_message: false },
+        ObservedEvent { op: ViewOp::Update, id: key, sequence: 75, has_message: false },
+        ObservedEvent { op: ViewOp::Remove, id: key, sequence: 75, has_message: false },
+        ObservedEvent { op: ViewOp::Create, id: key, sequence: 42, has_message: false },
     ];
 
-    if got.len() != expected.len() {
-        eprintln!(
-            "MISMATCH: expected {} events, got {}: {:?}",
-            expected.len(),
-            got.len(),
-            *got
-        );
-        return ExitCode::from(1);
-    }
-    let mut ok = true;
-    for (i, (o, e)) in got.iter().zip(expected.iter()).enumerate() {
-        if o != e {
-            eprintln!("MISMATCH at event {i}: got {o:?}, expected {e:?}");
-            ok = false;
-        }
-    }
+    let got = observed.lock().unwrap();
+    let ok = got.len() == expected.len()
+        && got.iter().zip(expected.iter()).all(|(a, e)| a == e);
+
+    println!(
+        "\n{}: expected {} events, observed {}",
+        if ok { "PASS" } else { "FAIL" },
+        expected.len(),
+        got.len()
+    );
+
     if !ok {
+        println!("\n--- expected ---");
+        for e in &expected {
+            println!("  {}  id={}  seq={}", op_name(e.op), e.id, e.sequence);
+        }
+        println!("--- observed ---");
+        for a in got.iter() {
+            println!("  {}  id={}  seq={}", op_name(a.op), a.id, a.sequence);
+        }
         return ExitCode::from(1);
     }
-    println!("\nOK: all four broker decisions observed in order");
     ExitCode::SUCCESS
 }

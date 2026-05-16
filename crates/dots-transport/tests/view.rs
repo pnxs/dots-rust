@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use dots_derive::DotsStruct;
 use dots_model::{Registry, filter::predicate, registry_with_internal_types};
-use dots_transport::{ConnectionBuilder, GuestTransceiver, HostTransceiver};
+use dots_transport::{ConnectionBuilder, GuestTransceiver, HostTransceiver, ViewOp};
 
 #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Pinger", cached)]
@@ -56,12 +56,12 @@ async fn view_four_cases_enter_update_leave_reenter() {
         )
         .expect("broker should support filtered subscriptions");
 
-    let observed: Arc<Mutex<Vec<(bool, Option<u32>, Option<u64>)>>> =
+    let observed: Arc<Mutex<Vec<(ViewOp, Option<u32>, Option<u64>)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let observed_for_handler = observed.clone();
     let _sub = view.subscribe(move |event| {
         observed_for_handler.lock().unwrap().push((
-            event.header.remove_obj == Some(true),
+            event.op,
             event.value.id,
             event.value.sequence,
         ));
@@ -120,22 +120,27 @@ async fn view_four_cases_enter_update_leave_reenter() {
     let got = observed.lock().unwrap().clone();
     assert_eq!(got.len(), 4, "expected 4 events, got {:?}", got);
 
-    // 1: enter view — non-remove, sequence visible (50)
-    assert_eq!(got[0].0, false, "enter: not a remove");
+    // 1: enter view — Create, sequence visible (50)
+    assert_eq!(got[0].0, ViewOp::Create, "enter view → create");
     assert_eq!(got[0].1, Some(key));
     assert_eq!(got[0].2, Some(50));
 
-    // 2: in-view update — non-remove (75)
-    assert_eq!(got[1].0, false, "in-view update: not a remove");
+    // 2: in-view update — Update (75)
+    assert_eq!(got[1].0, ViewOp::Update, "in-view update");
     assert_eq!(got[1].1, Some(key));
     assert_eq!(got[1].2, Some(75));
 
-    // 3: leave view — synthetic key-only remove
-    assert_eq!(got[2].0, true, "leave: synthetic remove");
+    // 3: leave view — Remove. The event's value carries the *last
+    //    in-view snapshot* (sequence=75), not the broker's key-only
+    //    wire payload. Matches C++ Event<T>::operator()() semantics
+    //    on remove: "the instance with this key, which last looked
+    //    like {seq=75}, is now gone from the view."
+    assert_eq!(got[2].0, ViewOp::Remove, "leave view → remove");
     assert_eq!(got[2].1, Some(key));
+    assert_eq!(got[2].2, Some(75), "remove carries last cached value");
 
-    // 4: re-enter view — non-remove (42)
-    assert_eq!(got[3].0, false, "reenter: not a remove");
+    // 4: re-enter view — Create (42)
+    assert_eq!(got[3].0, ViewOp::Create, "reenter view → create");
     assert_eq!(got[3].1, Some(key));
     assert_eq!(got[3].2, Some(42));
 

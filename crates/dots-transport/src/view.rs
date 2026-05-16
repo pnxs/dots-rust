@@ -20,10 +20,10 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use dots_core::{StructValue, decode_typed_from_slice};
-use dots_model::{Transmission, filter::DotsFilter};
+use dots_core::{StructValue, decode_typed_from_slice, encode_key_bytes};
+use dots_model::{DotsHeader, Transmission, filter::DotsFilter};
 
-use crate::connection::{Event, ViewDispatch};
+use crate::connection::ViewDispatch;
 use crate::container::{Container, ContainerEntry};
 use crate::guest::GuestTransceiver;
 
@@ -75,7 +75,7 @@ where
 /// `View<T>` handle share it.
 pub(crate) struct ViewState<T> {
     container: Container<T>,
-    handlers: Mutex<HashMap<u64, Box<dyn FnMut(&Event<T>) + Send>>>,
+    handlers: Mutex<HashMap<u64, Box<dyn FnMut(&ViewEvent<T>) + Send>>>,
     next_handler_id: AtomicU64,
 }
 
@@ -92,6 +92,53 @@ where
     }
 }
 
+/// What kind of view-transition produced this event.
+///
+/// Mirrors C++ `Event<T>::mt()` — the broker has already classified
+/// the transition (`enter view` / `in-view update` / `leave view`)
+/// and we surface that classification to user handlers so they don't
+/// have to reconstruct it from header bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewOp {
+    /// First time this key is seen in the view.
+    Create,
+    /// Key was already in the view; the broker delivered an update
+    /// (the value still matches the predicate).
+    Update,
+    /// Key has left the view (predicate stopped matching, or the
+    /// publisher removed the instance). The event's `value` carries
+    /// the last in-view snapshot — not the broker's key-only wire
+    /// payload — so a handler can inspect the value that just
+    /// disappeared.
+    Remove,
+}
+
+/// One event delivered to a [`View<T>`] subscriber.
+///
+/// Distinct from [`crate::Event<T>`] used by unfiltered subscribers
+/// because filtered views carry richer semantics: the [`ViewOp`]
+/// classifies the transition, and on `Remove` the `value` field is
+/// the last-cached snapshot rather than the wire payload (which is
+/// just the key fields).
+#[derive(Debug, Clone)]
+pub struct ViewEvent<T> {
+    pub header: DotsHeader,
+    pub value: T,
+    pub op: ViewOp,
+}
+
+impl<T> ViewState<T>
+where
+    T: StructValue + Default + Send + Clone + 'static,
+{
+    /// Look up the cached value for `key_bytes`, returning a clone
+    /// of the entry's value if present.
+    fn cached_value(&self, key_bytes: &[u8]) -> Option<T> {
+        let entries = self.container.entries.lock().expect("container mutex poisoned");
+        entries.get(key_bytes).map(|e| e.value.clone())
+    }
+}
+
 impl<T> ViewDispatch for ViewState<T>
 where
     T: StructValue + Default + Send + Clone + 'static,
@@ -102,22 +149,38 @@ where
         // unfiltered subscription path's tolerance for partial /
         // unfamiliar payloads.
         let bytes = txn.payload.encode();
-        let Ok(value) = decode_typed_from_slice::<T>(&bytes) else {
+        let Ok(decoded) = decode_typed_from_slice::<T>(&bytes) else {
             return;
         };
-        let event = Event {
-            header: txn.header.clone(),
-            value,
+
+        // Classify the transition by consulting the pre-update
+        // container state for this key. Mirrors C++ `Event<T>::mt()`
+        // — Create on new key, Update on existing key, Remove when
+        // the broker tagged the transmission as a leave-view (or
+        // any genuine `remove_obj`).
+        let key = encode_key_bytes(&decoded);
+        let is_remove = txn.header.remove_obj == Some(true);
+        let pre_value = self.cached_value(&key);
+        let (op, value) = match (is_remove, pre_value) {
+            (true, Some(prev)) => (ViewOp::Remove, prev),
+            // Spec edge: remove of an unknown key. Shouldn't happen
+            // for a well-behaved broker, but if it does we still
+            // surface the wire payload (key-only) so the handler
+            // can react.
+            (true, None) => (ViewOp::Remove, decoded),
+            (false, Some(_)) => (ViewOp::Update, decoded),
+            (false, None) => (ViewOp::Create, decoded),
         };
-        // Update the view's container (insert / remove via the same
+
+        // Apply the container update (insert / remove via the same
         // dispatch entry shape used for unfiltered containers).
         crate::container::view_dispatch_update::<T>(&self.container, txn);
-        // Fire user handlers. We collect ids to drop while
-        // iterating so a handler whose receiver was closed doesn't
-        // tie up subsequent calls. (Currently handlers are bare
-        // FnMut closures with no close signal — kept simple; if
-        // users want streaming semantics they can pipe through an
-        // mpsc themselves.)
+
+        let event = ViewEvent {
+            header: txn.header.clone(),
+            value,
+            op,
+        };
         let mut handlers = self
             .handlers
             .lock()
@@ -213,13 +276,13 @@ where
     /// handler.
     pub fn subscribe(
         &self,
-        mut handler: impl FnMut(&Event<T>) + Send + 'static,
+        mut handler: impl FnMut(&ViewEvent<T>) + Send + 'static,
     ) -> ViewSubscription<T> {
         // Sync replay: call the handler over the current container
         // entries with synthetic Create-shaped events.
         let snapshot: Vec<ContainerEntry<T>> = self.state.container.snapshot();
         for entry in snapshot {
-            let header = dots_model::DotsHeader {
+            let header = DotsHeader {
                 type_name: Some(self.type_name.clone()),
                 attributes: Some(<T as dots_core::Transmittable>::valid_set(&entry.value)),
                 sender: entry.clone_info.last_update_sender,
@@ -230,7 +293,11 @@ where
                 subscription_id: Some(self.subscription_id),
                 ..Default::default()
             };
-            handler(&Event { header, value: entry.value });
+            handler(&ViewEvent {
+                header,
+                value: entry.value,
+                op: ViewOp::Create,
+            });
         }
 
         let id = self.state.next_handler_id.fetch_add(1, Ordering::Relaxed);
