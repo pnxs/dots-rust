@@ -491,10 +491,24 @@ async fn host_replies_to_dots_echo_request() {
 }
 
 #[tokio::test]
-async fn host_publishes_dots_client_on_connect_and_disconnect() {
+async fn transition_handler_publishes_dots_client_on_connect_and_disconnect() {
     use dots_model::{DotsConnectionState, DotsClient};
 
     let host = HostTransceiver::new("test-host");
+
+    // Install the application-side transition handler. Mirrors what
+    // dotsd does — the host itself only emits raw transitions;
+    // *this* callback turns each one into a `DotsClient` publish.
+    let host_for_handler = host.clone();
+    host.set_transition_handler(move |t| {
+        let is_closed = t.state == DotsConnectionState::Closed;
+        host_for_handler.publish(&dots!(DotsClient {
+            id: t.client_id,
+            name: t.client_name.clone(),
+            running: !is_closed,
+            connection_state: t.state,
+        }));
+    });
 
     // Observer guest first — subscribes to DotsClient before any other
     // guest connects, so it sees their connect/disconnect events.

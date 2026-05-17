@@ -18,8 +18,19 @@
 //! embedded broker can accept the same syntax. Logging is via the
 //! `tracing` crate plus `tracing-subscriber` (override the default
 //! `info` level with the `RUST_LOG` env var).
+//!
+//! `dotsd` owns all daemon-level publishing — `DotsClient` for every
+//! guest's connection state. The host stays daemon-agnostic and only
+//! emits raw transitions via [`HostTransceiver::set_transition_handler`].
+//! Mirrors the dots-cpp `HostTransceiver` / `DotsDaemon` split.
 
-use dots_transport::{Endpoint, EndpointHandle, HostTransceiver, parse_endpoint};
+use std::sync::Arc;
+
+use dots_core::dots;
+use dots_model::{DotsClient, DotsConnectionState};
+use dots_transport::{
+    ConnectionTransition, Endpoint, EndpointHandle, HostTransceiver, parse_endpoint,
+};
 
 const DEFAULT_ENDPOINT: &str = "tcp://0.0.0.0:11235";
 const DEFAULT_NAME: &str = "dotsd";
@@ -31,6 +42,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (daemon_name, endpoints) = parse_args()?;
 
     let host = HostTransceiver::new(daemon_name.clone());
+
+    // Install the transition handler before endpoints start
+    // accepting, so the very first guest's `Connect` already fires
+    // a publish. Mirrors dots-cpp `DotsDaemon::handleTransition`.
+    let handler_host = host.clone();
+    host.set_transition_handler(move |t| publish_on_transition(&handler_host, t));
+
     // EndpointHandle owns each accept loop's JoinHandle plus the
     // UDS socket guard (for uds:// endpoints). Dropping it cleans
     // up the socket file; we keep them all alive for the daemon's
@@ -47,6 +65,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     tracing::info!("Ctrl-C received — shutting down");
     Ok(())
+}
+
+/// Transition handler installed on [`HostTransceiver`]. Publishes a
+/// fresh `DotsClient` record for the transitioning guest on every
+/// state change. Mirrors dots-cpp `DotsDaemon::handleTransition`.
+/// `running` is true for `EarlySubscribe` / `Connected`, false for
+/// `Closed`.
+fn publish_on_transition(host: &Arc<HostTransceiver>, t: &ConnectionTransition) {
+    let is_closed = t.state == DotsConnectionState::Closed;
+    host.publish(&dots!(DotsClient {
+        id: t.client_id,
+        name: t.client_name.clone(),
+        running: !is_closed,
+        connection_state: t.state,
+    }));
 }
 
 fn parse_args() -> Result<(String, Vec<Endpoint>), Box<dyn std::error::Error>> {

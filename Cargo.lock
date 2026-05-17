@@ -203,6 +203,8 @@ dependencies = [
 name = "dotsd"
 version = "0.1.0"
 dependencies = [
+ "dots-core",
+ "dots-model",
  "dots-transport",
  "tokio",
  "tracing",

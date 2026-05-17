@@ -27,7 +27,7 @@ use dots_core::{DynamicStruct, PropertySet, Publishable, StructValue, Transmitta
 use dots_model::{
     DotsCacheInfo, DotsConnectionState, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect,
     DotsMsgConnectResponse, DotsMsgHello, DotsServerCapabilities, EnumDescriptorData,
-    RawTransmission, Registry, StructDescriptorData, Transmission, daemon::DotsClient,
+    RawTransmission, Registry, StructDescriptorData, Transmission,
     encode_frame_with_header, encode_transmission_into, encode_transmission_with_mask_into,
     filter::DotsFilter,
 };
@@ -374,6 +374,25 @@ struct HostInner {
     /// Updated on every incoming transmission of a cached type;
     /// replayed on `DotsMember(Join)`.
     pool: FxHashMap<String, BTreeMap<Vec<u8>, CachedEntry>>,
+    /// Optional application-supplied callback fired on every
+    /// guest connection-state change. Daemons (e.g. `dotsd`)
+    /// install one to publish `DotsClient` — the host stays free
+    /// of daemon-level type knowledge. See
+    /// [`HostTransceiver::set_transition_handler`].
+    transition_handler: Option<Arc<dyn Fn(&ConnectionTransition) + Send + Sync>>,
+}
+
+/// Connection-state transition delivered to the host's
+/// [`HostTransceiver::set_transition_handler`] callback.
+///
+/// Mirrors the role of dots-cpp's `transition_handler_t` — the host
+/// reports raw lifecycle events; the daemon decides what (if any)
+/// DOTS records to publish in response (e.g. `DotsClient`).
+#[derive(Debug, Clone)]
+pub struct ConnectionTransition {
+    pub client_id: u32,
+    pub client_name: Option<String>,
+    pub state: DotsConnectionState,
 }
 
 /// Per-type membership state — kept as a struct rather than a bare
@@ -474,6 +493,7 @@ impl HostTransceiver {
                 guests: FxHashMap::default(),
                 next_client_id: HOST_ID + 1,
                 pool: FxHashMap::default(),
+                transition_handler: None,
             })),
         })
     }
@@ -489,6 +509,41 @@ impl HostTransceiver {
     /// Currently-connected guest count.
     pub fn guest_count(&self) -> usize {
         self.inner.lock().expect("host mutex poisoned").guests.len()
+    }
+
+    /// Install a callback invoked on every guest connection-state
+    /// transition. Replaces any previously-installed handler.
+    ///
+    /// The callback fires synchronously **after** the host's inner
+    /// lock is released, so it's free to call back into
+    /// [`publish`](Self::publish) / [`remove`](Self::remove) without
+    /// deadlock. Keep the callback work short — long-running
+    /// callbacks block the read loop of the transitioning guest
+    /// (and, for `Closed`, the `remove_guest` cleanup of every
+    /// disconnecting peer).
+    pub fn set_transition_handler<F>(&self, handler: F)
+    where
+        F: Fn(&ConnectionTransition) + Send + Sync + 'static,
+    {
+        self.inner
+            .lock()
+            .expect("host mutex poisoned")
+            .transition_handler = Some(Arc::new(handler));
+    }
+
+    /// Snapshot the transition handler under the inner lock and
+    /// fire it with `transition` after releasing the lock. No-op if
+    /// nothing is installed.
+    fn fire_transition(&self, transition: ConnectionTransition) {
+        let handler = self
+            .inner
+            .lock()
+            .expect("host mutex poisoned")
+            .transition_handler
+            .clone();
+        if let Some(handler) = handler {
+            handler(&transition);
+        }
     }
 
     /// Number of subscriptions on a given type group. Counts each
@@ -612,8 +667,9 @@ impl HostTransceiver {
                     tracing::warn!(client_id, error = %e, "guest task ended with error");
                 }
                 // Tell the drainer to exit, then await it so the
-                // socket has flushed any final bytes before we
-                // publish `DotsClient(Closed)`.
+                // socket has flushed any final bytes before the
+                // `Closed` transition fires for downstream
+                // observers.
                 writer_for_close.close();
                 let _ = drainer.await;
                 host.remove_guest(client_id);
@@ -1279,8 +1335,8 @@ impl HostTransceiver {
         self.cleanup_entries_for_guest(client_id);
 
         // 2. Drop the guest from the registry and prune empty
-        //    groups. Snapshot the name so we can publish DotsClient
-        //    after the lock is released.
+        //    groups. Snapshot the name so we can deliver it in the
+        //    transition event after the lock is released.
         let name = {
             let mut inner = self.inner.lock().expect("host mutex poisoned");
             let name = inner
@@ -1297,8 +1353,14 @@ impl HostTransceiver {
         };
         tracing::debug!(client_id, "guest removed");
 
-        // 3. Publish the final DotsClient state.
-        self.publish_dots_client(client_id, name, DotsConnectionState::Closed, false);
+        // 3. Fire the transition. Daemon-level types
+        //    (DotsClient, …) are published by the application's
+        //    handler — the host owns no daemon type knowledge.
+        self.fire_transition(ConnectionTransition {
+            client_id,
+            client_name: name,
+            state: DotsConnectionState::Closed,
+        });
     }
 
     /// Walk the cache pool for entries owned by `client_id` whose
@@ -1387,25 +1449,6 @@ impl HostTransceiver {
         }
     }
 
-    /// Publish a [`DotsClient`] record for this guest's current state.
-    /// Routes through the normal publish path so the cache pool stays
-    /// in sync. C++ dotsd publishes on every connection-state
-    /// transition; we mirror that.
-    fn publish_dots_client(
-        &self,
-        client_id: u32,
-        name: Option<String>,
-        state: DotsConnectionState,
-        running: bool,
-    ) {
-        let record = dots!(DotsClient {
-            id: client_id,
-            name: name,
-            running: running,
-            connection_state: state,
-        });
-        self.publish(&record);
-    }
 }
 
 // ===== Per-guest task =====
@@ -1462,12 +1505,11 @@ where
     } else {
         DotsConnectionState::Connected
     };
-    host.publish_dots_client(
+    host.fire_transition(ConnectionTransition {
         client_id,
-        connect.client_name.clone(),
-        initial_state,
-        true,
-    );
+        client_name: connect.client_name.clone(),
+        state: initial_state,
+    });
 
     // ----- Phase 3: EarlySubscribe (if preload requested) -----
     if preload_requested {
@@ -1483,12 +1525,11 @@ where
             }
         }
         tracing::debug!(client_id, "guest preload phase complete");
-        host.publish_dots_client(
+        host.fire_transition(ConnectionTransition {
             client_id,
-            connect.client_name.clone(),
-            DotsConnectionState::Connected,
-            true,
-        );
+            client_name: connect.client_name.clone(),
+            state: DotsConnectionState::Connected,
+        });
     }
 
     // ----- Phase 4: Connected — fan-out happens inline in
@@ -1504,8 +1545,8 @@ where
         }
         // Slow-consumer disconnect: if our own queue overflowed
         // because peers wrote faster than we read, give up.
-        // `remove_guest` cleans up the registry and publishes
-        // `DotsClient(Closed)` for us.
+        // `remove_guest` cleans up the registry and fires the
+        // `Closed` transition for us.
         if writer.is_overflowed() {
             tracing::warn!(client_id, "guest write buffer overflowed; disconnecting");
             return Err(HostError::Transport("write buffer overflow".into()));

@@ -9,6 +9,8 @@ publish = false
 description = "DOTS broker daemon — listens on TCP and routes pub/sub between guests."
 
 [dependencies]
+dots-core.workspace = true
+dots-model.workspace = true
 dots-transport = { workspace = true, features = ["tracing-init"] }
 
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal"] }
