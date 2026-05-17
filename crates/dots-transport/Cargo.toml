@@ -8,11 +8,18 @@ authors.workspace = true
 description = "Async transport for dots-rust: tokio_util::codec adapter for v2 transmission framing."
 
 [features]
-default = []
+default = ["stats"]
 # Opt-in helper that installs a `tracing_subscriber` with sensible
 # defaults — see `dots_transport::init_tracing`. Off by default so
 # library consumers aren't forced to pull `tracing-subscriber`.
 tracing-init = ["dep:tracing-subscriber"]
+# Per-guest I/O statistics: counter bumps on every enqueue/drain
+# (write side) and every decoded frame (read side), plus the
+# `GuestStats` accessor surface. Default-on. Disable to remove all
+# per-event accounting overhead — counters compile away, accessors
+# return `None` / empty, and `ConnectionTransition.final_stats` is
+# always `None`. See `GuestStats` / `HostTransceiver::guest_stats`.
+stats = []
 
 [dependencies]
 dots-core.workspace = true

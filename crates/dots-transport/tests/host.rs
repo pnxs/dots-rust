@@ -290,6 +290,7 @@ async fn host_publishes_distinct_dots_client_statistics_records() {
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_b_handle).await;
 }
 
+#[cfg(feature = "stats")]
 #[tokio::test]
 async fn guest_stats_count_both_directions() {
     let host = HostTransceiver::new("test-host");
@@ -913,6 +914,7 @@ async fn client_id_referenced_tracks_created_from_and_last_update() {
     );
 }
 
+#[cfg(feature = "stats")]
 #[tokio::test]
 async fn transition_handler_carries_final_stats_on_close() {
     use std::sync::Mutex as StdMutex;

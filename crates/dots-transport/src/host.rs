@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::IoSlice;
+#[cfg(feature = "stats")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -80,9 +81,11 @@ struct GuestWriter {
     /// [`run_guest`]; read from `snapshot_stats`. Lives outside the
     /// write mutex so reader and writer don't contend on each
     /// other's hot paths.
+    #[cfg(feature = "stats")]
     read_stats: ReadStats,
 }
 
+#[cfg(feature = "stats")]
 #[derive(Default)]
 struct ReadStats {
     bytes: AtomicU64,
@@ -113,9 +116,11 @@ struct WriteState {
     /// [`HostTransceiver::guest_stats`]. Lives under the same
     /// mutex as `queue` — every producer and the drainer already
     /// hold it, so per-bump cost is one add.
+    #[cfg(feature = "stats")]
     stats: WriteStatsRaw,
 }
 
+#[cfg(feature = "stats")]
 #[derive(Default)]
 struct WriteStatsRaw {
     bytes_sent: u64,
@@ -212,9 +217,11 @@ impl GuestWriter {
                 queued_bytes: 0,
                 overflow: false,
                 closed: false,
+                #[cfg(feature = "stats")]
                 stats: WriteStatsRaw::default(),
             }),
             notify: tokio::sync::Notify::new(),
+            #[cfg(feature = "stats")]
             read_stats: ReadStats::default(),
         })
     }
@@ -222,13 +229,17 @@ impl GuestWriter {
     /// Credit one received frame of `frame_bytes` to this guest's
     /// read counters. Called by the per-guest read loop after a
     /// successful frame decode. Atomic-only — does not touch the
-    /// write mutex.
+    /// write mutex. No-op when the `stats` feature is off; the
+    /// call site stays unchanged.
     #[inline]
-    fn record_received(&self, frame_bytes: usize) {
-        self.read_stats
-            .bytes
-            .fetch_add(frame_bytes as u64, Ordering::Relaxed);
-        self.read_stats.frames.fetch_add(1, Ordering::Relaxed);
+    fn record_received(&self, _frame_bytes: usize) {
+        #[cfg(feature = "stats")]
+        {
+            self.read_stats
+                .bytes
+                .fetch_add(_frame_bytes as u64, Ordering::Relaxed);
+            self.read_stats.frames.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Append `frame` to the output queue. **Synchronous** — no
@@ -268,12 +279,15 @@ impl GuestWriter {
             let was_empty = state.queue.is_empty();
             state.queued_bytes += frame.len();
             state.queue.push_back(frame);
-            if state.queued_bytes as u64 > state.stats.peak_queued_bytes {
-                state.stats.peak_queued_bytes = state.queued_bytes as u64;
-            }
-            let frames = state.queue.len() as u32;
-            if frames > state.stats.peak_queued_frames {
-                state.stats.peak_queued_frames = frames;
+            #[cfg(feature = "stats")]
+            {
+                if state.queued_bytes as u64 > state.stats.peak_queued_bytes {
+                    state.stats.peak_queued_bytes = state.queued_bytes as u64;
+                }
+                let frames = state.queue.len() as u32;
+                if frames > state.stats.peak_queued_frames {
+                    state.stats.peak_queued_frames = frames;
+                }
             }
             should_notify = was_empty;
         }
@@ -305,26 +319,37 @@ impl GuestWriter {
     /// *current* queued values so the next snapshot reports peaks
     /// observed strictly between the two calls (and not below the
     /// current sustained backlog).
-    fn snapshot_stats(&self) -> GuestStats {
-        let bytes_received = self.read_stats.bytes.load(Ordering::Relaxed);
-        let frames_received = self.read_stats.frames.load(Ordering::Relaxed);
-        let mut state = self.state.lock().expect("guest write state poisoned");
-        let current_bytes = state.queued_bytes as u64;
-        let current_frames = state.queue.len() as u32;
-        let snap = GuestStats {
-            bytes_sent: state.stats.bytes_sent,
-            frames_sent: state.stats.frames_sent,
-            bytes_received,
-            frames_received,
-            drainer_wakeups: state.stats.drainer_wakeups,
-            peak_queued_bytes: state.stats.peak_queued_bytes,
-            peak_queued_frames: state.stats.peak_queued_frames,
-            current_queued_bytes: current_bytes,
-            overflow_disconnected: state.overflow,
-        };
-        state.stats.peak_queued_bytes = current_bytes;
-        state.stats.peak_queued_frames = current_frames;
-        snap
+    ///
+    /// Returns `None` when the `stats` feature is disabled —
+    /// no counters were maintained, so there's nothing meaningful
+    /// to report.
+    fn snapshot_stats(&self) -> Option<GuestStats> {
+        #[cfg(feature = "stats")]
+        {
+            let bytes_received = self.read_stats.bytes.load(Ordering::Relaxed);
+            let frames_received = self.read_stats.frames.load(Ordering::Relaxed);
+            let mut state = self.state.lock().expect("guest write state poisoned");
+            let current_bytes = state.queued_bytes as u64;
+            let current_frames = state.queue.len() as u32;
+            let snap = GuestStats {
+                bytes_sent: state.stats.bytes_sent,
+                frames_sent: state.stats.frames_sent,
+                bytes_received,
+                frames_received,
+                drainer_wakeups: state.stats.drainer_wakeups,
+                peak_queued_bytes: state.stats.peak_queued_bytes,
+                peak_queued_frames: state.stats.peak_queued_frames,
+                current_queued_bytes: current_bytes,
+                overflow_disconnected: state.overflow,
+            };
+            state.stats.peak_queued_bytes = current_bytes;
+            state.stats.peak_queued_frames = current_frames;
+            Some(snap)
+        }
+        #[cfg(not(feature = "stats"))]
+        {
+            None
+        }
     }
 }
 
@@ -350,13 +375,12 @@ async fn writer_loop(writer: Arc<GuestWriter>) {
         // arrival). The inner loop may run several drain cycles
         // before the queue stays empty; those are still one
         // logical wake.
+        #[cfg(feature = "stats")]
         {
             let mut state = writer.state.lock().expect("guest write state poisoned");
             state.stats.drainer_wakeups = state.stats.drainer_wakeups.saturating_add(1);
         }
         loop {
-            let batch_bytes: u64;
-            let batch_frames: u64;
             {
                 let mut state = writer.state.lock().expect("guest write state poisoned");
                 if state.queue.is_empty() {
@@ -365,14 +389,24 @@ async fn writer_loop(writer: Arc<GuestWriter>) {
                     }
                     break;
                 }
-                // Move pending frames out under the lock; the
-                // socket write happens below without the mutex
-                // held, so producers can keep enqueuing while
-                // bytes drain. Record the batch size first so we
-                // can credit `bytes_sent` / `frames_sent` after a
-                // successful flush.
-                batch_bytes = state.queued_bytes as u64;
-                batch_frames = state.queue.len() as u64;
+                // Credit the batch under the same lock that drains
+                // the queue. A subsequent `write_chunks` failure
+                // counts as "attempted to send" — that's both
+                // useful (the final stats snapshot reflects what
+                // the drainer was carrying when it died) and lets
+                // the stats path stay a single conditional block
+                // here.
+                #[cfg(feature = "stats")]
+                {
+                    state.stats.bytes_sent = state
+                        .stats
+                        .bytes_sent
+                        .saturating_add(state.queued_bytes as u64);
+                    state.stats.frames_sent = state
+                        .stats
+                        .frames_sent
+                        .saturating_add(state.queue.len() as u64);
+                }
                 chunks.append(&mut state.queue);
                 state.queued_bytes = 0;
             }
@@ -383,9 +417,6 @@ async fn writer_loop(writer: Arc<GuestWriter>) {
                 state.closed = true;
                 return;
             }
-            let mut state = writer.state.lock().expect("guest write state poisoned");
-            state.stats.bytes_sent = state.stats.bytes_sent.saturating_add(batch_bytes);
-            state.stats.frames_sent = state.stats.frames_sent.saturating_add(batch_frames);
         }
         notified.await;
     }
@@ -713,16 +744,18 @@ impl HostTransceiver {
         self.inner.lock().expect("host mutex poisoned").guests.len()
     }
 
-    /// Snapshot write-side statistics for `client_id`. Returns
-    /// `None` if the guest is no longer connected — callers don't
-    /// need to coordinate with `remove_guest` themselves.
+    /// Snapshot statistics for `client_id`. Returns `None` if the
+    /// guest is no longer connected **or** if the `stats` feature is
+    /// disabled at compile time — callers don't need to coordinate
+    /// with `remove_guest` themselves and can treat "stats off" the
+    /// same as "guest not found".
     ///
     /// Each call resets the high-water marks on the underlying
     /// writer, so a periodic poller naturally gets the peak
     /// observed between consecutive polls. See [`GuestStats`]
     /// for field semantics.
     pub fn guest_stats(&self, client_id: u32) -> Option<GuestStats> {
-        self.writer_for(client_id).map(|w| w.snapshot_stats())
+        self.writer_for(client_id).and_then(|w| w.snapshot_stats())
     }
 
     /// Snapshot stats for every currently-connected guest. One pass
@@ -730,7 +763,8 @@ impl HostTransceiver {
     /// each writer's per-state lock is then taken individually, so
     /// the host mutex is held only briefly. As with
     /// [`guest_stats`](Self::guest_stats), each entry's high-water
-    /// marks are reset by this call.
+    /// marks are reset by this call. Returns an empty vector when
+    /// the `stats` feature is disabled.
     pub fn guest_stats_all(&self) -> Vec<(u32, GuestStats)> {
         let writers: Vec<(u32, SharedWriter)> = {
             let inner = self.inner.lock().expect("host mutex poisoned");
@@ -742,7 +776,7 @@ impl HostTransceiver {
         };
         writers
             .into_iter()
-            .map(|(id, w)| (id, w.snapshot_stats()))
+            .filter_map(|(id, w)| w.snapshot_stats().map(|s| (id, s)))
             .collect()
     }
 
@@ -1593,7 +1627,7 @@ impl HostTransceiver {
         //    mapped — the transition handler receives them inside
         //    `final_stats` so daemons can publish a terminal
         //    `DotsClientStatistics` for short-lived guests.
-        let final_stats = self.writer_for(client_id).map(|w| w.snapshot_stats());
+        let final_stats = self.writer_for(client_id).and_then(|w| w.snapshot_stats());
 
         // 3. Drop the guest from the registry and prune empty
         //    groups. Snapshot the name so we can deliver it in the

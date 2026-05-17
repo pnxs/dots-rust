@@ -8,10 +8,19 @@ authors.workspace = true
 publish = false
 description = "DOTS broker daemon — listens on TCP and routes pub/sub between guests."
 
+[features]
+default = ["stats"]
+# Forward dots-transport's `stats` feature. Disable
+# (`cargo build -p dotsd --no-default-features`) to drop per-guest
+# statistics bookkeeping at compile time — counters compile away,
+# accessors return empty, and the periodic `publish_stats` /
+# terminal stats path becomes a no-op.
+stats = ["dots-transport/stats"]
+
 [dependencies]
 dots-core.workspace = true
 dots-model.workspace = true
-dots-transport = { workspace = true, features = ["tracing-init"] }
+dots-transport = { workspace = true, default-features = false, features = ["tracing-init"] }
 
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "time"] }
 tracing.workspace = true
