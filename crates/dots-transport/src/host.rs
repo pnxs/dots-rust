@@ -15,9 +15,11 @@
 //! listener. Tests can also feed an in-memory duplex stream into
 //! [`accept`](HostTransceiver::accept) directly.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::io::IoSlice;
 use std::sync::{Arc, Mutex};
 
+use bytes::{Buf, Bytes};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -73,10 +75,17 @@ struct GuestWriter {
 }
 
 struct WriteState {
-    /// Pending bytes to write. `BytesMut::split` returns the
-    /// contents and resets self to empty while keeping capacity,
-    /// so steady-state operation does not re-allocate.
-    queue: bytes::BytesMut,
+    /// Pending frames to write. Each entry is a refcounted
+    /// `Bytes`, so the fan-out path can share one allocation
+    /// across N unfiltered subscribers via `clone()` (Arc bump,
+    /// no copy). The drainer turns the deque into a borrowed
+    /// `IoSlice` array and emits the lot with one
+    /// `try_write_vectored` syscall.
+    queue: VecDeque<Bytes>,
+    /// Sum of `queue.iter().map(|b| b.len()).sum()` kept
+    /// incrementally so the overflow check is O(1) and the
+    /// drainer doesn't have to recompute.
+    queued_bytes: usize,
     /// Sticky bit set when a producer would push past
     /// [`WRITE_OVERFLOW_THRESHOLD`] or when the drainer hits a
     /// fatal I/O error. Reader task checks this and exits.
@@ -115,7 +124,8 @@ impl GuestWriter {
         Arc::new(Self {
             handle,
             state: Mutex::new(WriteState {
-                queue: bytes::BytesMut::with_capacity(64*1024),
+                queue: VecDeque::with_capacity(64),
+                queued_bytes: 0,
                 overflow: false,
                 closed: false,
             }),
@@ -123,28 +133,33 @@ impl GuestWriter {
         })
     }
 
-    /// Append `buf` to the output queue. **Synchronous** — no
+    /// Append `frame` to the output queue. **Synchronous** — no
     /// `.await`, no async state machine on the producer side. The
-    /// per-guest drainer task picks the bytes up; if the queue was
+    /// per-guest drainer task picks the frame up; if the queue was
     /// empty we wake it via `notify_one`.
     ///
-    /// Bytes are dropped (and `overflow + closed` set) if the queue
-    /// would grow past [`WRITE_OVERFLOW_THRESHOLD`] — the reader
-    /// task observes the overflow flag on its next iteration and
-    /// disconnects the slow consumer.
-    fn enqueue(&self, buf: &[u8]) {
+    /// `frame` is moved into the queue without a copy. The fan-out
+    /// path passes the same `Bytes` (clone is a refcount bump) to
+    /// every unfiltered subscriber, so one encoded transmission
+    /// turns into one allocation regardless of subscriber count.
+    ///
+    /// Frames are dropped (and `overflow + closed` set) if the
+    /// queue would grow past [`WRITE_OVERFLOW_THRESHOLD`] — the
+    /// reader task observes the overflow flag on its next iteration
+    /// and disconnects the slow consumer.
+    fn enqueue(&self, frame: Bytes) {
         let should_notify;
         {
             let mut state = self.state.lock().expect("guest write state poisoned");
             if state.closed {
                 return;
             }
-            if state.queue.len().saturating_add(buf.len()) > WRITE_OVERFLOW_THRESHOLD {
+            if state.queued_bytes.saturating_add(frame.len()) > WRITE_OVERFLOW_THRESHOLD {
                 state.overflow = true;
                 state.closed = true;
                 tracing::warn!(
-                    queued = state.queue.len(),
-                    incoming = buf.len(),
+                    queued = state.queued_bytes,
+                    incoming = frame.len(),
                     threshold = WRITE_OVERFLOW_THRESHOLD,
                     "guest write buffer overflow; marking for disconnect",
                 );
@@ -153,7 +168,8 @@ impl GuestWriter {
                 return;
             }
             let was_empty = state.queue.is_empty();
-            state.queue.extend_from_slice(buf);
+            state.queued_bytes += frame.len();
+            state.queue.push_back(frame);
             should_notify = was_empty;
         }
         if should_notify {
@@ -183,7 +199,14 @@ impl GuestWriter {
 /// the shared `GuestWriter`. Awaits notifications; on each wake,
 /// drains the queue to the socket until empty, then awaits again.
 /// Exits when `closed` is set.
+///
+/// The TCP/Unix paths submit the whole queue with a single
+/// `try_write_vectored` per attempt (`writev(2)`), so N frames
+/// enqueued between drainer wakeups become one syscall instead of
+/// N. Partial writes (kernel buffer fills mid-call) trim the
+/// front of `chunks` and re-arm via `writable()`.
 async fn writer_loop(writer: Arc<GuestWriter>) {
+    let mut chunks: VecDeque<Bytes> = VecDeque::new();
     loop {
         // Note: `notified()` returns a future that registers the
         // waker eagerly, so a `notify_one` issued *after* we
@@ -191,7 +214,7 @@ async fn writer_loop(writer: Arc<GuestWriter>) {
         // wakes us — no missed-wakeup race.
         let notified = writer.notify.notified();
         loop {
-            let bytes = {
+            {
                 let mut state = writer.state.lock().expect("guest write state poisoned");
                 if state.queue.is_empty() {
                     if state.closed {
@@ -199,9 +222,14 @@ async fn writer_loop(writer: Arc<GuestWriter>) {
                     }
                     break;
                 }
-                state.queue.split()
-            };
-            if let Err(e) = writer.handle.write_buf(&bytes).await {
+                // Move pending frames out under the lock; the
+                // socket write happens below without the mutex
+                // held, so producers can keep enqueuing while
+                // bytes drain.
+                chunks.append(&mut state.queue);
+                state.queued_bytes = 0;
+            }
+            if let Err(e) = writer.handle.write_chunks(&mut chunks).await {
                 tracing::debug!(error = %e, "drainer write failed; closing guest writer");
                 let mut state = writer.state.lock().expect("guest write state poisoned");
                 state.overflow = true;
@@ -214,41 +242,105 @@ async fn writer_loop(writer: Arc<GuestWriter>) {
 }
 
 impl WriteHandle {
-    async fn write_buf(&self, buf: &[u8]) -> std::io::Result<()> {
+    /// Drain `chunks` to the socket, leaving `chunks` empty on
+    /// success. On error, `chunks` may still hold unwritten
+    /// frames — the caller is closing the writer so they get
+    /// dropped.
+    async fn write_chunks(&self, chunks: &mut VecDeque<Bytes>) -> std::io::Result<()> {
         match self {
-            Self::Tcp(half) => tcp_drain(half, buf).await,
+            Self::Tcp(half) => drain_vectored(half, chunks).await,
             #[cfg(unix)]
-            Self::Unix(half) => unix_drain(half, buf).await,
+            Self::Unix(half) => drain_vectored(half, chunks).await,
             Self::Generic(m) => {
                 use tokio::io::AsyncWriteExt;
                 let mut g = m.lock().await;
-                g.write_all(buf).await
+                while let Some(chunk) = chunks.pop_front() {
+                    g.write_all(&chunk).await?;
+                }
+                Ok(())
             }
         }
     }
 }
 
-async fn tcp_drain(half: &tokio::net::tcp::OwnedWriteHalf, buf: &[u8]) -> std::io::Result<()> {
-    let mut written = 0;
-    while written < buf.len() {
-        match half.try_write(&buf[written..]) {
-            Ok(n) => written += n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                half.writable().await?;
-            }
-            Err(e) => return Err(e),
+/// Linux's documented `IOV_MAX` floor. tokio caps `try_write_vectored`
+/// at this internally; capping here too keeps the slice allocation
+/// from growing unbounded under heavy fan-out.
+const MAX_IOV: usize = 1024;
+
+/// Advance the front of `chunks` by `n` written bytes. Whole frames
+/// at the front pop_front; the remaining first frame is sliced via
+/// `Bytes::advance` (refcount stays shared, no copy).
+fn advance_chunks(chunks: &mut VecDeque<Bytes>, mut n: usize) {
+    while n > 0 {
+        let Some(front) = chunks.front_mut() else {
+            return;
+        };
+        if front.len() <= n {
+            n -= front.len();
+            chunks.pop_front();
+        } else {
+            front.advance(n);
+            return;
         }
     }
-    Ok(())
+}
+
+/// Build a `[IoSlice]` view over the first `MAX_IOV` chunks. Reused
+/// each iteration of a partial-write loop. Returned vector borrows
+/// from `chunks` for its lifetime.
+fn ioslices_for<'a>(chunks: &'a VecDeque<Bytes>) -> Vec<IoSlice<'a>> {
+    chunks
+        .iter()
+        .take(MAX_IOV)
+        .map(|b| IoSlice::new(b.as_ref()))
+        .collect()
+}
+
+/// The two methods `drain_vectored` needs from a tokio write half.
+/// Implemented for `tcp::OwnedWriteHalf` and (on unix)
+/// `unix::OwnedWriteHalf` — both expose identical inherent
+/// `try_write_vectored` / `writable` signatures, but tokio doesn't
+/// give us a trait that covers them, so we declare our own. The
+/// `+ Send` bound on `writable`'s future is what lets
+/// `writer_loop`'s `tokio::spawn` keep its `Send` requirement.
+trait DrainHalf {
+    fn try_write_vectored(&self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize>;
+    fn writable(&self) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
+}
+
+impl DrainHalf for tokio::net::tcp::OwnedWriteHalf {
+    fn try_write_vectored(&self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        Self::try_write_vectored(self, bufs)
+    }
+    fn writable(&self) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+        Self::writable(self)
+    }
 }
 
 #[cfg(unix)]
-async fn unix_drain(half: &tokio::net::unix::OwnedWriteHalf, buf: &[u8]) -> std::io::Result<()> {
-    let mut written = 0;
-    while written < buf.len() {
-        match half.try_write(&buf[written..]) {
-            Ok(n) => written += n,
+impl DrainHalf for tokio::net::unix::OwnedWriteHalf {
+    fn try_write_vectored(&self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        Self::try_write_vectored(self, bufs)
+    }
+    fn writable(&self) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+        Self::writable(self)
+    }
+}
+
+async fn drain_vectored<H: DrainHalf>(
+    half: &H,
+    chunks: &mut VecDeque<Bytes>,
+) -> std::io::Result<()> {
+    while !chunks.is_empty() {
+        let slices = ioslices_for(chunks);
+        match half.try_write_vectored(&slices) {
+            Ok(n) => {
+                drop(slices);
+                advance_chunks(chunks, n);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                drop(slices);
                 half.writable().await?;
             }
             Err(e) => return Err(e),
@@ -642,7 +734,7 @@ impl HostTransceiver {
         let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_into(&header, value, &mut bytes);
-        self.cache_and_fan_out(&type_name, &header, &bytes, dyn_payload.as_ref(), HOST_ID);
+        self.cache_and_fan_out(&type_name, &header, Bytes::from(bytes), dyn_payload.as_ref(), HOST_ID);
     }
 
     /// Publish a partial update from the host. Same masking rules as
@@ -662,7 +754,7 @@ impl HostTransceiver {
         let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.cache_and_fan_out(&type_name, &header, &bytes, dyn_payload.as_ref(), HOST_ID);
+        self.cache_and_fan_out(&type_name, &header, Bytes::from(bytes), dyn_payload.as_ref(), HOST_ID);
     }
 
     /// Publish a removal from the host. Routes to every guest
@@ -683,7 +775,7 @@ impl HostTransceiver {
         let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.cache_and_fan_out(&type_name, &header, &bytes, dyn_payload.as_ref(), HOST_ID);
+        self.cache_and_fan_out(&type_name, &header, Bytes::from(bytes), dyn_payload.as_ref(), HOST_ID);
     }
 
     /// Round-trip a typed value through CBOR with the given mask to
@@ -733,7 +825,7 @@ impl HostTransceiver {
         &self,
         type_name: &str,
         header: &DotsHeader,
-        raw_frame: &[u8],
+        raw_frame: Bytes,
         payload: Option<&DynamicStruct>,
         exclude_client_id: u32,
     ) {
@@ -791,7 +883,7 @@ impl HostTransceiver {
         // `visible`). Borrow-check splits `inner.groups` mutably
         // from `inner.guests` immutably via separate field access
         // — collect (client_id, bytes) pairs and enqueue after.
-        let mut filtered_outbound: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut filtered_outbound: Vec<(u32, Bytes)> = Vec::new();
         let key_set = descriptor
             .as_ref()
             .map(|d| {
@@ -844,7 +936,7 @@ impl HostTransceiver {
                         // payload encode below honours that mask.
                         let mut bytes = Vec::with_capacity(64);
                         encode_transmission_with_mask_into(&h, post, effective, &mut bytes);
-                        filtered_outbound.push((*cid, bytes));
+                        filtered_outbound.push((*cid, Bytes::from(bytes)));
                     }
                     (false, true) => {
                         if let Some(k) = &key_bytes_post {
@@ -862,26 +954,29 @@ impl HostTransceiver {
                         h.subscription_id = Some(*sub_id);
                         let mut bytes = Vec::with_capacity(64);
                         encode_transmission_with_mask_into(&h, p, key_set, &mut bytes);
-                        filtered_outbound.push((*cid, bytes));
+                        filtered_outbound.push((*cid, Bytes::from(bytes)));
                     }
                     (false, false) => {}
                 }
             }
         }
 
-        // Unfiltered fan-out (byte-verbatim).
+        // Unfiltered fan-out (byte-verbatim). All subscribers share
+        // the same refcounted `Bytes`: `clone()` is an Arc bump, no
+        // memcpy, so one published frame is one allocation regardless
+        // of subscriber count.
         for &id in &group.unfiltered_subs {
             if id == exclude_client_id {
                 continue;
             }
             if let Some(record) = guests.get(&id) {
-                record.write_half.enqueue(raw_frame);
+                record.write_half.enqueue(raw_frame.clone());
             }
         }
 
         for (cid, bytes) in filtered_outbound {
             if let Some(record) = guests.get(&cid) {
-                record.write_half.enqueue(&bytes);
+                record.write_half.enqueue(bytes);
             }
         }
     }
@@ -899,7 +994,7 @@ impl HostTransceiver {
     /// four-cases transition logic and re-encodes the payload with
     /// each subscription's projection mask.
     #[allow(dead_code)] // retained for tests / callers that don't need filtering
-    fn fan_out_bytes(&self, type_name: &str, bytes: &[u8], exclude_client_id: u32) {
+    fn fan_out_bytes(&self, type_name: &str, bytes: Bytes, exclude_client_id: u32) {
         let inner = self.inner.lock().expect("host mutex poisoned");
         let Some(group) = inner.groups.get(type_name) else {
             return;
@@ -909,7 +1004,7 @@ impl HostTransceiver {
                 continue;
             }
             if let Some(record) = inner.guests.get(&id) {
-                record.write_half.enqueue(bytes);
+                record.write_half.enqueue(bytes.clone());
             }
         }
     }
@@ -1010,7 +1105,7 @@ impl HostTransceiver {
             sender: HOST_ID,
         });
         encode_transmission_into(&header, &info, &mut buf);
-        writer.enqueue(&buf);
+        writer.enqueue(Bytes::from(buf));
     }
 
     fn leave_group(&self, client_id: u32, group_name: &str) {
@@ -1173,7 +1268,7 @@ impl HostTransceiver {
             sender: HOST_ID,
         });
         encode_transmission_into(&header, &info, &mut buf);
-        writer.enqueue(&buf);
+        writer.enqueue(Bytes::from(buf));
     }
 
     fn remove_guest(&self, client_id: u32) {
@@ -1265,7 +1360,7 @@ impl HostTransceiver {
     fn route_synthetic_removal(&self, type_name: &str, txn: Transmission) {
         let mut buf = Vec::with_capacity(64);
         txn.encode_into(&mut buf);
-        self.cache_and_fan_out(type_name, &txn.header, &buf, Some(&txn.payload), HOST_ID);
+        self.cache_and_fan_out(type_name, &txn.header, Bytes::from(buf), Some(&txn.payload), HOST_ID);
     }
 
     /// Snapshot the per-guest writer for `client_id`. Returns `None`
@@ -1580,7 +1675,7 @@ fn handle_connected_message(
     let mut buf = Vec::with_capacity(FRAME_OVERHEAD_HINT + raw.payload.len());
     encode_frame_with_header(&header, &raw.payload, &mut buf);
 
-    host.cache_and_fan_out(type_name, &header, &buf, dyn_payload.as_ref(), 0);
+    host.cache_and_fan_out(type_name, &header, Bytes::from(buf), dyn_payload.as_ref(), 0);
 }
 
 /// Capacity hint for the per-frame overhead (4-byte size prefix +
@@ -1617,7 +1712,7 @@ fn handle_echo(host: &Arc<HostTransceiver>, client_id: u32, raw: &RawTransmissio
     let mut buf = Vec::with_capacity(64);
     encode_transmission_into(&header, &reply, &mut buf);
     if let Some(writer) = host.writer_for(client_id) {
-        writer.enqueue(&buf);
+        writer.enqueue(Bytes::from(buf));
     }
 }
 
@@ -1695,7 +1790,7 @@ fn handle_descriptor_request(
         server_sent_time: now_timepoint(),
     });
     encode_transmission_into(&header, &info, &mut buf);
-    writer.enqueue(&buf);
+    writer.enqueue(Bytes::from(buf));
 }
 
 /// Handle `DotsClearCache`: drop the named types' entries from the
@@ -1896,7 +1991,7 @@ where
     });
     let mut buf = Vec::with_capacity(64);
     encode_transmission_into(&header, value, &mut buf);
-    writer.enqueue(&buf);
+    writer.enqueue(Bytes::from(buf));
 }
 
 async fn next_txn<R>(stream: &mut R) -> Result<RawTransmission, HostError>
