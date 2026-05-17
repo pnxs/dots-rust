@@ -291,7 +291,7 @@ async fn host_publishes_distinct_dots_client_statistics_records() {
 }
 
 #[tokio::test]
-async fn guest_write_stats_count_published_frames_and_bytes() {
+async fn guest_stats_count_both_directions() {
     let host = HostTransceiver::new("test-host");
     let registry = registry();
     registry.register_struct_static(Pinger::DESCRIPTOR);
@@ -319,6 +319,7 @@ async fn guest_write_stats_count_published_frames_and_bytes() {
         }
     }
 
+    // Host → guest: 5 Pingers (drives bytes_sent / frames_sent).
     for i in 0..5_u32 {
         host.publish(&dots!(Pinger {
             id: i,
@@ -326,24 +327,57 @@ async fn guest_write_stats_count_published_frames_and_bytes() {
             sequence: i as u64,
         }));
     }
+    // Guest → host: 3 Pingers (drives bytes_received / frames_received
+    // on the host's record of this guest).
+    for i in 100..103_u32 {
+        gt.publish(&dots!(Pinger {
+            id: i,
+            message: "in",
+            sequence: i as u64,
+        }));
+    }
 
-    // Drain the subscription so we know all five frames have been
-    // dispatched on the wire (and therefore counted by the drainer).
+    // Drain the host→guest subscription so we know all five frames
+    // have been dispatched on the wire (and therefore counted by
+    // the drainer). Mix of host publishes + the guest's own
+    // publishes echoed back.
     for _ in 0..5 {
         let _ = tokio::time::timeout(Duration::from_secs(2), sub.recv())
             .await
             .expect("timed out");
     }
+    // Wait for the host's read loop to land the 3 guest publishes
+    // in the cache. Using cache_size (not guest_stats) here is
+    // deliberate — guest_stats() resets peak_queued_* on every
+    // call and would zero the high-water mark before the final
+    // snapshot below.
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.cache_size("Pinger") >= 8 {
+            break;
+        }
+    }
 
     let stats = host.guest_stats(guest_id).expect("guest still connected");
-    // 5 Pinger publishes + handshake / DotsClient traffic. Be precise
-    // about the publishes; allow extra for the join-time chatter.
+    // Write side: ≥5 publishes plus join-time chatter.
     assert!(
         stats.frames_sent >= 5,
         "expected ≥5 frames_sent, got {}",
         stats.frames_sent
     );
     assert!(stats.bytes_sent > 0, "bytes_sent should be non-zero");
+    // Read side: at minimum the 3 guest publishes (plus DotsMember
+    // joins, descriptor exchange, etc. — exact count varies with
+    // handshake state).
+    assert!(
+        stats.frames_received >= 3,
+        "expected ≥3 frames_received, got {}",
+        stats.frames_received
+    );
+    assert!(
+        stats.bytes_received > 0,
+        "bytes_received should be non-zero"
+    );
     assert!(
         stats.drainer_wakeups >= 1,
         "drainer must have woken at least once"
@@ -359,6 +393,8 @@ async fn guest_write_stats_count_published_frames_and_bytes() {
     let again = host.guest_stats(guest_id).unwrap();
     assert_eq!(again.frames_sent, stats.frames_sent);
     assert_eq!(again.bytes_sent, stats.bytes_sent);
+    assert!(again.frames_received >= stats.frames_received);
+    assert!(again.bytes_received >= stats.bytes_received);
     assert_eq!(again.peak_queued_bytes, again.current_queued_bytes);
     assert_eq!(again.peak_queued_frames, 0);
 

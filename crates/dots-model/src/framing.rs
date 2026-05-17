@@ -299,6 +299,11 @@ pub struct RawTransmission {
     pub header: DotsHeader,
     /// Raw CBOR bytes of the payload struct (no size prefix, no header).
     pub payload: Bytes,
+    /// Total bytes the wire frame occupied (5-byte size prefix +
+    /// encoded header + encoded payload). Recorded here so the
+    /// per-guest read loop can credit `bytes_received` without
+    /// re-encoding the header or peeking at the codec.
+    pub frame_bytes: usize,
 }
 
 impl RawTransmission {
@@ -325,7 +330,11 @@ impl RawTransmission {
         let payload_start_in_body = decoder.position();
         let payload_start = SIZE_PREFIX_LEN + payload_start_in_body;
         let payload = frame.slice(payload_start..total);
-        Ok(Self { header, payload })
+        Ok(Self {
+            header,
+            payload,
+            frame_bytes: total,
+        })
     }
 
     /// Decode the payload bytes into a [`DynamicStruct`] using the type

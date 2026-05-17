@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::IoSlice;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, Bytes};
@@ -75,6 +76,17 @@ struct GuestWriter {
     /// Drainer wakeup. Producers fire `notify_one` when the queue
     /// transitions empty → non-empty (or to signal `closed`).
     notify: tokio::sync::Notify,
+    /// Read-side counters. Bumped from the per-guest read loop in
+    /// [`run_guest`]; read from `snapshot_stats`. Lives outside the
+    /// write mutex so reader and writer don't contend on each
+    /// other's hot paths.
+    read_stats: ReadStats,
+}
+
+#[derive(Default)]
+struct ReadStats {
+    bytes: AtomicU64,
+    frames: AtomicU64,
 }
 
 struct WriteState {
@@ -113,14 +125,15 @@ struct WriteStatsRaw {
     peak_queued_frames: u32,
 }
 
-/// Per-guest write-side statistics, snapshotted via
+/// Per-guest I/O statistics, snapshotted via
 /// [`HostTransceiver::guest_stats`] / [`HostTransceiver::guest_stats_all`].
 ///
-/// Counters are split into two camps:
-/// - **Cumulative** (`bytes_sent`, `frames_sent`, `drainer_wakeups`)
-///   — monotonic for the lifetime of the guest, never reset by
-///   snapshotting. Consumers compute deltas across snapshots if they
-///   want rates.
+/// Counters are split into three camps:
+/// - **Cumulative write** (`bytes_sent`, `frames_sent`,
+///   `drainer_wakeups`) and **cumulative read** (`bytes_received`,
+///   `frames_received`) — monotonic for the lifetime of the guest,
+///   never reset by snapshotting. Consumers compute deltas across
+///   snapshots if they want rates.
 /// - **High-water marks** (`peak_queued_bytes`, `peak_queued_frames`)
 ///   — reset on every snapshot to the current queued values, so each
 ///   reading reports the peak observed *since the previous snapshot*.
@@ -129,17 +142,28 @@ struct WriteStatsRaw {
 /// the snapshot was taken; useful for spotting a chronic non-zero
 /// floor that the high-water marks would never reset below.
 ///
+/// Byte counters on both directions include the full wire frame (5
+/// byte size prefix + encoded header + encoded payload), so
+/// `bytes_sent` and `bytes_received` are directly comparable.
+///
 /// Derived ratios worth tracking on the consumer side:
 /// - `frames_sent / drainer_wakeups` — average vectored batch size.
 ///   Closer to 1 means the producer never gets ahead of the drainer;
 ///   large values mean fan-out bursts are amortized over one syscall.
 /// - `bytes_sent / drainer_wakeups` — average write size per syscall.
 #[derive(Debug, Default, Clone)]
-pub struct GuestWriteStats {
-    /// Total bytes handed to the socket since the guest connected.
+pub struct GuestStats {
+    /// Total bytes handed to the socket since the guest connected
+    /// (full wire frame size).
     pub bytes_sent: u64,
     /// Total frames handed to the socket since the guest connected.
     pub frames_sent: u64,
+    /// Total bytes pulled off the socket since the guest connected
+    /// (full wire frame size).
+    pub bytes_received: u64,
+    /// Total frames decoded from the socket since the guest
+    /// connected.
+    pub frames_received: u64,
     /// Number of times the drainer task woke up from `notified()`.
     pub drainer_wakeups: u64,
     /// Peak `queued_bytes` observed between the previous snapshot
@@ -191,7 +215,20 @@ impl GuestWriter {
                 stats: WriteStatsRaw::default(),
             }),
             notify: tokio::sync::Notify::new(),
+            read_stats: ReadStats::default(),
         })
+    }
+
+    /// Credit one received frame of `frame_bytes` to this guest's
+    /// read counters. Called by the per-guest read loop after a
+    /// successful frame decode. Atomic-only — does not touch the
+    /// write mutex.
+    #[inline]
+    fn record_received(&self, frame_bytes: usize) {
+        self.read_stats
+            .bytes
+            .fetch_add(frame_bytes as u64, Ordering::Relaxed);
+        self.read_stats.frames.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Append `frame` to the output queue. **Synchronous** — no
@@ -262,17 +299,23 @@ impl GuestWriter {
         self.state.lock().expect("guest write state poisoned").overflow
     }
 
-    /// Build a [`GuestWriteStats`] snapshot. Resets the high-water
-    /// marks to the *current* queued values so the next snapshot
-    /// reports peaks observed strictly between the two calls (and
-    /// not below the current sustained backlog).
-    fn snapshot_stats(&self) -> GuestWriteStats {
+    /// Build a [`GuestStats`] snapshot. Read counters come from
+    /// atomics (no lock); write counters and the high-water marks
+    /// come from `WriteState`. Resets the high-water marks to the
+    /// *current* queued values so the next snapshot reports peaks
+    /// observed strictly between the two calls (and not below the
+    /// current sustained backlog).
+    fn snapshot_stats(&self) -> GuestStats {
+        let bytes_received = self.read_stats.bytes.load(Ordering::Relaxed);
+        let frames_received = self.read_stats.frames.load(Ordering::Relaxed);
         let mut state = self.state.lock().expect("guest write state poisoned");
         let current_bytes = state.queued_bytes as u64;
         let current_frames = state.queue.len() as u32;
-        let snap = GuestWriteStats {
+        let snap = GuestStats {
             bytes_sent: state.stats.bytes_sent,
             frames_sent: state.stats.frames_sent,
+            bytes_received,
+            frames_received,
             drainer_wakeups: state.stats.drainer_wakeups,
             peak_queued_bytes: state.stats.peak_queued_bytes,
             peak_queued_frames: state.stats.peak_queued_frames,
@@ -507,7 +550,7 @@ pub struct ConnectionTransition {
     pub client_id: u32,
     pub client_name: Option<String>,
     pub state: DotsConnectionState,
-    pub final_stats: Option<GuestWriteStats>,
+    pub final_stats: Option<GuestStats>,
 }
 
 /// Per-type membership state — kept as a struct rather than a bare
@@ -676,9 +719,9 @@ impl HostTransceiver {
     ///
     /// Each call resets the high-water marks on the underlying
     /// writer, so a periodic poller naturally gets the peak
-    /// observed between consecutive polls. See [`GuestWriteStats`]
+    /// observed between consecutive polls. See [`GuestStats`]
     /// for field semantics.
-    pub fn guest_stats(&self, client_id: u32) -> Option<GuestWriteStats> {
+    pub fn guest_stats(&self, client_id: u32) -> Option<GuestStats> {
         self.writer_for(client_id).map(|w| w.snapshot_stats())
     }
 
@@ -688,7 +731,7 @@ impl HostTransceiver {
     /// the host mutex is held only briefly. As with
     /// [`guest_stats`](Self::guest_stats), each entry's high-water
     /// marks are reset by this call.
-    pub fn guest_stats_all(&self) -> Vec<(u32, GuestWriteStats)> {
+    pub fn guest_stats_all(&self) -> Vec<(u32, GuestStats)> {
         let writers: Vec<(u32, SharedWriter)> = {
             let inner = self.inner.lock().expect("host mutex poisoned");
             inner
@@ -1737,6 +1780,7 @@ where
         loop {
             match stream_in.next().await {
                 Some(Ok(raw)) => {
+                    writer.record_received(raw.frame_bytes);
                     if handle_preload_message(&host, client_id, &raw, &writer)? {
                         break;
                     }
@@ -1760,6 +1804,7 @@ where
     loop {
         match stream_in.next().await {
             Some(Ok(raw)) => {
+                writer.record_received(raw.frame_bytes);
                 handle_connected_message(&host, client_id, &raw);
             }
             Some(Err(e)) => return Err(HostError::Transport(e.to_string())),

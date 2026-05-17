@@ -46,7 +46,7 @@ pub use guest::{
     AllTypesSubscription, GuestDriver, GuestError, GuestTransceiver, SubscriptionHandle,
 };
 pub use host::{
-    ConnectionTransition, EndpointHandle, GuestWriteStats, HOST_ID, HostTransceiver,
+    ConnectionTransition, EndpointHandle, GuestStats, HOST_ID, HostTransceiver,
 };
 pub use view::{View, ViewError, ViewEvent, ViewOp, ViewSubscription};
 #[cfg(feature = "tracing-init")]

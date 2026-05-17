@@ -36,8 +36,7 @@ use dots_model::{
     DotsClient, DotsClientStatistics, DotsConnectionState, DotsStatistics,
 };
 use dots_transport::{
-    ConnectionTransition, Endpoint, EndpointHandle, GuestWriteStats, HostTransceiver,
-    parse_endpoint,
+    ConnectionTransition, Endpoint, EndpointHandle, GuestStats, HostTransceiver, parse_endpoint,
 };
 
 const DEFAULT_ENDPOINT: &str = "tcp://0.0.0.0:11235";
@@ -135,14 +134,18 @@ fn publish_on_transition(host: &Arc<HostTransceiver>, t: &ConnectionTransition) 
 }
 
 /// Build the `DotsClientStatistics` projection of one
-/// `GuestWriteStats` snapshot. Shared between the periodic publisher
+/// `GuestStats` snapshot. Shared between the periodic publisher
 /// and the terminal-on-Close path so the wire shape is identical.
-fn stats_record(client_id: u32, s: &GuestWriteStats) -> DotsClientStatistics {
+fn stats_record(client_id: u32, s: &GuestStats) -> DotsClientStatistics {
     dots!(DotsClientStatistics {
         client_id: client_id,
         sent: dots!(DotsStatistics {
             bytes: s.bytes_sent,
             packages: s.frames_sent,
+        }),
+        received: dots!(DotsStatistics {
+            bytes: s.bytes_received,
+            packages: s.frames_received,
         }),
         drainer_wakeups: s.drainer_wakeups,
         peak_queued_bytes: s.peak_queued_bytes,

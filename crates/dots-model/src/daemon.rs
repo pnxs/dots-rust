@@ -61,14 +61,16 @@ pub struct DotsClientStatistics {
     #[dots(tag = 2)]
     pub sent: Option<DotsStatistics>,
     #[dots(tag = 3)]
-    pub drainer_wakeups: Option<u64>,
+    pub received: Option<DotsStatistics>,
     #[dots(tag = 4)]
-    pub peak_queued_bytes: Option<u64>,
+    pub drainer_wakeups: Option<u64>,
     #[dots(tag = 5)]
-    pub peak_queued_frames: Option<u32>,
+    pub peak_queued_bytes: Option<u64>,
     #[dots(tag = 6)]
-    pub current_queued_bytes: Option<u64>,
+    pub peak_queued_frames: Option<u32>,
     #[dots(tag = 7)]
+    pub current_queued_bytes: Option<u64>,
+    #[dots(tag = 8)]
     pub overflow_disconnected: Option<bool>,
 }
 
