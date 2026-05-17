@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use dots_core::dots;
 use dots_derive::DotsStruct;
-use dots_model::{Registry, registry_with_internal_types};
+use dots_model::{DotsClientStatistics, DotsStatistics, Registry, registry_with_internal_types};
 use dots_transport::{Connection, ConnectionBuilder, GuestTransceiver, HostTransceiver};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -167,6 +167,205 @@ async fn host_publish_reaches_subscribed_guest() {
         .expect("sub closed");
     assert_eq!(event.value.id, Some(99));
     assert_eq!(event.header.sender, Some(dots_transport::HOST_ID));
+
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+}
+
+#[tokio::test]
+async fn host_publishes_distinct_dots_client_statistics_records() {
+    // Mirrors the dotsd stats publisher: host publishes N separate
+    // DotsClientStatistics records (with a nested DotsStatistics
+    // sub-struct), each keyed by a unique clientId. Assert that
+    // every record arrives at the subscriber AND that the host's
+    // cache pool ends up with N entries.
+    let host = HostTransceiver::new("test-host");
+    let registry = registry();
+
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+
+    let conn = ConnectionBuilder::new(guest_io, "watcher", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) =
+        GuestTransceiver::from_connection("watcher".to_string(), registry.clone(), conn);
+    let mut sub = gt.subscribe_stream::<DotsClientStatistics>();
+    let driver_handle = tokio::spawn(driver.run());
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("DotsClientStatistics") >= 1 {
+            break;
+        }
+    }
+    assert_eq!(host.group_size("DotsClientStatistics"), 1);
+
+    let ids = [10_u32, 20, 30];
+    for &id in &ids {
+        host.publish(&dots!(DotsClientStatistics {
+            client_id: id,
+            sent: dots!(DotsStatistics {
+                bytes: id as u64 * 100,
+                packages: id as u64,
+            }),
+            drainer_wakeups: id as u64 * 2,
+            peak_queued_bytes: 0_u64,
+            peak_queued_frames: 0_u32,
+            current_queued_bytes: 0_u64,
+            overflow_disconnected: false,
+        }));
+    }
+
+    let mut received: Vec<u32> = Vec::new();
+    for _ in 0..ids.len() {
+        let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("timed out waiting for DotsClientStatistics")
+            .expect("subscription closed");
+        received.push(event.value.client_id.expect("client_id missing"));
+        // Sanity: the nested DotsStatistics decoded — packages == id.
+        let sent = event.value.sent.as_ref().expect("sent sub-struct missing");
+        assert_eq!(
+            sent.packages,
+            Some(event.value.client_id.unwrap() as u64),
+            "nested DotsStatistics packages should match the client_id"
+        );
+    }
+    received.sort();
+    assert_eq!(
+        received,
+        ids.to_vec(),
+        "subscriber must receive one event per published key"
+    );
+
+    assert_eq!(
+        host.cache_size("DotsClientStatistics"),
+        ids.len(),
+        "host cache must hold one entry per published key"
+    );
+
+    // Late subscriber: connect AFTER the publishes, subscribe, and
+    // verify the cache replays all three records on join. This is
+    // the path a fresh `dots-trace` invocation hits.
+    let (host_io_b, guest_io_b) = tokio::io::duplex(8192);
+    host.accept(host_io_b);
+    let conn_b = ConnectionBuilder::new(guest_io_b, "late-watcher", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt_b, driver_b) = GuestTransceiver::from_connection(
+        "late-watcher".to_string(),
+        registry.clone(),
+        conn_b,
+    );
+    let mut sub_b = gt_b.subscribe_stream::<DotsClientStatistics>();
+    let driver_b_handle = tokio::spawn(driver_b.run());
+
+    let mut replayed: Vec<u32> = Vec::new();
+    for _ in 0..ids.len() {
+        let event = tokio::time::timeout(Duration::from_secs(2), sub_b.recv())
+            .await
+            .expect("timed out waiting for replayed DotsClientStatistics")
+            .expect("late-watcher subscription closed");
+        assert!(
+            event.header.from_cache.is_some(),
+            "replayed entries must carry from_cache"
+        );
+        replayed.push(event.value.client_id.unwrap());
+    }
+    replayed.sort();
+    assert_eq!(
+        replayed,
+        ids.to_vec(),
+        "late subscriber must receive every cached DotsClientStatistics"
+    );
+
+    gt.exit();
+    gt_b.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_b_handle).await;
+}
+
+#[tokio::test]
+async fn guest_write_stats_count_published_frames_and_bytes() {
+    let host = HostTransceiver::new("test-host");
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+
+    let conn = ConnectionBuilder::new(guest_io, "subscriber", registry.clone())
+        .preload(false)
+        .publishes::<Pinger>()
+        .connect()
+        .await
+        .unwrap();
+    let guest_id = conn.client_id().expect("client_id assigned");
+    let (gt, driver) =
+        GuestTransceiver::from_connection("subscriber".to_string(), registry.clone(), conn);
+    let mut sub = gt.subscribe_stream::<Pinger>();
+    let driver_handle = tokio::spawn(driver.run());
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("Pinger") >= 1 {
+            break;
+        }
+    }
+
+    for i in 0..5_u32 {
+        host.publish(&dots!(Pinger {
+            id: i,
+            message: "x",
+            sequence: i as u64,
+        }));
+    }
+
+    // Drain the subscription so we know all five frames have been
+    // dispatched on the wire (and therefore counted by the drainer).
+    for _ in 0..5 {
+        let _ = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("timed out");
+    }
+
+    let stats = host.guest_stats(guest_id).expect("guest still connected");
+    // 5 Pinger publishes + handshake / DotsClient traffic. Be precise
+    // about the publishes; allow extra for the join-time chatter.
+    assert!(
+        stats.frames_sent >= 5,
+        "expected ≥5 frames_sent, got {}",
+        stats.frames_sent
+    );
+    assert!(stats.bytes_sent > 0, "bytes_sent should be non-zero");
+    assert!(
+        stats.drainer_wakeups >= 1,
+        "drainer must have woken at least once"
+    );
+    assert!(
+        stats.peak_queued_bytes > 0,
+        "peak_queued_bytes should have observed the burst"
+    );
+    assert!(!stats.overflow_disconnected);
+
+    // Second snapshot: cumulative counters preserved, peaks reset
+    // (queue is empty by now, so they read 0).
+    let again = host.guest_stats(guest_id).unwrap();
+    assert_eq!(again.frames_sent, stats.frames_sent);
+    assert_eq!(again.bytes_sent, stats.bytes_sent);
+    assert_eq!(again.peak_queued_bytes, again.current_queued_bytes);
+    assert_eq!(again.peak_queued_frames, 0);
+
+    // Bulk accessor returns the one connected guest.
+    let all = host.guest_stats_all();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].0, guest_id);
 
     gt.exit();
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
@@ -492,13 +691,14 @@ async fn host_replies_to_dots_echo_request() {
 
 #[tokio::test]
 async fn transition_handler_publishes_dots_client_on_connect_and_disconnect() {
+    use dots_core::dots;
     use dots_model::{DotsConnectionState, DotsClient};
 
     let host = HostTransceiver::new("test-host");
 
     // Install the application-side transition handler. Mirrors what
-    // dotsd does — the host itself only emits raw transitions;
-    // *this* callback turns each one into a `DotsClient` publish.
+    // dotsd does — the host itself emits raw transitions; *this*
+    // callback turns each one into a `DotsClient` publish.
     let host_for_handler = host.clone();
     host.set_transition_handler(move |t| {
         let is_closed = t.state == DotsConnectionState::Closed;
@@ -585,6 +785,187 @@ async fn transition_handler_publishes_dots_client_on_connect_and_disconnect() {
 
     gt_obs.exit();
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_obs_handle).await;
+}
+
+#[tokio::test]
+async fn cached_values_round_trips_typed_entries() {
+    // Publish two Pinger records, then read them back via the
+    // cached_values<Pinger> accessor — proves the round-trip
+    // (DynamicStruct → encode → decode_typed) preserves all fields.
+    let host = HostTransceiver::new("test-host");
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    host.publish(&dots!(Pinger {
+        id: 1_u32,
+        message: "one",
+        sequence: 10_u64,
+    }));
+    host.publish(&dots!(Pinger {
+        id: 2_u32,
+        message: "two",
+        sequence: 20_u64,
+    }));
+
+    let mut values: Vec<Pinger> = host.cached_values::<Pinger>();
+    values.sort_by_key(|p| p.id);
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0].id, Some(1));
+    assert_eq!(values[0].message.as_deref(), Some("one"));
+    assert_eq!(values[0].sequence, Some(10));
+    assert_eq!(values[1].id, Some(2));
+    assert_eq!(values[1].message.as_deref(), Some("two"));
+    assert_eq!(values[1].sequence, Some(20));
+}
+
+#[tokio::test]
+async fn client_id_referenced_tracks_created_from_and_last_update() {
+    // Set up: one guest publishes a Pinger, then disconnects. The
+    // host's own publishes are tagged with HOST_ID. After the guest
+    // disconnects, the cache entry's `last_update_sender` still
+    // points at the (gone) guest id — `client_id_referenced` must
+    // return true so a cleanUpClients sweep won't reap the
+    // DotsClient(Closed) prematurely.
+    let host = HostTransceiver::new("test-host");
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+    let conn = ConnectionBuilder::new(guest_io, "publisher", registry.clone())
+        .preload(false)
+        .publishes::<Pinger>()
+        .connect()
+        .await
+        .unwrap();
+    let publisher_id = conn.client_id().expect("client_id assigned");
+    let (gt, driver) =
+        GuestTransceiver::from_connection("publisher".to_string(), registry.clone(), conn);
+    let driver_handle = tokio::spawn(driver.run());
+
+    gt.publish(&dots!(Pinger {
+        id: 42_u32,
+        message: "leak",
+        sequence: 1_u64,
+    }));
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.cache_size("Pinger") == 1 {
+            break;
+        }
+    }
+    assert_eq!(host.cache_size("Pinger"), 1);
+    assert!(
+        host.client_id_referenced(publisher_id),
+        "publisher's id should be referenced via the Pinger entry's last_update_sender",
+    );
+    assert!(
+        !host.client_id_referenced(99_999_u32),
+        "an id with no cache footprint must not appear referenced",
+    );
+
+    // Disconnect the publisher — the entry stays (no [cleanup]
+    // flag on Pinger), so `client_id_referenced` should still
+    // return true even though the guest is gone.
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+
+    assert!(
+        host.client_id_referenced(publisher_id),
+        "cache entries created by the publisher still hold its id after disconnect",
+    );
+}
+
+#[tokio::test]
+async fn transition_handler_carries_final_stats_on_close() {
+    use std::sync::Mutex as StdMutex;
+    use dots_model::DotsConnectionState;
+    use dots_transport::ConnectionTransition;
+
+    let host = HostTransceiver::new("test-host");
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    // Record every transition that fires. The disconnect transition
+    // is the one we want to inspect for `final_stats`.
+    let log: Arc<StdMutex<Vec<ConnectionTransition>>> = Arc::new(StdMutex::new(Vec::new()));
+    let log_for_handler = log.clone();
+    host.set_transition_handler(move |t| {
+        log_for_handler
+            .lock()
+            .expect("test log poisoned")
+            .push(t.clone());
+    });
+
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    let (host_io, guest_io) = tokio::io::duplex(8192);
+    host.accept(host_io);
+    let conn = ConnectionBuilder::new(guest_io, "stats-victim", registry.clone())
+        .preload(false)
+        .publishes::<Pinger>()
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) =
+        GuestTransceiver::from_connection("stats-victim".to_string(), registry.clone(), conn);
+    let driver_handle = tokio::spawn(driver.run());
+
+    // Force at least one frame down the guest's writer queue so its
+    // final stats aren't all zeros.
+    let mut _sub = gt.subscribe_stream::<Pinger>();
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("Pinger") >= 1 {
+            break;
+        }
+    }
+    host.publish(&dots!(Pinger {
+        id: 1_u32,
+        message: "boop",
+        sequence: 1_u64,
+    }));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+
+    // Give the host's per-guest task time to fire its Closed
+    // transition through remove_guest.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let l = log.lock().unwrap();
+        if l.iter().any(|t| t.state == DotsConnectionState::Closed) {
+            break;
+        }
+    }
+
+    let recorded = log.lock().unwrap();
+    let closed = recorded
+        .iter()
+        .find(|t| t.state == DotsConnectionState::Closed)
+        .expect("Closed transition must fire");
+    assert_eq!(closed.client_name.as_deref(), Some("stats-victim"));
+    let stats = closed
+        .final_stats
+        .as_ref()
+        .expect("final_stats must be populated on Closed transitions");
+    assert!(
+        stats.frames_sent >= 1,
+        "expected at least the Pinger frame in final_stats.frames_sent, got {}",
+        stats.frames_sent
+    );
+
+    // Connect transitions must NOT carry final_stats (only Closed
+    // does, by contract).
+    for t in recorded.iter() {
+        if t.state != DotsConnectionState::Closed {
+            assert!(
+                t.final_stats.is_none(),
+                "non-Closed transition leaked final_stats: {t:?}"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]

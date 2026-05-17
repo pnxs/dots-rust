@@ -13,7 +13,7 @@ dots-core.workspace = true
 dots-model.workspace = true
 dots-transport = { workspace = true, features = ["tracing-init"] }
 
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "time"] }
 tracing.workspace = true
 
 [lints]

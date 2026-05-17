@@ -42,6 +42,36 @@ pub struct DotsClient {
     pub connection_state: Option<DotsConnectionState>,
 }
 
+/// Per-client write-side statistics. Published periodically by the
+/// broker (one record per connected client, keyed by `clientId`) so
+/// observers can watch outgoing throughput, buffer pressure, and
+/// drainer behaviour on a per-guest basis. The broker removes a
+/// record when the corresponding [`DotsClient`] disappears.
+///
+/// `sent.bytes` / `sent.packages` are cumulative for the lifetime of
+/// the connection. `peakQueuedBytes` / `peakQueuedFrames` report the
+/// high-water mark observed *between consecutive publishes* (they
+/// reset on every snapshot). `currentQueuedBytes` is the
+/// instantaneous backlog at the moment of the snapshot.
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+#[dots(name = "DotsClientStatistics", cached)]
+pub struct DotsClientStatistics {
+    #[dots(tag = 1, key)]
+    pub client_id: Option<u32>,
+    #[dots(tag = 2)]
+    pub sent: Option<DotsStatistics>,
+    #[dots(tag = 3)]
+    pub drainer_wakeups: Option<u64>,
+    #[dots(tag = 4)]
+    pub peak_queued_bytes: Option<u64>,
+    #[dots(tag = 5)]
+    pub peak_queued_frames: Option<u32>,
+    #[dots(tag = 6)]
+    pub current_queued_bytes: Option<u64>,
+    #[dots(tag = 7)]
+    pub overflow_disconnected: Option<bool>,
+}
+
 /// Counters for bytes / packages on a transmission direction. Used as
 /// a sub-record of [`DotsDaemonStatus`].
 ///
@@ -53,7 +83,7 @@ pub struct DotsClient {
 /// }
 /// ```
 #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "DotsStatistics", internal)]
+#[dots(name = "DotsStatistics")]
 pub struct DotsStatistics {
     #[dots(tag = 1)]
     pub bytes: Option<u64>,

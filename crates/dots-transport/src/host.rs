@@ -23,7 +23,10 @@ use bytes::{Buf, Bytes};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::Mutex as AsyncMutex;
 
-use dots_core::{DynamicStruct, PropertySet, Publishable, StructValue, Transmittable, decode_typed_from_slice, dots};
+use dots_core::{
+    DynamicFieldKind, DynamicStruct, DynamicStructDescriptor, PropertySet, Publishable,
+    StructValue, Transmittable, decode_typed_from_slice, dots,
+};
 use dots_model::{
     DotsCacheInfo, DotsConnectionState, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect,
     DotsMsgConnectResponse, DotsMsgHello, DotsServerCapabilities, EnumDescriptorData,
@@ -94,6 +97,63 @@ struct WriteState {
     /// point. Set on overflow, on socket failure, and on
     /// `remove_guest`.
     closed: bool,
+    /// Monotonic counters and high-water marks read by
+    /// [`HostTransceiver::guest_stats`]. Lives under the same
+    /// mutex as `queue` — every producer and the drainer already
+    /// hold it, so per-bump cost is one add.
+    stats: WriteStatsRaw,
+}
+
+#[derive(Default)]
+struct WriteStatsRaw {
+    bytes_sent: u64,
+    frames_sent: u64,
+    drainer_wakeups: u64,
+    peak_queued_bytes: u64,
+    peak_queued_frames: u32,
+}
+
+/// Per-guest write-side statistics, snapshotted via
+/// [`HostTransceiver::guest_stats`] / [`HostTransceiver::guest_stats_all`].
+///
+/// Counters are split into two camps:
+/// - **Cumulative** (`bytes_sent`, `frames_sent`, `drainer_wakeups`)
+///   — monotonic for the lifetime of the guest, never reset by
+///   snapshotting. Consumers compute deltas across snapshots if they
+///   want rates.
+/// - **High-water marks** (`peak_queued_bytes`, `peak_queued_frames`)
+///   — reset on every snapshot to the current queued values, so each
+///   reading reports the peak observed *since the previous snapshot*.
+///
+/// `current_queued_bytes` is the instantaneous backlog at the moment
+/// the snapshot was taken; useful for spotting a chronic non-zero
+/// floor that the high-water marks would never reset below.
+///
+/// Derived ratios worth tracking on the consumer side:
+/// - `frames_sent / drainer_wakeups` — average vectored batch size.
+///   Closer to 1 means the producer never gets ahead of the drainer;
+///   large values mean fan-out bursts are amortized over one syscall.
+/// - `bytes_sent / drainer_wakeups` — average write size per syscall.
+#[derive(Debug, Default, Clone)]
+pub struct GuestWriteStats {
+    /// Total bytes handed to the socket since the guest connected.
+    pub bytes_sent: u64,
+    /// Total frames handed to the socket since the guest connected.
+    pub frames_sent: u64,
+    /// Number of times the drainer task woke up from `notified()`.
+    pub drainer_wakeups: u64,
+    /// Peak `queued_bytes` observed between the previous snapshot
+    /// (or guest connect) and this one. Reset on read.
+    pub peak_queued_bytes: u64,
+    /// Peak pending-frame count observed since the previous
+    /// snapshot. Reset on read.
+    pub peak_queued_frames: u32,
+    /// Currently-queued bytes at snapshot time. Not reset.
+    pub current_queued_bytes: u64,
+    /// `true` once the per-guest writer has been marked for
+    /// disconnect — either via [`WRITE_OVERFLOW_THRESHOLD`] tripping
+    /// or a fatal socket error during drain.
+    pub overflow_disconnected: bool,
 }
 
 /// Drop bytes destined for a guest whose buffered queue would grow
@@ -128,6 +188,7 @@ impl GuestWriter {
                 queued_bytes: 0,
                 overflow: false,
                 closed: false,
+                stats: WriteStatsRaw::default(),
             }),
             notify: tokio::sync::Notify::new(),
         })
@@ -170,6 +231,13 @@ impl GuestWriter {
             let was_empty = state.queue.is_empty();
             state.queued_bytes += frame.len();
             state.queue.push_back(frame);
+            if state.queued_bytes as u64 > state.stats.peak_queued_bytes {
+                state.stats.peak_queued_bytes = state.queued_bytes as u64;
+            }
+            let frames = state.queue.len() as u32;
+            if frames > state.stats.peak_queued_frames {
+                state.stats.peak_queued_frames = frames;
+            }
             should_notify = was_empty;
         }
         if should_notify {
@@ -193,6 +261,28 @@ impl GuestWriter {
     fn is_overflowed(&self) -> bool {
         self.state.lock().expect("guest write state poisoned").overflow
     }
+
+    /// Build a [`GuestWriteStats`] snapshot. Resets the high-water
+    /// marks to the *current* queued values so the next snapshot
+    /// reports peaks observed strictly between the two calls (and
+    /// not below the current sustained backlog).
+    fn snapshot_stats(&self) -> GuestWriteStats {
+        let mut state = self.state.lock().expect("guest write state poisoned");
+        let current_bytes = state.queued_bytes as u64;
+        let current_frames = state.queue.len() as u32;
+        let snap = GuestWriteStats {
+            bytes_sent: state.stats.bytes_sent,
+            frames_sent: state.stats.frames_sent,
+            drainer_wakeups: state.stats.drainer_wakeups,
+            peak_queued_bytes: state.stats.peak_queued_bytes,
+            peak_queued_frames: state.stats.peak_queued_frames,
+            current_queued_bytes: current_bytes,
+            overflow_disconnected: state.overflow,
+        };
+        state.stats.peak_queued_bytes = current_bytes;
+        state.stats.peak_queued_frames = current_frames;
+        snap
+    }
 }
 
 /// Drainer loop: one task per guest, owns the WriteHandle through
@@ -213,7 +303,17 @@ async fn writer_loop(writer: Arc<GuestWriter>) {
         // construct the future but *before* we `.await` still
         // wakes us — no missed-wakeup race.
         let notified = writer.notify.notified();
+        // Count one wakeup per outer iteration (i.e. per notified
+        // arrival). The inner loop may run several drain cycles
+        // before the queue stays empty; those are still one
+        // logical wake.
+        {
+            let mut state = writer.state.lock().expect("guest write state poisoned");
+            state.stats.drainer_wakeups = state.stats.drainer_wakeups.saturating_add(1);
+        }
         loop {
+            let batch_bytes: u64;
+            let batch_frames: u64;
             {
                 let mut state = writer.state.lock().expect("guest write state poisoned");
                 if state.queue.is_empty() {
@@ -225,7 +325,11 @@ async fn writer_loop(writer: Arc<GuestWriter>) {
                 // Move pending frames out under the lock; the
                 // socket write happens below without the mutex
                 // held, so producers can keep enqueuing while
-                // bytes drain.
+                // bytes drain. Record the batch size first so we
+                // can credit `bytes_sent` / `frames_sent` after a
+                // successful flush.
+                batch_bytes = state.queued_bytes as u64;
+                batch_frames = state.queue.len() as u64;
                 chunks.append(&mut state.queue);
                 state.queued_bytes = 0;
             }
@@ -236,6 +340,9 @@ async fn writer_loop(writer: Arc<GuestWriter>) {
                 state.closed = true;
                 return;
             }
+            let mut state = writer.state.lock().expect("guest write state poisoned");
+            state.stats.bytes_sent = state.stats.bytes_sent.saturating_add(batch_bytes);
+            state.stats.frames_sent = state.stats.frames_sent.saturating_add(batch_frames);
         }
         notified.await;
     }
@@ -374,11 +481,12 @@ struct HostInner {
     /// Updated on every incoming transmission of a cached type;
     /// replayed on `DotsMember(Join)`.
     pool: FxHashMap<String, BTreeMap<Vec<u8>, CachedEntry>>,
-    /// Optional application-supplied callback fired on every
-    /// guest connection-state change. Daemons (e.g. `dotsd`)
-    /// install one to publish `DotsClient` — the host stays free
-    /// of daemon-level type knowledge. See
-    /// [`HostTransceiver::set_transition_handler`].
+    /// Optional application-supplied callback fired whenever a
+    /// guest's connection state changes
+    /// (`EarlySubscribe` / `Connected` / `Closed`). Daemons (e.g.
+    /// `dotsd`) install one to publish `DotsClient` and any
+    /// related per-client records. The host stays free of
+    /// daemon-level type knowledge — see [`set_transition_handler`].
     transition_handler: Option<Arc<dyn Fn(&ConnectionTransition) + Send + Sync>>,
 }
 
@@ -387,12 +495,19 @@ struct HostInner {
 ///
 /// Mirrors the role of dots-cpp's `transition_handler_t` — the host
 /// reports raw lifecycle events; the daemon decides what (if any)
-/// DOTS records to publish in response (e.g. `DotsClient`).
+/// DOTS records to publish in response (`DotsClient`,
+/// `DotsClientStatistics`, …).
+///
+/// `final_stats` is populated only for `state == Closed`, snapshotted
+/// before the guest's writer is dropped. Lets the daemon publish a
+/// terminal `DotsClientStatistics` so short-lived guests aren't
+/// invisible to periodic polling.
 #[derive(Debug, Clone)]
 pub struct ConnectionTransition {
     pub client_id: u32,
     pub client_name: Option<String>,
     pub state: DotsConnectionState,
+    pub final_stats: Option<GuestWriteStats>,
 }
 
 /// Per-type membership state — kept as a struct rather than a bare
@@ -451,8 +566,14 @@ struct FilteredSub {
 #[derive(Clone)]
 struct CachedEntry {
     payload: DynamicStruct,
+    /// Sender on the *first* publish for this key. Preserved across
+    /// updates from other clients. Mirrors dots-cpp's
+    /// `CloneInformation::createdFrom` — daemons rely on this to
+    /// detect whether a disconnected client's data is still
+    /// referenced anywhere in the pool.
+    created_from: Option<u32>,
     /// Last-update sender (the publisher's `client_id`, or `HOST_ID`
-    /// for host-originated publishes).
+    /// for host-originated publishes). Overwritten on every update.
     last_update_sender: Option<u32>,
     /// Header `sent_time` from the most recent update.
     last_update_time: Option<dots_core::Timepoint>,
@@ -498,29 +619,19 @@ impl HostTransceiver {
         })
     }
 
-    pub fn self_name(&self) -> &str {
-        &self.self_name
-    }
-
-    pub fn registry(&self) -> &Arc<Registry> {
-        &self.registry
-    }
-
-    /// Currently-connected guest count.
-    pub fn guest_count(&self) -> usize {
-        self.inner.lock().expect("host mutex poisoned").guests.len()
-    }
-
     /// Install a callback invoked on every guest connection-state
-    /// transition. Replaces any previously-installed handler.
+    /// transition. Replaces any previously-installed handler. Pass a
+    /// no-op closure to clear (the host has no dedicated `clear`
+    /// method since transition handlers should typically be set once
+    /// at startup).
     ///
     /// The callback fires synchronously **after** the host's inner
     /// lock is released, so it's free to call back into
-    /// [`publish`](Self::publish) / [`remove`](Self::remove) without
-    /// deadlock. Keep the callback work short — long-running
-    /// callbacks block the read loop of the transitioning guest
-    /// (and, for `Closed`, the `remove_guest` cleanup of every
-    /// disconnecting peer).
+    /// [`publish`](Self::publish) / [`remove`](Self::remove) /
+    /// [`guest_stats`](Self::guest_stats) etc. without deadlock.
+    /// Keep the callback work short — long-running callbacks block
+    /// the read loop of the transitioning guest (and, for `Closed`,
+    /// the `remove_guest` cleanup of every disconnecting peer).
     pub fn set_transition_handler<F>(&self, handler: F)
     where
         F: Fn(&ConnectionTransition) + Send + Sync + 'static,
@@ -544,6 +655,52 @@ impl HostTransceiver {
         if let Some(handler) = handler {
             handler(&transition);
         }
+    }
+
+    pub fn self_name(&self) -> &str {
+        &self.self_name
+    }
+
+    pub fn registry(&self) -> &Arc<Registry> {
+        &self.registry
+    }
+
+    /// Currently-connected guest count.
+    pub fn guest_count(&self) -> usize {
+        self.inner.lock().expect("host mutex poisoned").guests.len()
+    }
+
+    /// Snapshot write-side statistics for `client_id`. Returns
+    /// `None` if the guest is no longer connected — callers don't
+    /// need to coordinate with `remove_guest` themselves.
+    ///
+    /// Each call resets the high-water marks on the underlying
+    /// writer, so a periodic poller naturally gets the peak
+    /// observed between consecutive polls. See [`GuestWriteStats`]
+    /// for field semantics.
+    pub fn guest_stats(&self, client_id: u32) -> Option<GuestWriteStats> {
+        self.writer_for(client_id).map(|w| w.snapshot_stats())
+    }
+
+    /// Snapshot stats for every currently-connected guest. One pass
+    /// under the host mutex collects the `SharedWriter` handles;
+    /// each writer's per-state lock is then taken individually, so
+    /// the host mutex is held only briefly. As with
+    /// [`guest_stats`](Self::guest_stats), each entry's high-water
+    /// marks are reset by this call.
+    pub fn guest_stats_all(&self) -> Vec<(u32, GuestWriteStats)> {
+        let writers: Vec<(u32, SharedWriter)> = {
+            let inner = self.inner.lock().expect("host mutex poisoned");
+            inner
+                .guests
+                .iter()
+                .map(|(id, rec)| (*id, rec.write_half.clone()))
+                .collect()
+        };
+        writers
+            .into_iter()
+            .map(|(id, w)| (id, w.snapshot_stats()))
+            .collect()
     }
 
     /// Number of subscriptions on a given type group. Counts each
@@ -602,6 +759,56 @@ impl HostTransceiver {
             .get(type_name)
             .map(BTreeMap::len)
             .unwrap_or(0)
+    }
+
+    /// Decode every cached entry of `T` and return them as owned
+    /// typed values. Intended for daemon-level sweeps (e.g.
+    /// `cleanUpClients`) that want to inspect cached state without
+    /// installing a subscription. Round-trip cost: one CBOR
+    /// re-encode + decode per entry, so don't call inside hot paths.
+    ///
+    /// Returns an empty vector if no entries exist or if a decode
+    /// fails (which shouldn't happen for entries the host accepted
+    /// — this is a belt-and-braces guard).
+    pub fn cached_values<T>(&self) -> Vec<T>
+    where
+        T: StructValue + Default,
+    {
+        let type_name = T::type_descriptor().name;
+        let payloads: Vec<DynamicStruct> = {
+            let inner = self.inner.lock().expect("host mutex poisoned");
+            inner
+                .pool
+                .get(type_name)
+                .map(|map| map.values().map(|e| e.payload.clone()).collect())
+                .unwrap_or_default()
+        };
+        payloads
+            .into_iter()
+            .filter_map(|p| decode_typed_from_slice::<T>(&p.encode()).ok())
+            .collect()
+    }
+
+    /// True if **any** cache entry, across all types, was either
+    /// created by or last-updated by `client_id`. Used by
+    /// `cleanUpClients`-style sweeps to decide whether a Closed
+    /// client's metadata is still referenced anywhere — only when
+    /// nothing references it is the `DotsClient` record safe to
+    /// drop. Mirrors dots-cpp's
+    /// `cloneInformation.createdFrom == id || lastUpdateFrom == id`
+    /// check.
+    pub fn client_id_referenced(&self, client_id: u32) -> bool {
+        let inner = self.inner.lock().expect("host mutex poisoned");
+        for map in inner.pool.values() {
+            for entry in map.values() {
+                if entry.created_from == Some(client_id)
+                    || entry.last_update_sender == Some(client_id)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Accept an incoming guest stream. Spawns a tokio task that runs
@@ -921,10 +1128,15 @@ impl HostTransceiver {
                         inner.pool.remove(type_name);
                     }
                 } else {
+                    // Preserve `created_from` across updates — only
+                    // the first publish for a key sets it. Mirrors
+                    // dots-cpp `CloneInformation::createdFrom`.
+                    let created_from = map.get(&key).and_then(|e| e.created_from).or(header.sender);
                     map.insert(
                         key,
                         CachedEntry {
                             payload: p.clone(),
+                            created_from,
                             last_update_sender: header.sender,
                             last_update_time: header.sent_time,
                             attributes: header.attributes.unwrap_or_default(),
@@ -1334,7 +1546,13 @@ impl HostTransceiver {
         //    HostTransceiver::handleTransitionImpl.
         self.cleanup_entries_for_guest(client_id);
 
-        // 2. Drop the guest from the registry and prune empty
+        // 2. Snapshot final write-stats while the writer is still
+        //    mapped — the transition handler receives them inside
+        //    `final_stats` so daemons can publish a terminal
+        //    `DotsClientStatistics` for short-lived guests.
+        let final_stats = self.writer_for(client_id).map(|w| w.snapshot_stats());
+
+        // 3. Drop the guest from the registry and prune empty
         //    groups. Snapshot the name so we can deliver it in the
         //    transition event after the lock is released.
         let name = {
@@ -1353,13 +1571,15 @@ impl HostTransceiver {
         };
         tracing::debug!(client_id, "guest removed");
 
-        // 3. Fire the transition. Daemon-level types
-        //    (DotsClient, …) are published by the application's
-        //    handler — the host owns no daemon type knowledge.
+        // 4. Fire the transition. Daemon-level types
+        //    (DotsClient, DotsClientStatistics, …) are published by
+        //    the application's handler — the host owns no daemon
+        //    type knowledge.
         self.fire_transition(ConnectionTransition {
             client_id,
             client_name: name,
             state: DotsConnectionState::Closed,
+            final_stats,
         });
     }
 
@@ -1509,6 +1729,7 @@ where
         client_id,
         client_name: connect.client_name.clone(),
         state: initial_state,
+        final_stats: None,
     });
 
     // ----- Phase 3: EarlySubscribe (if preload requested) -----
@@ -1529,6 +1750,7 @@ where
             client_id,
             client_name: connect.client_name.clone(),
             state: DotsConnectionState::Connected,
+            final_stats: None,
         });
     }
 
@@ -1762,6 +1984,69 @@ fn handle_echo(host: &Arc<HostTransceiver>, client_id: u32, raw: &RawTransmissio
 /// the requesting guest, terminated by
 /// `DotsCacheInfo{end_descriptor_request: true}`. Mirrors C++
 /// `HostTransceiver::handleDescriptorRequest`.
+/// Reorder `descriptors` so any nested struct dependency appears
+/// before the type that references it. The receiver's
+/// `Registry::build_dynamic_struct` resolves property `type_name`s
+/// against types already registered, so emitting a dependent first
+/// would leave the client unable to decode payloads that reference
+/// the missing leaf.
+///
+/// Plain DFS post-order over the dependency graph. Dependencies that
+/// fall outside the input set (e.g. `internal` types the client
+/// statically registers via [`dots_model::register_dots_internal_types`])
+/// are silently skipped — they're assumed already present.
+fn sort_descriptors_by_dependency(
+    descriptors: Vec<Arc<DynamicStructDescriptor>>,
+) -> Vec<Arc<DynamicStructDescriptor>> {
+    let by_name: BTreeMap<&str, &Arc<DynamicStructDescriptor>> = descriptors
+        .iter()
+        .map(|d| (d.name.as_str(), d))
+        .collect();
+    let mut visited: HashSet<String> = HashSet::with_capacity(descriptors.len());
+    let mut out: Vec<Arc<DynamicStructDescriptor>> = Vec::with_capacity(descriptors.len());
+    for d in &descriptors {
+        visit_descriptor(d, &by_name, &mut visited, &mut out);
+    }
+    out
+}
+
+fn visit_descriptor(
+    node: &Arc<DynamicStructDescriptor>,
+    by_name: &BTreeMap<&str, &Arc<DynamicStructDescriptor>>,
+    visited: &mut HashSet<String>,
+    out: &mut Vec<Arc<DynamicStructDescriptor>>,
+) {
+    if !visited.insert(node.name.clone()) {
+        return;
+    }
+    for p in &node.properties {
+        walk_field_for_struct_deps(&p.kind, by_name, visited, out);
+    }
+    out.push(node.clone());
+}
+
+fn walk_field_for_struct_deps(
+    kind: &DynamicFieldKind,
+    by_name: &BTreeMap<&str, &Arc<DynamicStructDescriptor>>,
+    visited: &mut HashSet<String>,
+    out: &mut Vec<Arc<DynamicStructDescriptor>>,
+) {
+    match kind {
+        DynamicFieldKind::Vec(inner) => {
+            walk_field_for_struct_deps(inner, by_name, visited, out)
+        }
+        DynamicFieldKind::Struct(child) => {
+            if let Some(node) = by_name.get(child.name.as_str()) {
+                visit_descriptor(node, by_name, visited, out);
+            }
+            // Else: leaf isn't in the visible set — presumed pre-
+            // registered on the client (internal type) or otherwise
+            // out of scope. Not a cycle, so skip silently.
+        }
+        _ => {}
+    }
+}
+
 fn handle_descriptor_request(
     host: &Arc<HostTransceiver>,
     client_id: u32,
@@ -1779,7 +2064,7 @@ fn handle_descriptor_request(
 
     // Snapshot of registered struct descriptors. The registry's
     // entries map already has the dynamic form for each.
-    let descriptors: Vec<Arc<dots_core::DynamicStructDescriptor>> = host
+    let visible: Vec<Arc<DynamicStructDescriptor>> = host
         .registry
         .iter_structs()
         .into_iter()
@@ -1787,6 +2072,11 @@ fn handle_descriptor_request(
         .filter(|d| whitelist.is_empty() || whitelist.iter().any(|w| w == &d.name))
         .filter(|d| !blacklist.iter().any(|b| b == &d.name))
         .collect();
+    // The client's `Registry::build_dynamic_struct` resolves nested
+    // struct references against types it already has — so a
+    // dependent type emitted before its leaf would be undecodable.
+    // Topo-sort by dependency before serialising.
+    let descriptors = sort_descriptors_by_dependency(visible);
 
     tracing::debug!(
         client_id,
@@ -2119,3 +2409,81 @@ impl Drop for UdsSocketGuard {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dots_core::{DynamicPropertyDescriptor, StructFlags};
+
+    fn leaf(name: &str) -> Arc<DynamicStructDescriptor> {
+        Arc::new(DynamicStructDescriptor {
+            name: name.to_string(),
+            flags: StructFlags::NONE,
+            properties: vec![],
+        })
+    }
+
+    fn struct_with_nested(
+        name: &str,
+        nested: &Arc<DynamicStructDescriptor>,
+    ) -> Arc<DynamicStructDescriptor> {
+        Arc::new(DynamicStructDescriptor {
+            name: name.to_string(),
+            flags: StructFlags::NONE,
+            properties: vec![DynamicPropertyDescriptor {
+                name: "nested".to_string(),
+                tag: 1,
+                is_key: false,
+                kind: DynamicFieldKind::Struct(nested.clone()),
+            }],
+        })
+    }
+
+    fn position_of(out: &[Arc<DynamicStructDescriptor>], name: &str) -> usize {
+        out.iter()
+            .position(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from sorted output"))
+    }
+
+    #[test]
+    fn sort_emits_leaf_before_dependent() {
+        let leaf = leaf("DotsStatistics");
+        let dependent = struct_with_nested("DotsClientStatistics", &leaf);
+        // Input in "wrong" order — dependent first.
+        let sorted = sort_descriptors_by_dependency(vec![dependent.clone(), leaf.clone()]);
+        assert!(
+            position_of(&sorted, "DotsStatistics")
+                < position_of(&sorted, "DotsClientStatistics"),
+            "leaf must precede dependent in sorted output: {:?}",
+            sorted.iter().map(|d| d.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sort_handles_vector_of_nested_struct() {
+        let leaf = leaf("Inner");
+        let outer = Arc::new(DynamicStructDescriptor {
+            name: "Outer".to_string(),
+            flags: StructFlags::NONE,
+            properties: vec![DynamicPropertyDescriptor {
+                name: "items".to_string(),
+                tag: 1,
+                is_key: false,
+                kind: DynamicFieldKind::Vec(Box::new(DynamicFieldKind::Struct(leaf.clone()))),
+            }],
+        });
+        let sorted = sort_descriptors_by_dependency(vec![outer, leaf]);
+        assert!(position_of(&sorted, "Inner") < position_of(&sorted, "Outer"));
+    }
+
+    #[test]
+    fn sort_skips_dependencies_outside_visible_set() {
+        // Dependent references a leaf that's NOT in the input — the
+        // client is presumed to already have it (internal type).
+        // Sort should still succeed and emit the dependent.
+        let external_leaf = leaf("DotsHeader");
+        let dependent = struct_with_nested("Wrapper", &external_leaf);
+        let sorted = sort_descriptors_by_dependency(vec![dependent]);
+        assert_eq!(sorted.len(), 1);
+        assert_eq!(sorted[0].name, "Wrapper");
+    }
+}

@@ -42,7 +42,8 @@ pub use filter::{
     DotsPredicateNode, DotsPredicateValue,
 };
 pub use daemon::{
-    DotsCacheStatus, DotsClient, DotsDaemonStatus, DotsResourceUsage, DotsStatistics,
+    DotsCacheStatus, DotsClient, DotsClientStatistics, DotsDaemonStatus, DotsResourceUsage,
+    DotsStatistics,
 };
 pub use descriptors::{
     DotsStructFlags, DotsStructScope, EnumDescriptorData, EnumElementDescriptor,
@@ -107,6 +108,7 @@ pub fn register_dots_internal_types(reg: &mut Registry) {
     // Daemon-side records (broker introspection).
     reg.register_struct_static(daemon::DotsClient::DESCRIPTOR);
     reg.register_struct_static(daemon::DotsStatistics::DESCRIPTOR);
+    reg.register_struct_static(daemon::DotsClientStatistics::DESCRIPTOR);
     reg.register_struct_static(daemon::DotsCacheStatus::DESCRIPTOR);
     reg.register_struct_static(daemon::DotsResourceUsage::DESCRIPTOR);
     reg.register_struct_static(daemon::DotsDaemonStatus::DESCRIPTOR);
