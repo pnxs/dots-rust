@@ -205,7 +205,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let property_decls = fields.iter().map(|f| property_decl(struct_ident, f));
 
     let property_descriptors = fields.iter().map(|f| {
-        let name = f.ident.to_string();
+        let name = unraw(f.ident);
         let tag = f.tag;
         let is_key = f.is_key;
         let kind = &f.kind;
@@ -232,7 +232,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     // `Pinger::PROP_SEQUENCE` and `Pinger::SEQUENCE.eq(value)`.
     let filter_consts = fields.iter().map(|f| {
         let upper = Ident::new(
-            &f.ident.to_string().to_uppercase(),
+            &unraw(f.ident).to_uppercase(),
             f.ident.span(),
         );
         let prop_ident = Ident::new(&format!("PROP_{upper}"), f.ident.span());
@@ -259,9 +259,10 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let accessors = fields.iter().map(|f| {
         let ident = f.ident;
         let inner_ty = f.inner_ty;
-        let has_ident = Ident::new(&format!("has_{}", ident), ident.span());
-        let with_ident = Ident::new(&format!("with_{}", ident), ident.span());
-        let clear_ident = Ident::new(&format!("clear_{}", ident), ident.span());
+        let bare = unraw(ident);
+        let has_ident = Ident::new(&format!("has_{bare}"), ident.span());
+        let with_ident = Ident::new(&format!("with_{bare}"), ident.span());
+        let clear_ident = Ident::new(&format!("clear_{bare}"), ident.span());
         quote! {
             #[doc = concat!("Borrow the `", stringify!(#ident), "` property if set.")]
             #[inline]
@@ -613,9 +614,18 @@ fn is_dsl_leaf_type(ty: &Type) -> bool {
 
 fn vtable_ident(field_ident: &Ident) -> Ident {
     Ident::new(
-        &format!("__DOTS_VTABLE_{}", field_ident.to_string().to_uppercase()),
+        &format!("__DOTS_VTABLE_{}", unraw(field_ident).to_uppercase()),
         field_ident.span(),
     )
+}
+
+/// `Ident::to_string` keeps the `r#` raw-ident prefix. Strip it so
+/// raw-keyword fields like `r#type` flow cleanly into wire names and
+/// derived identifiers (e.g. `PROP_TYPE` rather than the invalid
+/// `PROP_R#TYPE`).
+fn unraw(ident: &Ident) -> String {
+    let s = ident.to_string();
+    s.strip_prefix("r#").map(str::to_owned).unwrap_or(s)
 }
 
 fn collect_fields(data: &DataStruct) -> syn::Result<Vec<DotsField<'_>>> {
