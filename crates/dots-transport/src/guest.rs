@@ -89,15 +89,20 @@ pub struct GuestTransceiver {
     /// drop. `DotsMember(Join)` is published when a group's count
     /// transitions 0→1, `DotsMember(Leave)` on 1→0.
     joined_groups: Mutex<HashMap<String, u32>>,
-    /// Per-type container pool. One [`Container<T>`](crate::Container)
-    /// per `TypeId::of::<T>()`, library-owned. Subscribing to or
-    /// asking for the container of `T` populates this lazily; both
-    /// paths share the same backing instance.
+    /// Per-descriptor-name container pool. One
+    /// [`Arc<DynContainer>`](crate::container::DynContainer) per
+    /// wire-`type_name`, library-owned. Mirrors dots-cpp's
+    /// `ContainerPool` keyed by `const StructDescriptor*` (we key by
+    /// the descriptor's name string, which is unique per type).
     ///
-    /// Stored as `Box<dyn Any + Send + Sync>` so the
-    /// generic-over-`T` `Container` instances can coexist in a single
-    /// map keyed by `TypeId`.
-    container_pool: Mutex<HashMap<std::any::TypeId, Box<dyn std::any::Any + Send + Sync>>>,
+    /// Containers are pre-populated in
+    /// [`GuestDriver::early_subscribe`] for every descriptor in
+    /// [`Self::subscribe_types`] before `finish_preload` runs, so
+    /// cache replay flows directly into them through the dispatcher.
+    /// Later [`Self::container::<T>`] / [`Self::subscribe::<T>`] calls
+    /// look up by name and wrap in a typed [`crate::Container<T>`]
+    /// view — already populated.
+    container_pool: Mutex<HashMap<String, Arc<crate::container::DynContainer>>>,
     outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
     exit_flag: AtomicBool,
     /// Notifies the [`GuestDriver`]'s select-loop that the exit flag
@@ -479,36 +484,59 @@ impl GuestTransceiver {
         handle
     }
 
-    /// Build a typed [`Container<T>`] for `T`.
     /// Borrow the transceiver-owned container for `T`.
     ///
-    /// One container exists per `TypeId::of::<T>()` per transceiver —
-    /// the first call creates it (registering the dispatch entry and
-    /// joining the `T`-named group), and every subsequent call (from
-    /// [`subscribe`](Self::subscribe), [`subscribe_stream`](Self::subscribe_stream),
-    /// or this method) returns a cheap clone backed by the same store.
-    /// The dispatch entry and the group-leave fire when the last clone
-    /// drops.
+    /// One container exists per wire `type_name` per transceiver —
+    /// keyed by descriptor name in the pool, just like dots-cpp's
+    /// `ContainerPool::get<T>()`. If the entry already exists (e.g.
+    /// pre-created by [`GuestDriver::early_subscribe`] so the cache
+    /// replay flowed into it), this returns a typed view of the
+    /// existing storage. If the entry doesn't exist yet, it's
+    /// created lazily (registers the dispatch entry, joins the
+    /// `T`-named group).
+    ///
+    /// Cheap to call — clones just bump the underlying
+    /// `Arc<DynContainer>`.
     pub fn container<T>(self: &Arc<Self>) -> Container<T>
     where
         T: StructValue + Default + Send + 'static + dots_core::GlobalRegistration,
     {
-        let tid = std::any::TypeId::of::<T>();
+        T::register_as_subscribed();
+        let descriptor = T::type_descriptor();
+        self.register_struct::<T>();
+        let dyn_container = self.get_or_create_dyn_container(descriptor);
+        Container::<T>::from_dyn(dyn_container)
+    }
+
+    /// Pool lookup by descriptor name. Returns the existing
+    /// [`crate::container::DynContainer`] if present, otherwise
+    /// creates one, joins the group, and registers the dispatch
+    /// entry.
+    ///
+    /// Used both by [`Self::container::<T>`] (typed path) and by
+    /// [`GuestDriver::early_subscribe`]'s pre-population pass
+    /// (descriptor-only path, no `T` available).
+    pub(crate) fn get_or_create_dyn_container(
+        self: &Arc<Self>,
+        descriptor: &'static StructDescriptor,
+    ) -> Arc<crate::container::DynContainer> {
+        let name = descriptor.name;
+        {
+            let pool = self.container_pool.lock().expect("container pool poisoned");
+            if let Some(existing) = pool.get(name) {
+                return existing.clone();
+            }
+        }
+        self.join_group(name);
+        let leaver = self.make_leaver(name);
+        let dyn_descriptor =
+            Arc::new(dots_core::DynamicStructDescriptor::from_static(descriptor));
+        let container =
+            crate::container::make_dyn_container(dyn_descriptor, &self.dispatch, Some(leaver));
         let mut pool = self.container_pool.lock().expect("container pool poisoned");
-        let entry = pool.entry(tid).or_insert_with(|| {
-            T::register_as_subscribed();
-            self.register_struct::<T>();
-            let group = T::type_descriptor().name;
-            self.join_group(group);
-            let leaver = self.make_leaver(group);
-            let container: Container<T> =
-                crate::container::make_container(&self.dispatch, Some(leaver));
-            Box::new(container) as Box<dyn std::any::Any + Send + Sync>
-        });
-        entry
-            .downcast_ref::<Container<T>>()
-            .expect("container pool TypeId/type mismatch")
-            .clone()
+        // Race: another thread may have raced us to insert. Honor
+        // the first insertion so dispatch entries don't double-up.
+        pool.entry(name.to_string()).or_insert(container).clone()
     }
 
     /// Build a `GroupLeaver` whose drop publishes `DotsMember(Leave)`
@@ -859,8 +887,22 @@ where
             }
         }
 
+        // Phase 1c: pre-create the type-erased container for every
+        // subscribed type so cache replay events from Phase 2 flow
+        // into them via the dispatcher. This is the Rust equivalent
+        // of dots-cpp's `ContainerPool::get(descriptor)` — the pool
+        // is keyed by descriptor name, so a container can be built
+        // without a compile-time `T`. A later `dots::container::<T>()`
+        // finds the existing pool entry (already populated) and
+        // wraps it in a typed view. Mirrors `Container<T>` being a
+        // static_cast of `Container<>` in dots-cpp.
+        for d in &subscribe_types {
+            self.transceiver.get_or_create_dyn_container(d);
+        }
+
         // Phase 2: finish preload (cache events flow through dispatch
-        // into any installed subscriptions/containers).
+        // into the pre-created containers + any user-installed
+        // subscriptions).
         if conn.state() == dots_model::DotsConnectionState::EarlySubscribe {
             conn.finish_preload().await?;
         }

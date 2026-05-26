@@ -132,10 +132,16 @@ where
     T: StructValue + Default + Send + Clone + 'static,
 {
     /// Look up the cached value for `key_bytes`, returning a clone
-    /// of the entry's value if present.
+    /// of the entry's value (decoded from the stored
+    /// [`dots_core::DynamicStruct`]) if present.
     fn cached_value(&self, key_bytes: &[u8]) -> Option<T> {
-        let entries = self.container.entries.lock().expect("container mutex poisoned");
-        entries.get(key_bytes).map(|e| e.value.clone())
+        self.container
+            .as_dyn()
+            .with_entries_dyn(|entries| {
+                let entry = entries.get(key_bytes)?;
+                let bytes = entry.value.encode();
+                decode_typed_from_slice::<T>(&bytes).ok()
+            })
     }
 }
 

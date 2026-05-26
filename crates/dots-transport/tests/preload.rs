@@ -392,3 +392,71 @@ async fn driver_ships_enum_descriptors_before_struct_descriptors() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), driver_handle).await;
     server.await.unwrap();
 }
+
+/// Mirrors a user's `let app = App::new(...).await?; let c =
+/// app.container::<MyType>();` flow: the cache replay broker sends
+/// during the EarlySubscribe phase has to land in the pool's
+/// container *before* App::new returns, so the typed
+/// `container::<T>()` call (which happens after) sees it.
+///
+/// Drives [`GuestDriver::early_subscribe`] directly (the part of
+/// `App::new` that runs inside `build_app`), then asks for the
+/// typed container. The expectation: container holds the broker's
+/// cached entries, mirroring dots-cpp's
+/// `ContainerPool::get<MyType>()` returning a populated container.
+#[tokio::test]
+async fn container_after_early_subscribe_contains_cache_replay() {
+    let (client_io, server_io) = tokio::io::duplex(8192);
+    let reg = registry();
+
+    let cached = vec![
+        dots!(Pinger {
+            id: 1_u32,
+            message: "cached-1",
+        }),
+        dots!(Pinger {
+            id: 2_u32,
+            message: "cached-2",
+        }),
+    ];
+    let server = tokio::spawn(preload_server(server_io, reg.clone(), cached.clone()));
+
+    let conn = ConnectionBuilder::new(client_io, "preload-client", reg.clone())
+        .preload(true)
+        .connect()
+        .await
+        .unwrap();
+
+    let (gt, mut driver) = GuestTransceiver::from_connection(
+        reg,
+        conn,
+        [Pinger::DESCRIPTOR],
+        [Pinger::DESCRIPTOR],
+    );
+
+    // No subscription installed yet — match the user's reported
+    // bug pattern. We're only running `early_subscribe`, which is
+    // what `App::new` does internally.
+    driver.early_subscribe().await.unwrap();
+
+    // Cache replay should now be in the pool's container.
+    let pingers = gt.container::<Pinger>();
+    assert_eq!(
+        pingers.len(),
+        2,
+        "container should contain the 2 cached Pingers after early_subscribe",
+    );
+
+    let snapshot = pingers.snapshot();
+    let mut messages: Vec<String> = snapshot
+        .iter()
+        .filter_map(|e| e.value.message.clone())
+        .collect();
+    messages.sort();
+    assert_eq!(messages, vec!["cached-1".to_string(), "cached-2".to_string()]);
+
+    let driver_handle = tokio::spawn(driver.run());
+    gt.exit();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), driver_handle).await;
+    server.await.unwrap();
+}
