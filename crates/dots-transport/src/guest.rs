@@ -98,7 +98,6 @@ impl<T> std::hash::Hash for DescriptorPtr<T> {
 /// Created together with a [`GuestDriver`] by
 /// [`GuestTransceiver::from_connection`].
 pub struct GuestTransceiver {
-    self_name: String,
     /// Shared with the [`GuestDriver`]'s `Connection` dispatch table —
     /// adding a callback here is observable from the same loop that
     /// drives [`crate::Subscription`] and [`Container`] entries.
@@ -154,7 +153,6 @@ impl GuestTransceiver {
     /// broker — until then, publishes will queue and incoming
     /// transmissions will not be observed.
     pub fn from_connection<S>(
-        self_name: impl Into<String>,
         registry: Arc<Registry>,
         conn: Connection<S>,
     ) -> (Arc<Self>, GuestDriver<S>)
@@ -166,7 +164,6 @@ impl GuestTransceiver {
         let peer_capabilities = conn.peer_capabilities().cloned();
         let (tx, rx) = mpsc::unbounded_channel();
         let transceiver = Arc::new(GuestTransceiver {
-            self_name: self_name.into(),
             dispatch,
             registry,
             pending_structs: Mutex::new(HashSet::new()),
@@ -190,11 +187,6 @@ impl GuestTransceiver {
             outbound_rx: Some(rx),
         };
         (transceiver, driver)
-    }
-
-    /// Self-name supplied at construction.
-    pub fn self_name(&self) -> &str {
-        &self.self_name
     }
 
     /// Client id assigned by the broker in the handshake.

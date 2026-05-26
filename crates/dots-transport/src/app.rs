@@ -281,7 +281,7 @@ impl App {
         }
         let conn: Connection<S> = builder.connect().await?;
         let (transceiver, driver) =
-            GuestTransceiver::from_connection(client_name.to_string(), registry, conn);
+            GuestTransceiver::from_connection(registry, conn);
         let driver_future: DriverFuture = Box::pin(driver.run());
         Ok(App {
             transceiver,

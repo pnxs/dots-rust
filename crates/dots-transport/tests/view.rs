@@ -43,7 +43,6 @@ async fn view_four_cases_enter_update_leave_reenter() {
         .await
         .unwrap();
     let (gt_a, driver_a) = GuestTransceiver::from_connection(
-        "subscriber".to_string(),
         registry.clone(),
         conn_a,
     );
@@ -87,7 +86,6 @@ async fn view_four_cases_enter_update_leave_reenter() {
         .await
         .unwrap();
     let (gt_b, driver_b) = GuestTransceiver::from_connection(
-        "publisher".to_string(),
         registry.clone(),
         conn_b,
     );
@@ -171,7 +169,7 @@ async fn view_drop_removes_filtered_sub_from_host() {
         .await
         .unwrap();
     let (gt, driver) =
-        GuestTransceiver::from_connection("subscriber".to_string(), registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn);
     let driver_handle = tokio::spawn(driver.run());
 
     let view = gt
@@ -222,7 +220,6 @@ async fn view_preload_from_existing_cache() {
         .await
         .unwrap();
     let (gt_b, driver_b) = GuestTransceiver::from_connection(
-        "publisher".to_string(),
         registry.clone(),
         conn_b,
     );
@@ -251,7 +248,6 @@ async fn view_preload_from_existing_cache() {
         .await
         .unwrap();
     let (gt_a, driver_a) = GuestTransceiver::from_connection(
-        "subscriber".to_string(),
         registry.clone(),
         conn_a,
     );
