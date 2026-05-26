@@ -54,7 +54,7 @@ pub struct DotsClient {
 /// reset on every snapshot). `currentQueuedBytes` is the
 /// instantaneous backlog at the moment of the snapshot.
 #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "DotsClientStatistics", cached)]
+#[dots(name = "DotsClientStatistics", internal, cached)]
 pub struct DotsClientStatistics {
     #[dots(tag = 1, key)]
     pub client_id: Option<u32>,
@@ -85,7 +85,7 @@ pub struct DotsClientStatistics {
 /// }
 /// ```
 #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "DotsStatistics")]
+#[dots(name = "DotsStatistics", internal)]
 pub struct DotsStatistics {
     #[dots(tag = 1)]
     pub bytes: Option<u64>,
