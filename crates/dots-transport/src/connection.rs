@@ -23,14 +23,9 @@ use std::task::{Context, Poll};
 
 use bytes::BufMut;
 use dots_core::{
-    EnumDescriptor, PropertySet, Publishable, StructDescriptor, StructValue, Transmittable,
-    decode_typed_from_slice, dots,
+    PropertySet, Publishable, StructValue, Transmittable, decode_typed_from_slice, dots,
 };
-use dots_model::{
-    DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
-    DotsServerCapabilities, EnumDescriptorData, Registry, StructDescriptorData, Transmission,
-    encode_transmission_into, encode_transmission_with_mask_into,
-};
+use dots_model::{DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello, DotsServerCapabilities, Registry, Transmission, encode_transmission_into, encode_transmission_with_mask_into, DotsCacheInfo};
 use futures_util::{SinkExt, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -193,7 +188,7 @@ where
             "starting initial handshake"
         );
         let txn = self.read_next().await?;
-        let hello: DotsMsgHello = self.expect_typed(&txn, "DotsMsgHello")?;
+        let hello = self.expect_typed::<DotsMsgHello>(&txn)?;
         tracing::info!(
             server_name = ?hello.server_name,
             auth_required = ?hello.authentication_required,
@@ -205,9 +200,10 @@ where
         self.peer_capabilities = hello.capabilities;
 
         let mut connect = dots!(DotsMsgConnect {
-            client_name: client_name,
+            client_name,
             preload_cache: request_preload,
         });
+
         if auth_required {
             let Some(secret) = auth_secret else {
                 return Err(ConnectionError::AuthenticationNotSupported);
@@ -219,12 +215,11 @@ where
             connect.auth_challenge_response = Some(response);
             connect.cnonce = Some(cnonce);
         }
-        self.send_typed("DotsMsgConnect", &connect).await?;
+        self.send_typed(&connect).await?;
         tracing::debug!(request_preload, "sent DotsMsgConnect");
 
         let txn = self.read_next().await?;
-        let response: DotsMsgConnectResponse =
-            self.expect_typed(&txn, "DotsMsgConnectResponse")?;
+        let response = self.expect_typed::<DotsMsgConnectResponse>(&txn)?;
         if response.accepted != Some(true) {
             tracing::warn!(
                 server_name = ?response.server_name,
@@ -270,7 +265,7 @@ where
         let connect = dots!(DotsMsgConnect {
             preload_client_finished: true,
         });
-        self.send_typed("DotsMsgConnect", &connect).await?;
+        self.send_typed(&connect).await?;
 
         // Stream cache transmissions. Cache events have header.from_cache
         // set to a remaining count (0 for the last). The terminator is
@@ -283,8 +278,7 @@ where
                 .as_deref()
                 .ok_or(ConnectionError::HeaderMissingTypeName)?;
             if type_name == "DotsMsgConnectResponse" {
-                let response: DotsMsgConnectResponse =
-                    self.expect_typed(&txn, "DotsMsgConnectResponse")?;
+                let response = self.expect_typed::<DotsMsgConnectResponse>(&txn)?;
                 if response.preload_finished == Some(true) {
                     self.state = DotsConnectionState::Connected;
                     tracing::info!("preload finished, connection in Connected state");
@@ -293,12 +287,18 @@ where
                 tracing::debug!("intermediate ConnectResponse during preload");
                 continue;
             }
-            // Cache event — fan out to subscriptions.
-            tracing::trace!(
-                type_name,
-                from_cache = ?txn.header.from_cache,
-                "preload cache event"
-            );
+
+            if type_name == "DotsCacheInfo" {
+                let cache_info = self.expect_typed::<DotsCacheInfo>(&txn)?;
+                tracing::trace!("preload cache, DotsCacheInfo {:?}", cache_info);
+            } else {
+                // Cache event — fan out to subscriptions.
+                tracing::trace!(
+                    type_name,
+                    from_cache = ?txn.header.from_cache,
+                    "preload cache event"
+                );
+            }
             self.dispatch_to_subscribers(&txn);
         }
     }
@@ -314,19 +314,19 @@ where
     fn expect_typed<T>(
         &self,
         txn: &Transmission,
-        expected: &'static str,
     ) -> Result<T, ConnectionError>
     where
         T: StructValue + Default,
     {
+        let expected_type_name = T::type_descriptor().name;
         let type_name = txn
             .header
             .type_name
             .as_deref()
             .ok_or(ConnectionError::HeaderMissingTypeName)?;
-        if type_name != expected {
+        if type_name != expected_type_name {
             return Err(ConnectionError::UnexpectedMessage {
-                expected,
+                expected: expected_type_name,
                 got: type_name.into(),
             });
         }
@@ -346,7 +346,6 @@ where
     /// to build a [`DynamicStruct`] from the typed value.
     pub async fn send_typed<T>(
         &mut self,
-        type_name: &str,
         payload: &T,
     ) -> Result<(), ConnectionError>
     where
@@ -357,7 +356,7 @@ where
         // map is already sparse with the same information, but the
         // header field is mandatory at the protocol level.
         let header = dots!(DotsHeader {
-            type_name: type_name,
+            type_name: payload.type_name(),
             attributes: payload.valid_set(),
             sender: self.client_id,
         });
@@ -390,9 +389,8 @@ where
     /// high-level shortcut over [`send_typed`](Self::send_typed) when
     /// the value's own descriptor name is what should appear in the
     /// header.
-    pub async fn publish<P: Publishable>(&mut self, value: &P) -> Result<(), ConnectionError> {
-        let type_name = value.type_name().to_string();
-        self.send_typed(&type_name, value).await
+    pub async fn publish<P: Publishable + StructValue>(&mut self, value: &P) -> Result<(), ConnectionError> {
+        self.send_typed(value).await
     }
 
     /// Publish a value with a property mask. See
@@ -607,7 +605,17 @@ fn dispatch_external(dispatch: &Arc<Mutex<DispatchState>>, txn: &Transmission) {
         return;
     };
 
-    entries.retain_mut(|(_, entry)| entry.dispatch(txn).unwrap_or(true));
+    entries.retain_mut(|(_, entry)| match entry.dispatch(txn) {
+        Ok(retain) => retain,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                type_name = type_name,
+                "dispatch entry failed to decode transmission; keeping entry, dropping message"
+            );
+            true
+        }
+    });
 
     let mut state = dispatch.lock().expect("dispatch mutex poisoned");
     let slot = state.entries.entry(type_name.to_string()).or_default();
@@ -834,42 +842,23 @@ where
 
 // ===== ConnectionBuilder =====
 
-/// Build a [`Connection`] with type registration and optional cache preload.
+/// Build a [`Connection`] and run the DOTS handshake (optionally with
+/// cache preload).
 ///
-/// Typical full lifecycle:
-///
-/// ```ignore
-/// let mut conn = ConnectionBuilder::new(stream, "my-client", registry)
-///     .publishes::<MyType1>()
-///     .publishes::<MyType2>()
-///     .preload(true)
-///     .connect().await?;
-/// // conn.state() == DotsConnectionState::EarlySubscribe
-///
-/// let sub = conn.subscribe::<MyType2>();
-/// conn.finish_preload().await?;
-/// // Cache events for MyType2 have been dispatched into `sub`.
-/// // conn.state() == DotsConnectionState::Connected.
-/// ```
-///
-/// `connect()` runs the initial handshake and publishes a
-/// `StructDescriptorData` (or `EnumDescriptorData`) for every type
-/// declared via the `publishes_*` methods, so the broker learns the
-/// shape of each user-defined type before any value of it flows.
+/// Descriptor exchange — the post-handshake step where the guest tells
+/// the broker about its publish/subscribe types — is **not** the
+/// builder's job. Pass the type lists to
+/// [`GuestTransceiver::from_connection`](crate::GuestTransceiver::from_connection)
+/// instead; the [`GuestDriver`](crate::guest::GuestDriver) ships the
+/// descriptors during its EarlySubscribe phase.
 pub struct ConnectionBuilder<S> {
     stream: S,
     client_name: String,
     registry: Arc<Registry>,
     preload: bool,
-    pending: Vec<PendingDescriptor>,
     /// Shared secret for SHA-256 challenge-response authentication.
     /// `None` means the client will reject any auth-required Hello.
     auth_secret: Option<String>,
-}
-
-enum PendingDescriptor {
-    Struct(&'static StructDescriptor),
-    Enum(&'static EnumDescriptor),
 }
 
 impl<S> ConnectionBuilder<S>
@@ -882,7 +871,6 @@ where
             client_name: client_name.into(),
             registry,
             preload: true,
-            pending: Vec::new(),
             auth_secret: None,
         }
     }
@@ -909,32 +897,8 @@ where
         self
     }
 
-    /// Publish a struct type's descriptor during connect, telling the
-    /// broker about the shape of values it'll route on this client's
-    /// behalf. Convenience over [`publishes_struct`](Self::publishes_struct)
-    /// for types that implement [`StructValue`].
-    pub fn publishes<T>(self) -> Self
-    where
-        T: StructValue,
-    {
-        self.publishes_struct(T::type_descriptor())
-    }
-
-    /// Publish a struct type's descriptor by descriptor reference.
-    pub fn publishes_struct(mut self, descriptor: &'static StructDescriptor) -> Self {
-        self.pending.push(PendingDescriptor::Struct(descriptor));
-        self
-    }
-
-    /// Publish an enum type's descriptor by descriptor reference.
-    pub fn publishes_enum(mut self, descriptor: &'static EnumDescriptor) -> Self {
-        self.pending.push(PendingDescriptor::Enum(descriptor));
-        self
-    }
-
-    /// Run the handshake, publish all queued type descriptors, and
-    /// return a [`Connection`] in the appropriate state (see
-    /// [`preload`](Self::preload)).
+    /// Run the handshake and return a [`Connection`] in the appropriate
+    /// state (see [`preload`](Self::preload)).
     pub async fn connect(self) -> Result<Connection<S>, ConnectionError> {
         let codec = TransmissionCodec::new(self.registry);
         let framed = Framed::new(self.stream, codec);
@@ -946,29 +910,6 @@ where
             self.auth_secret.as_deref(),
         )
         .await?;
-
-        // After the initial Connect/ConnectResponse, publish each
-        // declared type's descriptor data so the broker can route /
-        // route subscriptions for them. We do this regardless of
-        // preload — even non-preload clients still need to register
-        // their types before publishing values.
-        //
-        // Send enums BEFORE structs: the broker's
-        // `build_dynamic_struct` resolves nested type references via
-        // its registry as it parses each struct descriptor, so any
-        // enum referenced as a struct field must already be there.
-        for pending in &self.pending {
-            if let PendingDescriptor::Enum(d) = pending {
-                let data = EnumDescriptorData::from_static(d);
-                conn.send_typed("EnumDescriptorData", &data).await?;
-            }
-        }
-        for pending in &self.pending {
-            if let PendingDescriptor::Struct(d) = pending {
-                let data = StructDescriptorData::from_static(d);
-                conn.send_typed("StructDescriptorData", &data).await?;
-            }
-        }
 
         Ok(conn)
     }

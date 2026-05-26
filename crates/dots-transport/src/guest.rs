@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use dots_core::{
-    DynamicStruct, DynamicStructDescriptor, EnumDescriptor, PropertySet, Publishable,
+    DynamicStruct, DynamicStructDescriptor, EnumDescriptor, FieldKind, PropertySet, Publishable,
     StructDescriptor, StructValue, Timepoint, Transmittable, decode_typed_from_slice, dots,
 };
 use dots_model::{
@@ -70,30 +70,9 @@ impl From<TransportError> for GuestError {
     }
 }
 
-/// Wraps a `&'static T` with pointer-equality semantics for HashSet.
-struct DescriptorPtr<T: 'static>(&'static T);
-
-impl<T> Clone for DescriptorPtr<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<T> Copy for DescriptorPtr<T> {}
-impl<T> PartialEq for DescriptorPtr<T> {
-    fn eq(&self, other: &Self) -> bool {
-        core::ptr::eq(self.0, other.0)
-    }
-}
-impl<T> Eq for DescriptorPtr<T> {}
-impl<T> std::hash::Hash for DescriptorPtr<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (self.0 as *const T as usize).hash(state);
-    }
-}
-
-/// Guest-side shared state — subscription dispatch, pending
-/// descriptors, group-join tracking, outbound publish queue. Cheap to
-/// clone via `Arc<GuestTransceiver>`.
+/// Guest-side shared state — subscription dispatch, group-join
+/// tracking, outbound publish queue. Cheap to clone via
+/// `Arc<GuestTransceiver>`.
 ///
 /// Created together with a [`GuestDriver`] by
 /// [`GuestTransceiver::from_connection`].
@@ -105,8 +84,6 @@ pub struct GuestTransceiver {
     /// Type registry shared with the framed codec, used to wrap typed
     /// payloads in dynamic transmissions for the relay path.
     registry: Arc<Registry>,
-    pending_structs: Mutex<HashSet<DescriptorPtr<StructDescriptor>>>,
-    pending_enums: Mutex<HashSet<DescriptorPtr<EnumDescriptor>>>,
     /// Per-group active subscriber count. Incremented on every
     /// subscribe / container creation; decremented on the matching
     /// drop. `DotsMember(Join)` is published when a group's count
@@ -142,33 +119,75 @@ pub struct GuestTransceiver {
     /// Subscription-id allocator for filtered subscriptions
     /// (`View<T>`). Monotonic, process-local, never reset.
     next_subscription_id: AtomicU32,
+    /// Types this transceiver publishes. Configured via
+    /// [`GuestTransceiver::from_connection`]; the [`GuestDriver`] ships
+    /// the descriptor (and any transitively-referenced struct/enum
+    /// descriptors) during the EarlySubscribe phase before preload
+    /// completes. Mirrors dots-cpp's `m_preloadPublishTypes`.
+    publish_types: Mutex<Vec<&'static StructDescriptor>>,
+    /// Types this transceiver subscribes to. In addition to shipping
+    /// the descriptors (Phase 1 of [`GuestDriver::run`]), the driver
+    /// emits a `DotsMember(Join)` for each entry during Phase 1b so
+    /// the broker can start the cache replay before
+    /// `preloadClientFinished`. [`Self::joined_groups`] is pre-bumped
+    /// to 1 per entry at construction so a subsequent user-side
+    /// `subscribe::<T>` / `container::<T>` doesn't emit a duplicate
+    /// Join. Mirrors dots-cpp's `m_preloadSubscribeTypes`.
+    subscribe_types: Mutex<Vec<&'static StructDescriptor>>,
 }
 
 impl GuestTransceiver {
     /// Build a guest from an established [`Connection`]. Returns the
     /// shared transceiver and a separable I/O driver.
     ///
+    /// `published_types` and `subscribed_types` declare the static
+    /// types this guest will publish and subscribe to. The
+    /// [`GuestDriver`] ships their descriptors (and any transitively
+    /// referenced struct/enum descriptors) to the broker during the
+    /// EarlySubscribe phase, then publishes a `DotsMember(Join)` for
+    /// each subscribed type so the broker can start cache replay
+    /// before `preloadClientFinished`. Mirrors the
+    /// `preloadPublishTypes` / `preloadSubscribeTypes` arguments of
+    /// dots-cpp's `GuestTransceiver::open`.
+    ///
     /// The driver must be polled (typically via
     /// [`GuestDriver::run`]) to actually exchange traffic with the
     /// broker — until then, publishes will queue and incoming
     /// transmissions will not be observed.
-    pub fn from_connection<S>(
+    pub fn from_connection<S, P, U>(
         registry: Arc<Registry>,
         conn: Connection<S>,
+        published_types: P,
+        subscribed_types: U,
     ) -> (Arc<Self>, GuestDriver<S>)
     where
         S: AsyncRead + AsyncWrite + Unpin,
+        P: IntoIterator<Item = &'static StructDescriptor>,
+        U: IntoIterator<Item = &'static StructDescriptor>,
     {
         let dispatch = conn.dispatch_handle();
         let client_id = conn.client_id();
         let peer_capabilities = conn.peer_capabilities().cloned();
         let (tx, rx) = mpsc::unbounded_channel();
+
+        let publish_types: Vec<&'static StructDescriptor> =
+            published_types.into_iter().collect();
+        let subscribe_types: Vec<&'static StructDescriptor> =
+            subscribed_types.into_iter().collect();
+
+        // Pre-bump joined_groups for every subscribed type so a later
+        // user-side `subscribe::<T>` / `container::<T>` increments to 2
+        // (not 0→1) and doesn't emit a duplicate `DotsMember(Join)` —
+        // the driver's Phase 1b is the canonical Join for each entry.
+        let mut groups = HashMap::new();
+        for d in &subscribe_types {
+            groups.insert(d.name.to_string(), 1);
+        }
+
         let transceiver = Arc::new(GuestTransceiver {
             dispatch,
             registry,
-            pending_structs: Mutex::new(HashSet::new()),
-            pending_enums: Mutex::new(HashSet::new()),
-            joined_groups: Mutex::new(HashMap::new()),
+            joined_groups: Mutex::new(groups),
             container_pool: Mutex::new(HashMap::new()),
             outbound_tx: tx,
             exit_flag: AtomicBool::new(false),
@@ -180,11 +199,14 @@ impl GuestTransceiver {
                 lock
             },
             next_subscription_id: AtomicU32::new(1),
+            publish_types: Mutex::new(publish_types),
+            subscribe_types: Mutex::new(subscribe_types),
         });
         let driver = GuestDriver {
             transceiver: transceiver.clone(),
             conn: Some(conn),
             outbound_rx: Some(rx),
+            early_subscribe_done: false,
         };
         (transceiver, driver)
     }
@@ -501,16 +523,6 @@ impl GuestTransceiver {
         })
     }
 
-    /// Pre-register an enum type's descriptor so it gets shipped to
-    /// the broker before preload finishes. Auto-registration covers
-    /// any enum embedded in a subscribed/published struct's fields
-    /// (recursively, including through nested structs and `Vec`),
-    /// so this only needs to be called for standalone enums that
-    /// never appear as a struct field.
-    pub fn register_enum(&self, descriptor: &'static EnumDescriptor) {
-        self.register_enum_descriptor_internal(descriptor);
-    }
-
     /// Publish a value. Synchronous — bytes are pushed onto the
     /// outbound channel and sent by the [`GuestDriver::run`] loop.
     ///
@@ -638,63 +650,15 @@ impl GuestTransceiver {
         self.register_struct_descriptor(T::type_descriptor());
     }
 
+    /// Register a struct descriptor (and any nested struct/enum
+    /// descriptors it references) with the codec registry so incoming
+    /// wire transmissions can be decoded. Does **not** schedule the
+    /// descriptor for transmission to the broker — descriptor exchange
+    /// is driven exclusively by the `publish_types` / `subscribe_types`
+    /// lists passed to [`Self::from_connection`].
     fn register_struct_descriptor(&self, descriptor: &'static StructDescriptor) {
-        // (a) Queue the descriptor for publishing to the broker before
-        // preload finishes. `pending_structs` is a HashSet so the
-        // recursive walk below silently dedupes against types we've
-        // already seen.
-        let inserted = self
-            .pending_structs
-            .lock()
-            .expect("pending mutex poisoned")
-            .insert(DescriptorPtr(descriptor));
-        // (b) Tell the codec's runtime registry about this type so
-        // incoming transmissions of it can be decoded.
-        self.registry.register_struct_static(descriptor);
-
-        // (c) Walk the descriptor's properties for nested types: any
-        // embedded struct or enum descriptor needs to travel to the
-        // broker too, so peers reading those fields by name (e.g. a
-        // C++ guest with no compiled-in copy of the user enum) can
-        // resolve them. Skip if we've already registered this struct,
-        // since its children will already have been walked and we
-        // could otherwise loop on cyclic references.
-        if !inserted {
-            return;
-        }
-        for prop in descriptor.properties {
-            self.register_field_kind_descriptors(&prop.kind);
-        }
-    }
-
-    /// Recursively follow a [`FieldKind`] to register any nested
-    /// struct or enum descriptors it transitively references. Vec
-    /// types unwrap to their inner kind; primitives and strings have
-    /// nothing to register.
-    fn register_field_kind_descriptors(&self, kind: &dots_core::FieldKind) {
-        use dots_core::FieldKind;
-        match kind {
-            FieldKind::Struct(d) => {
-                // Recurse via register_struct_descriptor so nested
-                // structs get their own properties walked too.
-                self.register_struct_descriptor(d);
-            }
-            FieldKind::Enum(e) => {
-                self.register_enum_descriptor_internal(e);
-            }
-            FieldKind::Vec(inner) => {
-                self.register_field_kind_descriptors(inner);
-            }
-            _ => {}
-        }
-    }
-
-    fn register_enum_descriptor_internal(&self, descriptor: &'static EnumDescriptor) {
-        self.pending_enums
-            .lock()
-            .expect("pending mutex poisoned")
-            .insert(DescriptorPtr(descriptor));
-        self.registry.register_enum_static(descriptor);
+        let mut seen = HashSet::new();
+        register_struct_in_registry(&self.registry, descriptor, &mut seen);
     }
 
     /// Increment the per-group subscriber count, publishing
@@ -771,60 +735,128 @@ pub struct GuestDriver<S> {
     transceiver: Arc<GuestTransceiver>,
     conn: Option<Connection<S>>,
     outbound_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    early_subscribe_done: bool,
 }
 
 impl<S> GuestDriver<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Drive the connection forward:
+    /// Drive the EarlySubscribe phase to completion: ship pre-declared
+    /// type descriptors, publish `DotsMember(Join)` for every subscribed
+    /// type, and (on the preload path) signal `preloadClientFinished`
+    /// and drain cache events until the broker confirms `Connected`.
     ///
-    /// 1. Publish all queued type descriptors.
-    /// 2. Finish preload if the connection is in `EarlySubscribe`.
-    /// 3. Enter the main read/write select loop until exit, EOF, or
-    ///    transport error.
-    pub async fn run(mut self) -> Result<(), GuestError> {
-        let mut conn = self.conn.take().expect("GuestDriver::run called twice");
-        let mut outbound_rx = self
-            .outbound_rx
-            .take()
-            .expect("GuestDriver::run called twice");
-
-        // Phase 1: publish all queued type descriptors.
-        let pending_structs: Vec<&'static StructDescriptor> = self
-            .transceiver
-            .pending_structs
-            .lock()
-            .expect("pending mutex poisoned")
-            .iter()
-            .map(|d| d.0)
-            .collect();
-        let pending_enums: Vec<&'static EnumDescriptor> = self
-            .transceiver
-            .pending_enums
-            .lock()
-            .expect("pending mutex poisoned")
-            .iter()
-            .map(|d| d.0)
-            .collect();
-        tracing::debug!(
-            structs = pending_structs.len(),
-            enums = pending_enums.len(),
-            "publishing pending type descriptors"
-        );
-        // Publish enums BEFORE structs. The broker's
-        // `build_dynamic_struct` resolves nested type references
-        // through its registry as it parses each `StructDescriptorData`,
-        // so any enum referenced as a struct field must already be
-        // registered there. Same constraint as dots-cpp's descriptor
-        // exchange — declaration order is part of the contract.
-        for d in pending_enums {
-            let data = EnumDescriptorData::from_static(d);
-            conn.send_typed("EnumDescriptorData", &data).await?;
+    /// Idempotent — calling twice is a no-op. [`run`](Self::run) also
+    /// invokes this if it hasn't been called yet, so direct callers of
+    /// [`GuestTransceiver::from_connection`] who only need the main I/O
+    /// loop don't have to call it explicitly.
+    ///
+    /// [`crate::App::new`] calls this before returning so the connection
+    /// is already in `Connected` state by the time the caller receives
+    /// the `App`. Cache events that arrive during this phase are
+    /// dispatched against whatever subscribers are installed at the
+    /// time — when called from `App::new`, no user-side subscribers
+    /// exist yet, so cache events are dropped. Live (post-cache) events
+    /// flow normally once [`run`](Self::run) starts.
+    pub async fn early_subscribe(&mut self) -> Result<(), GuestError> {
+        if self.early_subscribe_done {
+            return Ok(());
         }
-        for d in pending_structs {
+        let conn = self
+            .conn
+            .as_mut()
+            .expect("GuestDriver::early_subscribe after run");
+
+        // Phase 1: ship descriptors for the configured publish &
+        // subscribe types, plus every struct/enum descriptor reachable
+        // through their property trees. The walk dedups by `&'static`
+        // pointer identity so a type referenced by multiple parents
+        // ships exactly once. Enums travel BEFORE structs: the broker's
+        // `build_dynamic_struct` resolves nested type references through
+        // its registry as it parses each `StructDescriptorData`, so any
+        // enum referenced as a struct field must already be registered
+        // there. Same constraint as dots-cpp's descriptor exchange —
+        // declaration order is part of the contract.
+        let publish_types = self
+            .transceiver
+            .publish_types
+            .lock()
+            .expect("publish_types mutex poisoned")
+            .clone();
+        let subscribe_types = self
+            .transceiver
+            .subscribe_types
+            .lock()
+            .expect("subscribe_types mutex poisoned")
+            .clone();
+        let mut structs_to_send: Vec<&'static StructDescriptor> = Vec::new();
+        let mut enums_to_send: Vec<&'static EnumDescriptor> = Vec::new();
+        {
+            let mut seen_structs: HashSet<usize> = HashSet::new();
+            let mut seen_enums: HashSet<usize> = HashSet::new();
+            for d in publish_types.iter().chain(subscribe_types.iter()).copied() {
+                collect_descriptor_send_order(
+                    d,
+                    &mut seen_structs,
+                    &mut seen_enums,
+                    &mut structs_to_send,
+                    &mut enums_to_send,
+                );
+            }
+        }
+        // Register the closure with the codec registry so the read
+        // loop can decode incoming transmissions of any subscribed
+        // type (and any type embedded in one).
+        for d in &structs_to_send {
+            self.transceiver.registry.register_struct_static(d);
+        }
+        for d in &enums_to_send {
+            self.transceiver.registry.register_enum_static(d);
+        }
+        tracing::debug!(
+            structs = structs_to_send.len(),
+            enums = enums_to_send.len(),
+            "publishing pre-declared type descriptors"
+        );
+        for d in &enums_to_send {
+            let data = EnumDescriptorData::from_static(d);
+            conn.send_typed(&data).await?;
+        }
+        for d in &structs_to_send {
             let data = StructDescriptorData::from_static(d);
-            conn.send_typed("StructDescriptorData", &data).await?;
+            conn.send_typed(&data).await?;
+        }
+
+        // Phase 1b: publish DotsMember(Join, T) for every subscribed
+        // type. Mirrors dots-cpp `GuestTransceiver::handleTransitionImpl`,
+        // which emits a `joinGroup` for each entry of
+        // `m_preloadSubscribeTypes` during the early_subscribe
+        // transition (right after transmitting their descriptors). The
+        // transceiver's `joined_groups` counter was pre-bumped to 1
+        // for each entry in `from_connection`, so a later user-side
+        // `subscribe::<T>` / `container::<T>` increments to 2 instead
+        // of publishing a second Join. We go through `conn.publish`
+        // (synchronous flush via the framed sink) because the outbound
+        // mpsc isn't drained until Phase 3 — too late for the broker
+        // to start its cache replay before `preloadClientFinished` on
+        // the preload path. On the non-preload path the broker is
+        // already in `Connected` state; the Join is still valid and
+        // makes the type routable immediately.
+        if !subscribe_types.is_empty() {
+            let client_id = self.transceiver.client_id();
+            tracing::debug!(
+                joins = subscribe_types.len(),
+                "publishing preload DotsMember(Join) for subscribed types"
+            );
+            for d in &subscribe_types {
+                let member = dots!(DotsMember {
+                    group_name: d.name,
+                    event: DotsMemberEvent::Join,
+                    client: client_id,
+                });
+                conn.publish(&member).await?;
+            }
         }
 
         // Phase 2: finish preload (cache events flow through dispatch
@@ -832,6 +864,24 @@ where
         if conn.state() == dots_model::DotsConnectionState::EarlySubscribe {
             conn.finish_preload().await?;
         }
+
+        self.early_subscribe_done = true;
+        Ok(())
+    }
+
+    /// Drive the connection's main read/write loop until exit, EOF, or
+    /// transport error.
+    ///
+    /// Calls [`early_subscribe`](Self::early_subscribe) first if it
+    /// hasn't been called yet, so the EarlySubscribe phase is always
+    /// completed before the main loop begins.
+    pub async fn run(mut self) -> Result<(), GuestError> {
+        self.early_subscribe().await?;
+        let conn = self.conn.take().expect("GuestDriver::run called twice");
+        let mut outbound_rx = self
+            .outbound_rx
+            .take()
+            .expect("GuestDriver::run called twice");
 
         // Phase 3: split the framed and run the main select loop.
         let (framed, dispatch) = conn.into_parts();
@@ -880,6 +930,97 @@ where
             }
         }
         Ok(())
+    }
+}
+
+/// Walk a struct descriptor's property tree, accumulating the dedup
+/// closure into `structs_to_send` / `enums_to_send` in descriptor-send
+/// order: every nested type is appended before the parent struct
+/// itself, matching the order the broker needs to resolve forward
+/// references during `StructDescriptorData` parsing.
+fn collect_descriptor_send_order(
+    descriptor: &'static StructDescriptor,
+    seen_structs: &mut HashSet<usize>,
+    seen_enums: &mut HashSet<usize>,
+    structs_to_send: &mut Vec<&'static StructDescriptor>,
+    enums_to_send: &mut Vec<&'static EnumDescriptor>,
+) {
+    if !seen_structs.insert(descriptor as *const _ as usize) {
+        return;
+    }
+    for prop in descriptor.properties {
+        collect_field_kind_send_order(
+            &prop.kind,
+            seen_structs,
+            seen_enums,
+            structs_to_send,
+            enums_to_send,
+        );
+    }
+    structs_to_send.push(descriptor);
+}
+
+fn collect_field_kind_send_order(
+    kind: &FieldKind,
+    seen_structs: &mut HashSet<usize>,
+    seen_enums: &mut HashSet<usize>,
+    structs_to_send: &mut Vec<&'static StructDescriptor>,
+    enums_to_send: &mut Vec<&'static EnumDescriptor>,
+) {
+    match kind {
+        FieldKind::Struct(d) => collect_descriptor_send_order(
+            d,
+            seen_structs,
+            seen_enums,
+            structs_to_send,
+            enums_to_send,
+        ),
+        FieldKind::Enum(e) => {
+            if seen_enums.insert(*e as *const _ as usize) {
+                enums_to_send.push(e);
+            }
+        }
+        FieldKind::Vec(inner) => collect_field_kind_send_order(
+            inner,
+            seen_structs,
+            seen_enums,
+            structs_to_send,
+            enums_to_send,
+        ),
+        _ => {}
+    }
+}
+
+/// Recursively register `descriptor` and every struct/enum reachable
+/// through its property tree with the codec registry. Used by the
+/// runtime `register_struct_descriptor` path so types pulled in by
+/// `publish` / `container::<T>` / `view::<T>` can be decoded when they
+/// arrive on the wire — even if the caller didn't include them in
+/// [`GuestTransceiver::from_connection`]'s publish/subscribe lists.
+fn register_struct_in_registry(
+    registry: &Registry,
+    descriptor: &'static StructDescriptor,
+    seen: &mut HashSet<usize>,
+) {
+    if !seen.insert(descriptor as *const _ as usize) {
+        return;
+    }
+    registry.register_struct_static(descriptor);
+    for prop in descriptor.properties {
+        register_field_kind_in_registry(registry, &prop.kind, seen);
+    }
+}
+
+fn register_field_kind_in_registry(
+    registry: &Registry,
+    kind: &FieldKind,
+    seen: &mut HashSet<usize>,
+) {
+    match kind {
+        FieldKind::Struct(d) => register_struct_in_registry(registry, d, seen),
+        FieldKind::Enum(e) => registry.register_enum_static(e),
+        FieldKind::Vec(inner) => register_field_kind_in_registry(registry, inner, seen),
+        _ => {}
     }
 }
 

@@ -25,7 +25,9 @@ use dots_model::{
     Registry, StructDescriptorData, Transmission, encode_transmission,
     registry_with_internal_types,
 };
-use dots_transport::{ConnectionBuilder, ConnectionError, TransmissionCodec};
+use dots_transport::{
+    ConnectionBuilder, ConnectionError, GuestTransceiver, TransmissionCodec,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio_util::codec::Framed;
@@ -61,6 +63,7 @@ fn dynamic_for(reg: &Registry, type_name: &str, payload: &dyn StructValue) -> Tr
 
 /// Fake server: receives Connect with preload=true, responds, then
 /// expects the StructDescriptorData publish for Pinger, then the
+/// DotsMember(Join, Pinger) the driver emits in Phase 1b, then the
 /// preloadClientFinished Connect, then streams `cached_pingers` back
 /// (each with header.from_cache decreasing), and finally sends the
 /// preloadFinished response.
@@ -111,6 +114,10 @@ async fn preload_server(
     let bytes = txn.payload.encode();
     let descriptor_data: StructDescriptorData = decode_typed_from_slice(&bytes).unwrap();
     assert_eq!(descriptor_data.name.as_deref(), Some("Pinger"));
+
+    // Receive DotsMember(Join, Pinger) — Phase 1b of the driver.
+    let txn = framed.next().await.unwrap().unwrap();
+    assert_eq!(txn.header.type_name.as_deref(), Some("DotsMember"));
 
     // Receive Connect (preload_client_finished=true).
     let txn = framed.next().await.unwrap().unwrap();
@@ -212,20 +219,25 @@ async fn builder_with_preload_lands_in_early_subscribe_then_finishes() {
     ];
     let server = tokio::spawn(preload_server(server_io, reg.clone(), cached.clone()));
 
-    let mut conn = ConnectionBuilder::new(client_io, "preload-client", reg)
-        .publishes::<Pinger>()
+    let conn = ConnectionBuilder::new(client_io, "preload-client", reg.clone())
         .preload(true)
         .connect()
         .await
         .unwrap();
     assert_eq!(conn.state(), DotsConnectionState::EarlySubscribe);
 
-    let mut sub = conn.subscribe::<Pinger>();
-    conn.finish_preload().await.unwrap();
-    assert_eq!(conn.state(), DotsConnectionState::Connected);
+    let (gt, driver) = GuestTransceiver::from_connection(
+        reg,
+        conn,
+        [Pinger::DESCRIPTOR],
+        [Pinger::DESCRIPTOR],
+    );
+    let mut sub = gt.subscribe_stream::<Pinger>();
+    let driver_handle = tokio::spawn(driver.run());
 
-    // Drain the cached events from the subscription. They were
-    // dispatched during finish_preload's read loop.
+    // The driver completes Phase 1 (descriptors), Phase 1b (Joins),
+    // Phase 2 (finish_preload + cache dispatch), then enters the main
+    // loop. Cache events for Pinger flow into `sub`.
     let first = sub.recv().await.expect("cache event 1");
     assert_eq!(first.value, cached[0]);
     assert_eq!(first.header.from_cache, Some(1));
@@ -234,7 +246,8 @@ async fn builder_with_preload_lands_in_early_subscribe_then_finishes() {
     assert_eq!(second.value, cached[1]);
     assert_eq!(second.header.from_cache, Some(0));
 
-    drop(conn);
+    gt.exit();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), driver_handle).await;
     server.await.unwrap();
 }
 
@@ -290,7 +303,7 @@ async fn finish_preload_errors_when_not_in_early_subscribe() {
 }
 
 #[tokio::test]
-async fn builder_publishes_struct_and_enum_descriptors_in_order() {
+async fn driver_ships_enum_descriptors_before_struct_descriptors() {
     use dots_derive::DotsEnum;
 
     #[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,8 +316,19 @@ async fn builder_publishes_struct_and_enum_descriptors_in_order() {
         Green,
     }
 
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Painted", cached)]
+    struct Painted {
+        #[dots(tag = 1, key)]
+        id: Option<u32>,
+        #[dots(tag = 2)]
+        color: Option<Color>,
+    }
+
     let (client_io, server_io) = tokio::io::duplex(4096);
     let reg = registry();
+    reg.register_struct_static(Painted::DESCRIPTOR);
+    reg.register_enum_static(Color::DESCRIPTOR);
 
     let server_reg = reg.clone();
     let server = tokio::spawn(async move {
@@ -352,13 +376,19 @@ async fn builder_publishes_struct_and_enum_descriptors_in_order() {
         );
     });
 
-    let conn = ConnectionBuilder::new(client_io, "registrar", reg)
-        .publishes_struct(Pinger::DESCRIPTOR)
-        .publishes_enum(Color::DESCRIPTOR)
+    let conn = ConnectionBuilder::new(client_io, "registrar", reg.clone())
         .preload(false)
         .connect()
         .await
         .unwrap();
-    drop(conn);
+    let (gt, driver) = GuestTransceiver::from_connection(
+        reg,
+        conn,
+        [Painted::DESCRIPTOR],
+        std::iter::empty(),
+    );
+    let driver_handle = tokio::spawn(driver.run());
+    gt.exit();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), driver_handle).await;
     server.await.unwrap();
 }

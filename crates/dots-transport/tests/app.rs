@@ -11,8 +11,8 @@ use std::time::Duration;
 use dots_core::{StructValue, decode_typed_from_slice, dots, encode_to_vec};
 use dots_derive::DotsStruct;
 use dots_model::{
-    DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello, Registry,
-    StructDescriptorData, Transmission, encode_transmission,
+    DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect, DotsMsgConnectResponse,
+    DotsMsgHello, Registry, StructDescriptorData, Transmission, encode_transmission,
     registry_with_internal_types,
 };
 use dots_transport::{App, TransmissionCodec};
@@ -29,6 +29,19 @@ struct Pinger {
     id: Option<u32>,
     #[dots(tag = 2)]
     message: Option<String>,
+}
+
+/// Used in the early-subscribe wire-flow test below to exercise the
+/// publish-only path: monomorphizing `app.publish::<PreloadPubOnly>`
+/// puts the type in `PUBLISHED_TYPES` (so its descriptor ships during
+/// EarlySubscribe), but nothing in this test binary calls
+/// `subscribe::<PreloadPubOnly>` so it stays out of `SUBSCRIBED_TYPES`
+/// (so no auto-`DotsMember(Join)` is emitted for it).
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+#[dots(name = "PreloadPubOnly", cached)]
+struct PreloadPubOnly {
+    #[dots(tag = 1, key)]
+    id: Option<u32>,
 }
 
 fn registry() -> Arc<Registry> {
@@ -101,9 +114,12 @@ async fn handshake_with_preload(
         .await
         .unwrap();
 
-    // Receive auto-published descriptor data + the preload-finished
-    // Connect; collect the type names in order until we see that
-    // Connect.
+    // Receive auto-published descriptor data, auto-published
+    // DotsMember(Join) for SUBSCRIBED_TYPES, and finally the
+    // preload-finished Connect; collect descriptor names in order
+    // until we see that Connect. DotsMember messages are consumed
+    // and skipped — tests that care about specific joins parse them
+    // separately.
     let mut descriptors_seen = Vec::new();
     loop {
         let txn = framed.next().await.unwrap().unwrap();
@@ -115,6 +131,9 @@ async fn handshake_with_preload(
             }
             Some("EnumDescriptorData") => {
                 descriptors_seen.push("<enum>".into());
+            }
+            Some("DotsMember") => {
+                // Auto-subscribe Join from the EarlySubscribe phase.
             }
             Some("DotsMsgConnect") => {
                 let bytes = txn.payload.encode();
@@ -415,4 +434,200 @@ async fn dropping_subscription_handle_unsubscribes() {
 
     client.exit();
     let _ = timeout(Duration::from_secs(1), run).await;
+}
+
+/// Wire-level test for the EarlySubscribe phase. Mirrors dots-cpp
+/// `GuestTransceiver::handleTransitionImpl`, which transmits a
+/// descriptor for every `m_preloadPublishTypes` entry, and a
+/// descriptor *plus* `joinGroup` for every `m_preloadSubscribeTypes`
+/// entry, before sending `preloadClientFinished`.
+///
+/// The Rust port pre-collects both `PUBLISHED_TYPES` and
+/// `SUBSCRIBED_TYPES` into the `ConnectionBuilder` for the descriptor
+/// pass, and the `GuestDriver::run` Phase 1b loops over
+/// `SUBSCRIBED_TYPES` to emit one `DotsMember(Join)` per type. We
+/// assert:
+///
+/// 1. Every `StructDescriptorData` and every `DotsMember(Join)` that
+///    arrives during EarlySubscribe is followed by exactly one
+///    `DotsMsgConnect{ preloadClientFinished = true }` (i.e. the
+///    auto-publish work has completed before the client signals
+///    "ready").
+/// 2. Every recorded `DotsMember` has `event = Join` — Leave/Kill
+///    have no place in this phase.
+/// 3. The descriptors of both `Pinger` (touched via `subscribe::<T>`)
+///    and `PreloadPubOnly` (touched via `publish::<T>`) appear in
+///    that descriptor set.
+/// 4. A `DotsMember(Join, "Pinger")` is emitted for the subscribed
+///    type — the new behavior under test.
+///
+/// Note on what we **don't** assert: that a publish-only type
+/// produces no `DotsMember(Join)`. In debug builds the link-time
+/// `linkme` slot for `register_as_subscribed::<T>` is emitted for
+/// every `#[derive(DotsStruct)]` type regardless of whether
+/// `subscribe::<T>` is ever called — see the build-mode caveat in
+/// `dots-derive/tests/global_registration.rs`. Release/LTO tightens
+/// this to "only types actually subscribed", but in `cargo test`
+/// debug we'd flap on the negative assertion.
+#[tokio::test]
+async fn early_subscribe_publishes_descriptors_and_joins_for_subscribed_types() {
+    use std::sync::Mutex;
+
+    let captured: Arc<Mutex<(Vec<String>, Vec<DotsMember>)>> =
+        Arc::new(Mutex::new((Vec::new(), Vec::new())));
+    let captured_for_server = captured.clone();
+
+    let addr = spawn_server(move |stream, reg| async move {
+        let mut framed = Framed::new(stream, TransmissionCodec::new(reg.clone()));
+
+        let hello = dots!(DotsMsgHello {
+            server_name: "preload-flow-test",
+            auth_challenge: 0_u64,
+            authentication_required: false,
+        });
+        framed
+            .send(dynamic_for(&reg, "DotsMsgHello", &hello))
+            .await
+            .unwrap();
+
+        let txn = framed.next().await.unwrap().unwrap();
+        let bytes = txn.payload.encode();
+        let connect: DotsMsgConnect = decode_typed_from_slice(&bytes).unwrap();
+        assert_eq!(connect.preload_cache, Some(true));
+
+        let response = dots!(DotsMsgConnectResponse {
+            server_name: "preload-flow-test",
+            client_id: 7_u32,
+            accepted: true,
+            preload: true,
+            preload_finished: false,
+        });
+        framed
+            .send(dynamic_for(&reg, "DotsMsgConnectResponse", &response))
+            .await
+            .unwrap();
+
+        loop {
+            let txn = framed.next().await.unwrap().unwrap();
+            match txn.header.type_name.as_deref() {
+                Some("StructDescriptorData") => {
+                    let bytes = txn.payload.encode();
+                    let data: StructDescriptorData =
+                        decode_typed_from_slice(&bytes).unwrap();
+                    captured_for_server
+                        .lock()
+                        .unwrap()
+                        .0
+                        .push(data.name.unwrap_or_default());
+                }
+                Some("EnumDescriptorData") => {
+                    // Not asserted on, but valid here.
+                }
+                Some("DotsMember") => {
+                    let bytes = txn.payload.encode();
+                    let member: DotsMember = decode_typed_from_slice(&bytes).unwrap();
+                    captured_for_server.lock().unwrap().1.push(member);
+                }
+                Some("DotsMsgConnect") => {
+                    let bytes = txn.payload.encode();
+                    let c: DotsMsgConnect = decode_typed_from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        c.preload_client_finished,
+                        Some(true),
+                        "expected preloadClientFinished to terminate EarlySubscribe",
+                    );
+                    break;
+                }
+                other => panic!("unexpected EarlySubscribe message: {other:?}"),
+            }
+        }
+
+        let response = dots!(DotsMsgConnectResponse {
+            server_name: "preload-flow-test",
+            client_id: 7_u32,
+            accepted: true,
+            preload: true,
+            preload_finished: true,
+        });
+        framed
+            .send(dynamic_for(&reg, "DotsMsgConnectResponse", &response))
+            .await
+            .unwrap();
+
+        // Hold the connection open until the client exits.
+        let _ = framed.next().await;
+    })
+    .await;
+
+    let app = App::connect_tcp(&addr.to_string(), "preload-flow-client")
+        .await
+        .unwrap();
+
+    // Touch both halves of the link-time intent so the monomorphization
+    // and the resulting `register_as_*` symbols land in this binary:
+    //   - subscribe::<Pinger>     →  Pinger ∈ SUBSCRIBED_TYPES
+    //   - publish::<PreloadPubOnly> → PreloadPubOnly ∈ PUBLISHED_TYPES
+    // The `publish()` value is queued on the outbound mpsc and only
+    // drained in the driver's Phase 3 (post-preload), so it has no
+    // effect on the EarlySubscribe wire flow under test.
+    app.subscribe::<Pinger>(|_| {}).discard();
+    app.publish(&dots!(PreloadPubOnly { id: 1_u32 }));
+
+    let client = app.client();
+    let run = tokio::spawn(app.run());
+
+    // Drive the EarlySubscribe phase to completion. Once we observe
+    // any DotsMember (the auto-Join Phase 1b), preloadClientFinished
+    // follows immediately in Phase 2 — so a short settle is enough.
+    for _ in 0..200 {
+        if !captured.lock().unwrap().1.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    client.exit();
+    let _ = timeout(Duration::from_secs(1), run).await;
+
+    let (descriptors, members) = {
+        let guard = captured.lock().unwrap();
+        (guard.0.clone(), guard.1.clone())
+    };
+
+    // (2) every captured DotsMember is a Join — Leaves don't belong here.
+    for m in &members {
+        assert_eq!(
+            m.event,
+            Some(DotsMemberEvent::Join),
+            "unexpected DotsMember event in EarlySubscribe: {m:?}",
+        );
+    }
+
+    // (3) descriptors include the type we subscribed to and the type
+    //     we published.
+    assert!(
+        descriptors.iter().any(|n| n == "Pinger"),
+        "subscribed type's descriptor must be sent in EarlySubscribe; got {descriptors:?}",
+    );
+    assert!(
+        descriptors.iter().any(|n| n == "PreloadPubOnly"),
+        "published type's descriptor must be sent in EarlySubscribe; got {descriptors:?}",
+    );
+
+    // (4) the new behavior: SUBSCRIBED_TYPES auto-emits Join.
+    let join_names: Vec<&str> = members
+        .iter()
+        .filter_map(|m| m.group_name.as_deref())
+        .collect();
+    assert!(
+        join_names.contains(&"Pinger"),
+        "subscribed type must produce a DotsMember(Join) in EarlySubscribe; got {join_names:?}",
+    );
+
+    // Sanity: at least one Join was emitted (Phase 1b actually ran).
+    assert!(
+        !members.is_empty(),
+        "expected at least one auto-published DotsMember(Join) in EarlySubscribe",
+    );
 }

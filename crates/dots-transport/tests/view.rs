@@ -38,13 +38,20 @@ async fn view_four_cases_enter_update_leave_reenter() {
     host.accept(host_io_a);
     let conn_a = ConnectionBuilder::new(guest_io_a, "subscriber", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
+    // Filtered subscriber: no auto-Join. Pinger is pre-registered on
+    // both sides (`registry.register_struct_static` above + the same
+    // on `host.registry()`), so no descriptor needs to ship. Leaving
+    // both lists empty avoids a Phase 1b non-filtered Join that would
+    // cause the broker to fan out every Pinger to this guest in
+    // addition to the filtered view stream.
     let (gt_a, driver_a) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_a,
+        [],
+        [],
     );
     let driver_a_handle = tokio::spawn(driver_a.run());
 
@@ -81,13 +88,14 @@ async fn view_four_cases_enter_update_leave_reenter() {
     host.accept(host_io_b);
     let conn_b = ConnectionBuilder::new(guest_io_b, "publisher", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt_b, driver_b) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_b,
+        [Pinger::DESCRIPTOR],
+        [],
     );
     let driver_b_handle = tokio::spawn(driver_b.run());
 
@@ -164,12 +172,13 @@ async fn view_drop_removes_filtered_sub_from_host() {
     host.accept(host_io);
     let conn = ConnectionBuilder::new(guest_io, "subscriber", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
+    // Filtered subscriber only — no auto-Join, see the four-cases test
+    // above for why both lists are empty here.
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [], []);
     let driver_handle = tokio::spawn(driver.run());
 
     let view = gt
@@ -215,13 +224,14 @@ async fn view_preload_from_existing_cache() {
     host.accept(host_io_b);
     let conn_b = ConnectionBuilder::new(guest_io_b, "publisher", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt_b, driver_b) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_b,
+        [Pinger::DESCRIPTOR],
+        [],
     );
     let driver_b_handle = tokio::spawn(driver_b.run());
 
@@ -243,13 +253,14 @@ async fn view_preload_from_existing_cache() {
     host.accept(host_io_a);
     let conn_a = ConnectionBuilder::new(guest_io_a, "subscriber", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt_a, driver_a) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_a,
+        [],
+        [],
     );
     let driver_a_handle = tokio::spawn(driver_a.run());
 

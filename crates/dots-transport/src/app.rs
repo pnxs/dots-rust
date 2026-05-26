@@ -29,7 +29,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use dots_core::{
-    DynamicStruct, DynamicStructDescriptor, EnumDescriptor, PropertySet, Publishable, StructValue,
+    DynamicStruct, DynamicStructDescriptor, PUBLISHED_TYPES, PropertySet, Publishable,
+    SUBSCRIBED_TYPES, StructValue,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -140,6 +141,16 @@ impl App {
     /// A malformed `DOTS_ENDPOINT` returns
     /// [`AppError::Endpoint`] rather than silently falling back, so a
     /// typo is surfaced rather than hidden behind a working default.
+    ///
+    /// Returns once the connection has completed the EarlySubscribe
+    /// phase and reached `Connected` — descriptors for every link-time
+    /// `PUBLISHED_TYPES` / `SUBSCRIBED_TYPES` entry have been shipped,
+    /// `DotsMember(Join)` has been published for each subscribed type,
+    /// and the broker's cache replay has finished. Note that any cache
+    /// events delivered during preload arrive before this returns, so
+    /// they're dispatched against an empty subscriber table — callers
+    /// that need the cache must avoid stateless subscribe-and-read
+    /// patterns for static types.
     ///
     /// Use [`connect`](Self::connect),
     /// [`connect_tcp`](Self::connect_tcp), or
@@ -280,8 +291,43 @@ impl App {
             builder = builder.with_auth(s);
         }
         let conn: Connection<S> = builder.connect().await?;
-        let (transceiver, driver) =
-            GuestTransceiver::from_connection(registry, conn);
+
+        // Hand the link-time `PUBLISHED_TYPES` / `SUBSCRIBED_TYPES`
+        // slices to the transceiver. The `#[derive(DotsStruct)]` macro
+        // emits `linkme` entries inside `register_as_published` /
+        // `register_as_subscribed`; each `publish::<T>` /
+        // `subscribe::<T>` / `container::<T>` monomorphization pulls
+        // those entries into the binary, so these slices reflect the
+        // binary's actual link-time intent. The driver's Phase 1
+        // walks them transitively (registering and shipping every
+        // nested struct/enum descriptor in declaration order) and
+        // Phase 1b emits `DotsMember(Join, T.name)` for each
+        // subscribed type so the broker starts cache replay before
+        // `preloadClientFinished`. Mirrors dots-cpp's `Application`
+        // passing `io::global_subscribe_types()` into
+        // `GuestTransceiver::open`.
+        let published_types = PUBLISHED_TYPES
+            .iter()
+            .copied()
+            .filter(|d| !d.flags.is_internal());
+        let subscribed_types = SUBSCRIBED_TYPES
+            .iter()
+            .copied()
+            .filter(|d| !d.flags.is_internal());
+
+        let (transceiver, mut driver) = GuestTransceiver::from_connection(
+            registry,
+            conn,
+            published_types,
+            subscribed_types,
+        );
+        // Run the EarlySubscribe phase (descriptor exchange, Join for
+        // every subscribed type, finish_preload) before returning, so
+        // the connection is in `Connected` state by the time the caller
+        // receives the `App`. Cache events that arrive during this
+        // phase have no user-side subscribers yet — they're dropped.
+        // Live events flow normally once `App::run` starts.
+        driver.early_subscribe().await?;
         let driver_future: DriverFuture = Box::pin(driver.run());
         Ok(App {
             transceiver,
@@ -367,10 +413,6 @@ impl App {
         T: StructValue + Default + Send + Clone + 'static + dots_core::GlobalRegistration,
     {
         self.transceiver.view::<T>(filter)
-    }
-
-    pub fn register_enum(&self, descriptor: &'static EnumDescriptor) {
-        self.transceiver.register_enum(descriptor)
     }
 
     pub fn publish<P: Publishable>(&self, value: &P) {

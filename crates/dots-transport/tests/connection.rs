@@ -390,7 +390,7 @@ async fn send_typed_after_handshake_reaches_server() {
         id: 42_u32,
         note: "hello dotsd",
     });
-    conn.send_typed("Demo", &demo).await.unwrap();
+    conn.send_typed(&demo).await.unwrap();
 
     drop(conn);
     server.await.unwrap();

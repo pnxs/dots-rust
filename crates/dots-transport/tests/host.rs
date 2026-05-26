@@ -62,13 +62,14 @@ async fn host_routes_pinger_between_two_guests() {
     // cache pool yet, so we don't need to drain a preload phase).
     let conn_a = ConnectionBuilder::new(guest_io_a, "guest-a", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt_a, driver_a) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_a,
+        [Pinger::DESCRIPTOR],
+        [Pinger::DESCRIPTOR],
     );
     let mut sub_a = gt_a.subscribe_stream::<Pinger>();
     let driver_a_handle = tokio::spawn(driver_a.run());
@@ -77,13 +78,14 @@ async fn host_routes_pinger_between_two_guests() {
     // we publish without subscribing here).
     let conn_b = ConnectionBuilder::new(guest_io_b, "guest-b", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt_b, driver_b) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_b,
+        [Pinger::DESCRIPTOR],
+        [Pinger::DESCRIPTOR],
     );
     let driver_b_handle = tokio::spawn(driver_b.run());
 
@@ -134,12 +136,11 @@ async fn host_publish_reaches_subscribed_guest() {
 
     let conn = ConnectionBuilder::new(guest_io, "subscriber", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [Pinger::DESCRIPTOR], [Pinger::DESCRIPTOR]);
     let mut sub = gt.subscribe_stream::<Pinger>();
     let driver_handle = tokio::spawn(driver.run());
 
@@ -189,7 +190,7 @@ async fn host_publishes_distinct_dots_client_statistics_records() {
         .await
         .unwrap();
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [], []);
     let mut sub = gt.subscribe_stream::<DotsClientStatistics>();
     let driver_handle = tokio::spawn(driver.run());
 
@@ -258,6 +259,8 @@ async fn host_publishes_distinct_dots_client_statistics_records() {
     let (gt_b, driver_b) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_b,
+        [],
+        [],
     );
     let mut sub_b = gt_b.subscribe_stream::<DotsClientStatistics>();
     let driver_b_handle = tokio::spawn(driver_b.run());
@@ -300,13 +303,12 @@ async fn guest_stats_count_both_directions() {
 
     let conn = ConnectionBuilder::new(guest_io, "subscriber", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let guest_id = conn.client_id().expect("client_id assigned");
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [Pinger::DESCRIPTOR], [Pinger::DESCRIPTOR]);
     let mut sub = gt.subscribe_stream::<Pinger>();
     let driver_handle = tokio::spawn(driver.run());
 
@@ -417,13 +419,14 @@ async fn host_replays_cached_pingers_to_late_subscriber() {
     host.accept(host_io_a);
     let conn_a = ConnectionBuilder::new(guest_io_a, "publisher", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt_a, driver_a) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_a,
+        [Pinger::DESCRIPTOR],
+        [Pinger::DESCRIPTOR],
     );
     let driver_a_handle = tokio::spawn(driver_a.run());
 
@@ -457,13 +460,14 @@ async fn host_replays_cached_pingers_to_late_subscriber() {
     host.accept(host_io_b);
     let conn_b = ConnectionBuilder::new(guest_io_b, "subscriber", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt_b, driver_b) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_b,
+        [Pinger::DESCRIPTOR],
+        [Pinger::DESCRIPTOR],
     );
     let mut sub = gt_b.subscribe_stream::<Pinger>();
     let cache = gt_b.container::<Pinger>();
@@ -516,12 +520,11 @@ async fn dropping_subscription_keeps_group_alive_until_transceiver_drops() {
 
     let conn = ConnectionBuilder::new(guest_io, "guest", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [Pinger::DESCRIPTOR], [Pinger::DESCRIPTOR]);
     let driver_handle = tokio::spawn(driver.run());
 
     let sub = gt.subscribe_stream::<Pinger>();
@@ -575,12 +578,11 @@ async fn dropping_one_of_two_subscriptions_keeps_join() {
 
     let conn = ConnectionBuilder::new(guest_io, "guest", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [Pinger::DESCRIPTOR], [Pinger::DESCRIPTOR]);
     let driver_handle = tokio::spawn(driver.run());
 
     // Two subscriptions to the same type — the second should NOT
@@ -620,13 +622,14 @@ async fn guest_remove_drops_entry_from_host_cache() {
     host.accept(host_io_a);
     let conn_a = ConnectionBuilder::new(guest_io_a, "publisher", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt_a, driver_a) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_a,
+        [Pinger::DESCRIPTOR],
+        [Pinger::DESCRIPTOR],
     );
     let driver_a_handle = tokio::spawn(driver_a.run());
 
@@ -685,7 +688,7 @@ async fn host_replies_to_dots_echo_request() {
         .await
         .unwrap();
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [], []);
     let mut sub = gt.subscribe_stream::<DotsEcho>();
     let driver_handle = tokio::spawn(driver.run());
 
@@ -751,7 +754,7 @@ async fn transition_handler_publishes_dots_client_on_connect_and_disconnect() {
         .await
         .unwrap();
     let (gt_obs, driver_obs) =
-        GuestTransceiver::from_connection(registry(), conn_obs);
+        GuestTransceiver::from_connection(registry(), conn_obs, [], []);
     let mut sub = gt_obs.subscribe_stream::<DotsClient>();
     let driver_obs_handle = tokio::spawn(driver_obs.run());
 
@@ -775,7 +778,7 @@ async fn transition_handler_publishes_dots_client_on_connect_and_disconnect() {
         .await
         .unwrap();
     let (gt_b, driver_b) =
-        GuestTransceiver::from_connection(registry(), conn_b);
+        GuestTransceiver::from_connection(registry(), conn_b, [], []);
     let driver_b_handle = tokio::spawn(driver_b.run());
 
     // Wait for the alice-connect event.
@@ -865,13 +868,12 @@ async fn client_id_referenced_tracks_created_from_and_last_update() {
     host.accept(host_io);
     let conn = ConnectionBuilder::new(guest_io, "publisher", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let publisher_id = conn.client_id().expect("client_id assigned");
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [Pinger::DESCRIPTOR], [Pinger::DESCRIPTOR]);
     let driver_handle = tokio::spawn(driver.run());
 
     gt.publish(&dots!(Pinger {
@@ -935,12 +937,11 @@ async fn transition_handler_carries_final_stats_on_close() {
     host.accept(host_io);
     let conn = ConnectionBuilder::new(guest_io, "stats-victim", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [Pinger::DESCRIPTOR], [Pinger::DESCRIPTOR]);
     let driver_handle = tokio::spawn(driver.run());
 
     // Force at least one frame down the guest's writer queue so its
@@ -1027,13 +1028,14 @@ async fn host_serve_unix_routes_pinger_round_trip() {
     registry.register_struct_static(Pinger::DESCRIPTOR);
     let conn = ConnectionBuilder::new(stream, "uds-client", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt, driver) = GuestTransceiver::from_connection(
         registry.clone(),
         conn,
+        [Pinger::DESCRIPTOR],
+        [Pinger::DESCRIPTOR],
     );
     let mut sub = gt.subscribe_stream::<Pinger>();
     let driver_handle = tokio::spawn(driver.run());
@@ -1101,11 +1103,15 @@ async fn registering_a_struct_pulls_in_nested_enum_descriptors() {
         .connect()
         .await
         .unwrap();
-    let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
-    // User subscribes only to `Greeter`. The `Mood` enum, embedded in
-    // a Greeter field, must auto-register without an explicit
-    // `register_enum` call.
+    // The user declares Greeter as a subscribed type. The `Mood`
+    // enum, embedded in a Greeter field, must auto-register through
+    // the driver's descriptor-walk without any explicit enum entry.
+    let (gt, driver) = GuestTransceiver::from_connection(
+        registry.clone(),
+        conn,
+        [],
+        [Greeter::DESCRIPTOR],
+    );
     let _sub = gt.subscribe_stream::<Greeter>();
     let driver_handle = tokio::spawn(driver.run());
 
@@ -1155,13 +1161,14 @@ async fn cleanup_flag_drops_publisher_entries_on_disconnect() {
     host.accept(host_io_obs);
     let conn_obs = ConnectionBuilder::new(guest_io_obs, "observer", registry.clone())
         .preload(false)
-        .publishes::<TempClient>()
         .connect()
         .await
         .unwrap();
     let (gt_obs, driver_obs) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_obs,
+        [TempClient::DESCRIPTOR],
+        [TempClient::DESCRIPTOR],
     );
     let mut sub = gt_obs.subscribe_stream::<TempClient>();
     let driver_obs_handle = tokio::spawn(driver_obs.run());
@@ -1171,13 +1178,14 @@ async fn cleanup_flag_drops_publisher_entries_on_disconnect() {
     host.accept(host_io_pub);
     let conn_pub = ConnectionBuilder::new(guest_io_pub, "publisher", registry.clone())
         .preload(false)
-        .publishes::<TempClient>()
         .connect()
         .await
         .unwrap();
     let (gt_pub, driver_pub) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_pub,
+        [TempClient::DESCRIPTOR],
+        [TempClient::DESCRIPTOR],
     );
     let driver_pub_handle = tokio::spawn(driver_pub.run());
 
@@ -1285,7 +1293,7 @@ async fn host_replies_to_descriptor_request_with_known_structs() {
         .await
         .unwrap();
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [], []);
     let mut sub_descriptors = gt.subscribe_stream::<StructDescriptorData>();
     let mut sub_cache_info = gt.subscribe_stream::<DotsCacheInfo>();
     let driver_handle = tokio::spawn(driver.run());
@@ -1346,13 +1354,14 @@ async fn dots_clear_cache_drops_named_types_and_publishes_removals() {
     host.accept(host_io_pub);
     let conn_pub = ConnectionBuilder::new(guest_io_pub, "publisher", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt_pub, driver_pub) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_pub,
+        [Pinger::DESCRIPTOR],
+        [Pinger::DESCRIPTOR],
     );
     let driver_pub_handle = tokio::spawn(driver_pub.run());
 
@@ -1410,7 +1419,7 @@ async fn gt_exit_promptly_wakes_the_driver_on_a_quiet_connection() {
         .await
         .unwrap();
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry(), conn);
+        GuestTransceiver::from_connection(registry(), conn, [], []);
     let driver_handle = tokio::spawn(driver.run());
 
     // No traffic yet — call exit, expect prompt return.
@@ -1446,6 +1455,8 @@ async fn dynamic_subscribe_receives_event_with_runtime_descriptor() {
     let (gt, driver) = GuestTransceiver::from_connection(
         guest_registry.clone(),
         conn,
+        [],
+        [],
     );
     let driver_handle = tokio::spawn(driver.run());
 
@@ -1511,12 +1522,11 @@ async fn dynamic_publish_routes_through_broker_to_typed_subscriber() {
     host.accept(host_io_sub);
     let conn_sub = ConnectionBuilder::new(guest_io_sub, "sub", registry.clone())
         .preload(false)
-        .publishes::<Pinger>()
         .connect()
         .await
         .unwrap();
     let (gt_sub, driver_sub) =
-        GuestTransceiver::from_connection(registry.clone(), conn_sub);
+        GuestTransceiver::from_connection(registry.clone(), conn_sub, [Pinger::DESCRIPTOR], [Pinger::DESCRIPTOR]);
     let mut sub = gt_sub.subscribe_stream::<Pinger>();
     let driver_sub_handle = tokio::spawn(driver_sub.run());
 
@@ -1539,7 +1549,7 @@ async fn dynamic_publish_routes_through_broker_to_typed_subscriber() {
         .await
         .unwrap();
     let (gt_pub, driver_pub) =
-        GuestTransceiver::from_connection(pub_registry.clone(), conn_pub);
+        GuestTransceiver::from_connection(pub_registry.clone(), conn_pub, [], []);
     let driver_pub_handle = tokio::spawn(driver_pub.run());
 
     let descriptor = Arc::new(DynamicStructDescriptor::from_static(Pinger::DESCRIPTOR));
@@ -1592,7 +1602,7 @@ async fn subscribe_new_struct_type_catches_up_on_existing_descriptors() {
         .await
         .unwrap();
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [], []);
     let driver_handle = tokio::spawn(driver.run());
 
     let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1629,7 +1639,7 @@ async fn subscribe_new_struct_type_fires_for_wire_descriptor_arrivals() {
         .await
         .unwrap();
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [], []);
     let driver_handle = tokio::spawn(driver.run());
 
     let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1707,7 +1717,7 @@ async fn subscribe_all_types_funnels_events_for_distinct_types() {
         .await
         .unwrap();
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn);
+        GuestTransceiver::from_connection(registry.clone(), conn, [], []);
     let driver_handle = tokio::spawn(driver.run());
 
     // Capture (type_name, sender) for each event.
