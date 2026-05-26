@@ -146,11 +146,11 @@ impl App {
     /// phase and reached `Connected` — descriptors for every link-time
     /// `PUBLISHED_TYPES` / `SUBSCRIBED_TYPES` entry have been shipped,
     /// `DotsMember(Join)` has been published for each subscribed type,
-    /// and the broker's cache replay has finished. Note that any cache
-    /// events delivered during preload arrive before this returns, so
-    /// they're dispatched against an empty subscriber table — callers
-    /// that need the cache must avoid stateless subscribe-and-read
-    /// patterns for static types.
+    /// the broker's cache replay has finished, and the per-type
+    /// containers in the transceiver's pool have been populated with
+    /// the replayed instances. A subsequent
+    /// [`crate::global::container::<T>`] / [`Self::container::<T>`]
+    /// call returns a typed view of that already-populated container.
     ///
     /// Use [`connect`](Self::connect),
     /// [`connect_tcp`](Self::connect_tcp), or
@@ -328,6 +328,11 @@ impl App {
         // phase have no user-side subscribers yet — they're dropped.
         // Live events flow normally once `App::run` starts.
         driver.early_subscribe().await?;
+        // Install the transceiver as the process-wide singleton so
+        // `dots_transport::global::{publish, subscribe, container, …}`
+        // resolve to it. Panics if another `App` is already active —
+        // matches dots-cpp's single-`Application` constraint.
+        crate::global::init(transceiver.clone());
         let driver_future: DriverFuture = Box::pin(driver.run());
         Ok(App {
             transceiver,
@@ -450,5 +455,14 @@ impl App {
             }
         });
         self.run().await
+    }
+}
+
+impl Drop for App {
+    /// Release the [`crate::global`] singleton slot so a subsequent
+    /// `App::new` (e.g. in the next test, or in a re-connect path)
+    /// can install a fresh transceiver.
+    fn drop(&mut self) {
+        crate::global::destroy();
     }
 }

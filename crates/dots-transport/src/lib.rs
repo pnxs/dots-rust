@@ -27,6 +27,7 @@ mod container;
 mod endpoint;
 mod error;
 pub mod filter;
+pub mod global;
 mod guest;
 mod host;
 mod view;

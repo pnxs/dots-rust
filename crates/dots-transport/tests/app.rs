@@ -6,7 +6,22 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+
+/// Process-wide guard so the App tests don't race on the
+/// `dots_transport::global` singleton. Each test acquires this at the
+/// start; the guard is held for the duration of the test, then
+/// released as the test function returns. Tokio's `#[tokio::test]`
+/// default current-thread runtime keeps the future pinned to one OS
+/// thread, so holding a `!Send` `MutexGuard` across awaits is safe.
+static APP_LOCK: Mutex<()> = Mutex::new(());
+
+fn app_lock() -> MutexGuard<'static, ()> {
+    // Tolerate a poisoned mutex (a prior test panicking while
+    // holding the lock) — the next test can still run.
+    APP_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 use dots_core::{StructValue, decode_typed_from_slice, dots, encode_to_vec};
 use dots_derive::DotsStruct;
@@ -165,6 +180,7 @@ async fn handshake_with_preload(
 
 #[tokio::test]
 async fn app_connects_and_runs_until_exit() {
+    let _guard = app_lock();
     let addr = spawn_server(|stream, reg| async move {
         let mut framed = Framed::new(stream, TransmissionCodec::new(reg.clone()));
         handshake_with_preload(&mut framed, &reg).await;
@@ -188,6 +204,7 @@ async fn app_connects_and_runs_until_exit() {
 
 #[tokio::test]
 async fn app_auto_publishes_descriptors_for_subscribed_types() {
+    let _guard = app_lock();
     let addr = spawn_server(|stream, reg| async move {
         let mut framed = Framed::new(stream, TransmissionCodec::new(reg.clone()));
         let descriptors = handshake_with_preload(&mut framed, &reg).await;
@@ -213,6 +230,7 @@ async fn app_auto_publishes_descriptors_for_subscribed_types() {
 
 #[tokio::test]
 async fn callback_subscription_receives_events() {
+    let _guard = app_lock();
     let counter = Arc::new(AtomicUsize::new(0));
 
     let addr = spawn_server(|stream, reg| async move {
@@ -265,6 +283,7 @@ async fn callback_subscription_receives_events() {
 
 #[tokio::test]
 async fn client_publish_from_handler_reaches_server() {
+    let _guard = app_lock();
     let received = Arc::new(tokio::sync::Notify::new());
     let received_in_server = received.clone();
 
@@ -331,6 +350,7 @@ async fn client_publish_from_handler_reaches_server() {
 
 #[tokio::test]
 async fn container_alongside_callback_both_update() {
+    let _guard = app_lock();
     let counter = Arc::new(AtomicUsize::new(0));
 
     let addr = spawn_server(|stream, reg| async move {
@@ -382,6 +402,7 @@ async fn container_alongside_callback_both_update() {
 
 #[tokio::test]
 async fn dropping_subscription_handle_unsubscribes() {
+    let _guard = app_lock();
     let counter = Arc::new(AtomicUsize::new(0));
 
     let addr = spawn_server(|stream, reg| async move {
@@ -471,7 +492,7 @@ async fn dropping_subscription_handle_unsubscribes() {
 /// debug we'd flap on the negative assertion.
 #[tokio::test]
 async fn early_subscribe_publishes_descriptors_and_joins_for_subscribed_types() {
-    use std::sync::Mutex;
+    let _guard = app_lock();
 
     let captured: Arc<Mutex<(Vec<String>, Vec<DotsMember>)>> =
         Arc::new(Mutex::new((Vec::new(), Vec::new())));
