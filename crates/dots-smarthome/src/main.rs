@@ -30,7 +30,7 @@ const APP_NAME: &str = "smart-home";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dots_transport::init_tracing();
+    dots_transport::init_tracing("");
 
     let app = App::new(APP_NAME).await?;
     tracing::info!("smart-home connected");

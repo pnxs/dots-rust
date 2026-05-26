@@ -50,7 +50,7 @@ const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dots_transport::init_tracing();
+    dots_transport::init_tracing("");
 
     let Args {
         name: daemon_name,

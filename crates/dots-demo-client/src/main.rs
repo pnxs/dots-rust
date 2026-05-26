@@ -42,7 +42,7 @@ const CLIENT_NAME: &str = "dots-demo-client";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dots_transport::init_tracing();
+    dots_transport::init_tracing("");
 
     // Link-time-collected lists of types this binary actually touches.
     // Populated by `subscribe::<T>` / `publish::<T>` monomorphizations

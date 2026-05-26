@@ -23,7 +23,7 @@ const APP_NAME: &str = "smart-home-sim";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dots_transport::init_tracing();
+    dots_transport::init_tracing("");
 
     let app = App::new(APP_NAME).await?;
     let client = app.client();

@@ -54,7 +54,7 @@ fn op_name(op: ViewOp) -> &'static str {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    dots_transport::init_tracing();
+    dots_transport::init_tracing("");
 
     let app = match App::new(CLIENT_NAME).await {
         Ok(a) => a,
