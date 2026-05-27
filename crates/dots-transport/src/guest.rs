@@ -932,7 +932,7 @@ where
         tracing::debug!("entering GuestDriver run loop");
         loop {
             if self.transceiver.exit_flag.load(Ordering::Acquire) {
-                tracing::info!("exit flag set, leaving guest run loop");
+                tracing::debug!("exit flag set, leaving guest run loop");
                 break;
             }
             tokio::select! {
@@ -956,7 +956,7 @@ where
                         return Err(e.into());
                     }
                     None => {
-                        tracing::info!("server closed connection");
+                        tracing::debug!("server closed connection");
                         break;
                     }
                 },

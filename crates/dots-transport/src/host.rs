@@ -812,7 +812,7 @@ impl HostTransceiver {
         }
         inner.groups.clear();
         inner.pool.clear();
-        tracing::info!(guest_count, "host shutdown — guest tasks aborted");
+        tracing::debug!(guest_count, "host shutdown — guest tasks aborted");
     }
 
     /// Names of all groups that have at least one subscriber.
@@ -982,7 +982,7 @@ impl HostTransceiver {
             crate::Endpoint::Tcp(addr) => {
                 let listener = tokio::net::TcpListener::bind(&addr).await?;
                 let local = listener.local_addr()?;
-                tracing::info!(listen = %local, "TCP endpoint ready");
+                tracing::debug!(listen = %local, "TCP endpoint ready");
                 Ok(EndpointHandle {
                     join: self.serve_tcp(listener),
                     _uds_guard: None,
@@ -997,7 +997,7 @@ impl HostTransceiver {
                     let _ = std::fs::remove_file(&path);
                 }
                 let listener = tokio::net::UnixListener::bind(&path)?;
-                tracing::info!(listen = %path.display(), "UDS endpoint ready");
+                tracing::debug!(listen = %path.display(), "UDS endpoint ready");
                 Ok(EndpointHandle {
                     join: self.serve_unix(listener),
                     _uds_guard: Some(UdsSocketGuard { path }),
@@ -1028,7 +1028,7 @@ impl HostTransceiver {
                     tracing::warn!(?peer, error = %e, "set_nodelay failed on accepted TCP stream");
                 }
                 let id = host.accept_tcp(stream);
-                tracing::info!(?peer, client_id = id, "TCP guest accepted");
+                tracing::debug!(?peer, client_id = id, "TCP guest accepted");
             }
         })
     }
@@ -1049,7 +1049,7 @@ impl HostTransceiver {
                     .ok()
                     .and_then(|a| a.as_pathname().map(|p| p.display().to_string()));
                 let id = host.accept_unix(stream);
-                tracing::info!(peer = ?peer, client_id = id, "UDS guest accepted");
+                tracing::debug!(peer = ?peer, client_id = id, "UDS guest accepted");
             }
         })
     }
@@ -1783,7 +1783,7 @@ where
     let connect: DotsMsgConnect = decode_handshake(&connect_raw, "DotsMsgConnect")?;
     let preload_requested = connect.preload_cache == Some(true);
     host.set_client_name(client_id, connect.client_name.clone());
-    tracing::info!(
+    tracing::debug!(
         client_id,
         client_name = ?connect.client_name,
         preload = preload_requested,

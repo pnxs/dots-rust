@@ -189,7 +189,7 @@ where
         );
         let txn = self.read_next().await?;
         let hello = self.expect_typed::<DotsMsgHello>(&txn)?;
-        tracing::info!(
+        tracing::trace!(
             server_name = ?hello.server_name,
             auth_required = ?hello.authentication_required,
             "received DotsMsgHello"
@@ -235,7 +235,7 @@ where
         } else {
             DotsConnectionState::Connected
         };
-        tracing::info!(
+        tracing::debug!(
             client_id = ?self.client_id,
             state = ?self.state,
             "handshake accepted"
@@ -281,7 +281,7 @@ where
                 let response = self.expect_typed::<DotsMsgConnectResponse>(&txn)?;
                 if response.preload_finished == Some(true) {
                     self.state = DotsConnectionState::Connected;
-                    tracing::info!("preload finished, connection in Connected state");
+                    tracing::debug!("preload finished, connection in Connected state");
                     return Ok(());
                 }
                 tracing::debug!("intermediate ConnectResponse during preload");

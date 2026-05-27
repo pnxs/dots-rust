@@ -247,7 +247,7 @@ impl App {
         client_name: &str,
         secret: Option<&str>,
     ) -> Result<App, AppError> {
-        tracing::info!(
+        tracing::debug!(
             addr,
             client_name,
             with_auth = secret.is_some(),
@@ -265,7 +265,7 @@ impl App {
         client_name: &str,
         secret: Option<&str>,
     ) -> Result<App, AppError> {
-        tracing::info!(
+        tracing::debug!(
             path = %path.display(),
             client_name,
             with_auth = secret.is_some(),
