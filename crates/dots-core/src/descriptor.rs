@@ -111,6 +111,12 @@ pub struct PropertyVtable {
     /// a `None`, which is a no-op. Must be called exactly once per
     /// initialized field before the buffer is freed.
     pub drop_in_place: unsafe fn(*mut u8),
+
+    /// Deep-clones the `Option<T>` at `src` into `dst`. The `dst`
+    /// location must be a valid `Option<T>` (e.g. zero-initialized,
+    /// which reads as `None`); any previous value is dropped before
+    /// the clone is written. Used by `AnyStruct::clone`.
+    pub clone_in_place: unsafe fn(src: *const u8, dst: *mut u8),
 }
 
 impl core::fmt::Debug for PropertyVtable {

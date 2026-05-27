@@ -529,10 +529,8 @@ impl GuestTransceiver {
         }
         self.join_group(name);
         let leaver = self.make_leaver(name);
-        let dyn_descriptor =
-            Arc::new(dots_core::DynamicStructDescriptor::from_static(descriptor));
         let container =
-            crate::container::make_dyn_container(dyn_descriptor, &self.dispatch, Some(leaver));
+            crate::container::make_dyn_container(descriptor, &self.dispatch, Some(leaver));
         let mut pool = self.container_pool.lock().expect("container pool poisoned");
         // Race: another thread may have raced us to insert. Honor
         // the first insertion so dispatch entries don't double-up.
@@ -1212,12 +1210,19 @@ where
     F: FnMut(&Event<DynamicStruct>) + Send + 'static,
 {
     fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError> {
-        // The codec already decoded the wire bytes into a
-        // `DynamicStruct` against the registry's descriptor for this
-        // type, so no further decode work is needed here.
+        // The wire-decode normally lands in `Payload::Wire` for
+        // dynamic-only types. But `subscribe_all_types` can install
+        // dynamic subscribers for types whose static descriptor *is*
+        // compiled in — those decode to `Payload::Typed`, and the
+        // handler still needs the `DynamicStruct` shape. Project
+        // through CBOR in that case.
+        let dyn_value = match &txn.payload {
+            dots_model::Payload::Wire(d) => d.clone(),
+            dots_model::Payload::Typed(a) => DynamicStruct::from_struct_value(a),
+        };
         let event = Event {
             header: txn.header.clone(),
-            value: txn.payload.clone(),
+            value: dyn_value,
         };
         (self.handler)(&event);
         Ok(true)

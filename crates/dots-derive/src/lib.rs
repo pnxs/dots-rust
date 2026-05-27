@@ -538,6 +538,7 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
                 encode_value: ::dots_core::layout::opt_encode_vec::<#elem_ty>,
                 decode_value: ::dots_core::layout::opt_decode_vec::<#elem_ty>,
                 drop_in_place: ::dots_core::layout::opt_drop::<#inner_ty>,
+                clone_in_place: ::dots_core::layout::opt_clone_vec::<#elem_ty>,
             };
         };
     }
@@ -549,6 +550,7 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
             encode_value: ::dots_core::layout::opt_encode::<#inner_ty>,
             decode_value: ::dots_core::layout::opt_decode::<#inner_ty>,
             drop_in_place: ::dots_core::layout::opt_drop::<#inner_ty>,
+            clone_in_place: ::dots_core::layout::opt_clone::<#inner_ty>,
         };
     }
 }

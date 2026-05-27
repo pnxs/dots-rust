@@ -31,7 +31,7 @@ impl Stairwell {
                 Some(entry) => {
                     // `None` brightness reads as "0" per the model
                     // contract (invalid property == 0).
-                    if entry.value.brightness.unwrap_or(0) == 0 {
+                    if entry.brightness.unwrap_or(0) == 0 {
                         100
                     } else {
                         0

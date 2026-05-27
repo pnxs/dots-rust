@@ -8,7 +8,7 @@
 
 use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "OneKey")]
 struct OneKey {
     #[dots(tag = 1, key)]
@@ -17,7 +17,7 @@ struct OneKey {
     value: Option<u32>,
 }
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "TwoKeys")]
 struct TwoKeys {
     #[dots(tag = 1, key)]
@@ -28,7 +28,7 @@ struct TwoKeys {
     note: Option<String>,
 }
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Keyless")]
 struct Keyless {
     #[dots(tag = 1)]
@@ -69,7 +69,7 @@ fn multi_key_new_takes_positional_args_in_declaration_order() {
     assert_eq!(k.note, None);
 }
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Documented")]
 struct Documented {
     /// Stable client identifier (must be unique per region).

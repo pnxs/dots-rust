@@ -29,7 +29,7 @@ enum Severity {
     Error,
 }
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Address")]
 struct Address {
     #[dots(tag = 1)]
@@ -38,7 +38,7 @@ struct Address {
     number: Option<u32>,
 }
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "LogEntry", cached)]
 struct LogEntry {
     #[dots(tag = 1, key)]

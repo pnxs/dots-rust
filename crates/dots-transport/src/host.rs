@@ -26,8 +26,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::Mutex as AsyncMutex;
 
 use dots_core::{
-    DynamicFieldKind, DynamicStruct, DynamicStructDescriptor, PropertySet, Publishable,
-    StructValue, Transmittable, decode_typed_from_slice, dots,
+    AnyStruct, DynamicFieldKind, DynamicStruct, DynamicStructDescriptor, PropertySet,
+    Publishable, StructValue, Transmittable, decode_typed_from_slice, dots,
 };
 use dots_model::{
     DotsCacheInfo, DotsConnectionState, DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect,
@@ -634,12 +634,14 @@ struct FilteredSub {
     visible: HashSet<Vec<u8>>,
 }
 
-/// One cached instance held in the pool. The payload is stored as the
-/// dynamic struct that arrived on the wire; on replay we re-encode it
-/// with a fresh `header.from_cache` countdown.
+/// One cached instance held in the pool. The payload is stored in
+/// whichever decode form it arrived as ([`Payload::Typed`] when the
+/// broker has the static descriptor, [`Payload::Wire`] otherwise);
+/// on replay we re-encode it with a fresh `header.from_cache`
+/// countdown.
 #[derive(Clone)]
 struct CachedEntry {
-    payload: DynamicStruct,
+    payload: dots_model::Payload,
     /// Sender on the *first* publish for this key. Preserved across
     /// updates from other clients. Mirrors dots-cpp's
     /// `CloneInformation::createdFrom` — daemons rely on this to
@@ -849,10 +851,10 @@ impl HostTransceiver {
     /// — this is a belt-and-braces guard).
     pub fn cached_values<T>(&self) -> Vec<T>
     where
-        T: StructValue + Default,
+        T: StructValue + Default + Clone,
     {
         let type_name = T::type_descriptor().name;
-        let payloads: Vec<DynamicStruct> = {
+        let payloads: Vec<dots_model::Payload> = {
             let inner = self.inner.lock().expect("host mutex poisoned");
             inner
                 .pool
@@ -862,7 +864,14 @@ impl HostTransceiver {
         };
         payloads
             .into_iter()
-            .filter_map(|p| decode_typed_from_slice::<T>(&p.encode()).ok())
+            .filter_map(|p| match p {
+                // Typed: zero-cost cast through descriptor identity.
+                dots_model::Payload::Typed(a) => a.as_typed::<T>().cloned(),
+                // Wire: fall back to the CBOR roundtrip (rare — only
+                // for types the host has the dynamic descriptor for
+                // but no compiled-in `T`).
+                dots_model::Payload::Wire(d) => decode_typed_from_slice::<T>(&d.encode()).ok(),
+            })
             .collect()
     }
 
@@ -1061,9 +1070,9 @@ impl HostTransceiver {
     /// Synchronous: enqueues bytes to each subscriber's drainer
     /// task. The actual socket I/O happens asynchronously in those
     /// drainer tasks.
-    pub fn publish<P: Publishable>(&self, value: &P) {
-        let type_name = value.type_name().to_string();
-        let mask = value.valid_set();
+    pub fn publish<P: Publishable + StructValue>(&self, value: &P) {
+        let type_name = Transmittable::type_name(value).to_string();
+        let mask = StructValue::valid_set(value);
         let header = dots!(DotsHeader {
             type_name: type_name.clone(),
             attributes: mask,
@@ -1081,9 +1090,9 @@ impl HostTransceiver {
     /// [`GuestTransceiver::publish_with_mask`](crate::GuestTransceiver::publish_with_mask):
     /// only properties that are both set on `value` and present in
     /// `included | key_set(value)` are emitted.
-    pub fn publish_with_mask<P: Publishable>(&self, value: &P, included: PropertySet) {
-        let type_name = value.type_name().to_string();
-        let mask = (included | value.key_set()) & value.valid_set();
+    pub fn publish_with_mask<P: Publishable + StructValue>(&self, value: &P, included: PropertySet) {
+        let type_name = Transmittable::type_name(value).to_string();
+        let mask = (included | Transmittable::key_set(value)) & StructValue::valid_set(value);
         let header = dots!(DotsHeader {
             type_name: type_name.clone(),
             attributes: mask,
@@ -1101,9 +1110,9 @@ impl HostTransceiver {
     /// subscribed to the value's type-name group, with
     /// `header.remove_obj = true` and only key fields in the payload.
     /// Drops the entry from the host's cache pool.
-    pub fn remove<P: Publishable>(&self, value: &P) {
-        let type_name = value.type_name().to_string();
-        let mask = value.key_set();
+    pub fn remove<P: Publishable + StructValue>(&self, value: &P) {
+        let type_name = Transmittable::type_name(value).to_string();
+        let mask = Transmittable::key_set(value);
         let header = dots!(DotsHeader {
             type_name: type_name.clone(),
             attributes: mask,
@@ -1118,24 +1127,28 @@ impl HostTransceiver {
         self.cache_and_fan_out(&type_name, &header, Bytes::from(bytes), dyn_payload.as_ref(), HOST_ID);
     }
 
-    /// Round-trip a typed value through CBOR with the given mask to
-    /// build the matching `DynamicStruct`. Returns `None` for
-    /// unregistered types or when the decode fails (which it
-    /// shouldn't for descriptor-driven encodes — this is the
-    /// belt-and-braces guard).
-    fn payload_as_dynamic<T: Transmittable + ?Sized>(
+    /// Build the cache-side representation of a typed publish.
+    ///
+    /// Uses the registry's static descriptor (always present here —
+    /// the host's `publish<P: Publishable>` is bound by `P:
+    /// StructValue`, which means the descriptor was registered
+    /// statically). Cloning into an `AnyStruct` with the desired mask
+    /// avoids the CBOR encode-then-decode roundtrip the previous
+    /// `DynamicStruct`-only implementation used.
+    fn payload_as_dynamic<T: StructValue>(
         &self,
         type_name: &str,
         value: &T,
         mask: PropertySet,
-    ) -> Option<DynamicStruct> {
-        let Some(dots_model::DescriptorEntry::Struct(d)) = self.registry.lookup(type_name) else {
+    ) -> Option<dots_model::Payload> {
+        let stat = self.registry.lookup_static_struct(type_name)?;
+        // Sanity check: the value's own descriptor must match.
+        if !core::ptr::eq(stat, value.descriptor()) {
             return None;
-        };
-        let mut payload_bytes = Vec::with_capacity(64);
-        let mut enc = dots_core::minicbor::Encoder::new(&mut payload_bytes);
-        value.encode_into(mask, &mut enc).expect("encode infallible");
-        DynamicStruct::decode(d.clone(), &payload_bytes).ok()
+        }
+        Some(dots_model::Payload::Typed(AnyStruct::from_struct_value_with_mask(
+            value, mask,
+        )))
     }
 
     /// Enqueue `bytes` to every subscriber of `type_name` (excluding
@@ -1166,7 +1179,7 @@ impl HostTransceiver {
         type_name: &str,
         header: &DotsHeader,
         raw_frame: Bytes,
-        payload: Option<&DynamicStruct>,
+        payload: Option<&dots_model::Payload>,
         exclude_client_id: u32,
     ) {
         let mut inner = self.inner.lock().expect("host mutex poisoned");
@@ -1185,7 +1198,7 @@ impl HostTransceiver {
         // Pre-merge snapshot — only needed when at least one filtered
         // sub exists. For the all-unfiltered case the four-cases
         // branch is skipped entirely and we pay zero clone cost.
-        let pre_merge_payload: Option<DynamicStruct> = if is_cached && has_filtered_subs {
+        let pre_merge_payload: Option<dots_model::Payload> = if is_cached && has_filtered_subs {
             payload.and_then(|p| {
                 let key = p.key_bytes();
                 inner.pool.get(type_name).and_then(|m| m.get(&key)).map(|e| e.payload.clone())
@@ -1259,7 +1272,7 @@ impl HostTransceiver {
                 let was_visible = key_bytes_pre
                     .as_ref()
                     .is_some_and(|k| sub.visible.contains(k));
-                let now_matches = !is_remove && sub.compiled.matches(post);
+                let now_matches = !is_remove && matches_payload(&sub.compiled, post);
 
                 match (now_matches, was_visible) {
                     (true, _) => {
@@ -1378,7 +1391,7 @@ impl HostTransceiver {
         // Snapshot the cache contents and the guest's writer handle
         // under the std::Mutex, then drop the lock before any await.
         let writer: Option<SharedWriter>;
-        let entries: Vec<(DotsHeader, DynamicStruct)>;
+        let entries: Vec<(DotsHeader, dots_model::Payload)>;
         let cached_type: bool;
         {
             let inner = self.inner.lock().expect("host mutex poisoned");
@@ -1538,13 +1551,13 @@ impl HostTransceiver {
         // Snapshot matching cache entries (two-pass so the
         // `from_cache` countdown is accurate). Also grab the
         // guest's writer.
-        let (writer, matches): (Option<SharedWriter>, Vec<(DotsHeader, DynamicStruct, Vec<u8>)>) = {
+        let (writer, matches): (Option<SharedWriter>, Vec<(DotsHeader, dots_model::Payload, Vec<u8>)>) = {
             let inner = self.inner.lock().expect("host mutex poisoned");
             let writer = inner.guests.get(&client_id).map(|r| r.write_half.clone());
             let mut out = Vec::new();
             if let Some(map) = inner.pool.get(group_name) {
                 for (k, e) in map.iter() {
-                    if sub.compiled.matches(&e.payload) {
+                    if matches_payload(&sub.compiled, &e.payload) {
                         let attrs = e.attributes;
                         let effective = (project | key_set) & attrs;
                         let header = dots!(DotsHeader {
@@ -1993,9 +2006,9 @@ fn handle_connected_message(
             .get(type_name)
             .is_some_and(|g| !g.filtered_subs.is_empty())
     };
-    let dyn_payload = if needs_dynamic {
+    let dyn_payload: Option<dots_model::Payload> = if needs_dynamic {
         match (&descriptor, DynamicStruct::decode(descriptor.clone().unwrap_or_else(|| panic!("descriptor present")), &raw.payload)) {
-            (Some(_), Ok(p)) => Some(p),
+            (Some(_), Ok(p)) => Some(dots_model::Payload::Wire(p)),
             (Some(_), Err(e)) => {
                 tracing::warn!(
                     client_id,
@@ -2285,6 +2298,25 @@ fn register_incoming_struct(host: &Arc<HostTransceiver>, raw: &RawTransmission) 
             host.registry.register_struct_dynamic(Arc::new(d));
         }
         Err(e) => tracing::warn!(error = %e, "failed to build dynamic struct from descriptor"),
+    }
+}
+
+/// Evaluate a compiled predicate against a payload.
+///
+/// The filter's predicate engine walks `DynamicStruct::properties`
+/// (its tagged-union value list) directly, so wire-only payloads
+/// match natively. Typed payloads land here only in test or
+/// future-typed-broker setups — for the current broker route, the
+/// receive path always builds [`dots_model::Payload::Wire`] before
+/// calling the filter. Typed payloads conservatively return `false`
+/// so an accidental Typed entry doesn't silently bypass filtering.
+fn matches_payload(
+    pred: &crate::filter::CompiledPredicate,
+    payload: &dots_model::Payload,
+) -> bool {
+    match payload {
+        dots_model::Payload::Wire(d) => pred.matches(d),
+        dots_model::Payload::Typed(_) => false,
     }
 }
 

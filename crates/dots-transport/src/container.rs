@@ -3,13 +3,19 @@
 //! Mirrors dots-cpp's `Container<type::Struct>` + `Container<T>` split:
 //!
 //! - [`DynContainer`] is the actual storage. It holds
-//!   `BTreeMap<key_bytes, DynContainerEntry>` where each entry is a
-//!   [`DynamicStruct`] (the runtime-described, type-erased payload)
-//!   plus [`CloneInfo`]. The dispatcher inserts incoming transmissions
-//!   here knowing only the descriptor — no compile-time `T`.
+//!   `BTreeMap<key_bytes, DynContainerEntry>` where each entry is an
+//!   [`AnyStruct`] (a heap allocation laid out exactly like the typed
+//!   `T` would be) plus [`CloneInfo`]. The dispatcher inserts incoming
+//!   transmissions here knowing only the descriptor — no compile-time
+//!   `T`.
 //! - [`Container<T>`] is a thin handle: `Arc<DynContainer>` +
-//!   `PhantomData<T>`. Typed reads (`snapshot`, `get`, `with_entries`)
-//!   decode the stored `DynamicStruct` into `T` on access.
+//!   `PhantomData<T>`. Typed reads borrow `&T` directly out of the
+//!   stored `AnyStruct`s via a descriptor-identity-checked pointer
+//!   cast — no CBOR roundtrip. The borrowed accessors are
+//!   [`get`](Container::get) (single entry, returns a guard-backed
+//!   [`ContainerRef`]) and [`for_each`](Container::for_each)
+//!   (iterate while the lock is held). [`snapshot`](Container::snapshot)
+//!   stays as the explicit owned-`Vec` path.
 //!
 //! The split lets [`crate::GuestTransceiver`] pre-create empty
 //! containers for every entry in `SUBSCRIBED_TYPES` during the
@@ -25,12 +31,10 @@
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex, Weak};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use dots_core::{
-    DynamicStruct, DynamicStructDescriptor, StructValue, Timepoint, decode_typed_from_slice,
-    encode_key_bytes,
-};
+use dots_core::{AnyStruct, StructDescriptor, StructValue, Timepoint, encode_key_bytes};
 use dots_model::Transmission;
 
 use crate::connection::{DispatchEntry, DispatchState, GroupLeaver};
@@ -60,23 +64,29 @@ pub enum Operation {
 
 /// Type-erased entry as held in [`DynContainer`]'s storage.
 ///
-/// The value is a [`DynamicStruct`] (runtime-described). Typed views
-/// decode it to `T` on access via
-/// [`Container<T>::snapshot`] / [`get`](Container::get) /
-/// [`with_entries`](Container::with_entries).
-#[derive(Debug, Clone)]
+/// The value is an [`AnyStruct`] — a heap allocation whose layout
+/// matches the typed `T` exactly. Typed views borrow `&T` directly
+/// via [`AnyStruct::as_typed`].
+#[derive(Clone)]
 pub struct DynContainerEntry {
-    pub value: DynamicStruct,
+    pub value: AnyStruct,
     pub clone_info: CloneInfo,
+}
+
+impl core::fmt::Debug for DynContainerEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DynContainerEntry")
+            .field("type", &self.value.descriptor().name)
+            .field("clone_info", &self.clone_info)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One decoded entry from a [`Container<T>`].
 ///
 /// Returned by [`Container<T>::snapshot`] / [`get`](Container::get)
 /// and as the values in the map passed to
-/// [`with_entries`](Container::with_entries). Each is produced by
-/// decoding the corresponding [`DynContainerEntry::value`]
-/// (a [`DynamicStruct`]) into `T`.
+/// [`with_entries`](Container::with_entries).
 #[derive(Debug, Clone)]
 pub struct ContainerEntry<T> {
     pub value: T,
@@ -93,7 +103,7 @@ type Entries = BTreeMap<Vec<u8>, DynContainerEntry>;
 /// dispatcher inserts incoming transmissions by looking up the
 /// type name in the pool and applying the update directly here.
 pub struct DynContainer {
-    descriptor: Arc<DynamicStructDescriptor>,
+    descriptor: &'static StructDescriptor,
     entries: Mutex<Entries>,
     /// Optional RAII leaver — publishes `DotsMember(Leave)` when this
     /// container drops. `Some` only for the
@@ -105,7 +115,7 @@ pub struct DynContainer {
 
 impl DynContainer {
     /// Construct an empty container for the given descriptor.
-    pub(crate) fn new(descriptor: Arc<DynamicStructDescriptor>, leaver: Option<GroupLeaver>) -> Self {
+    pub(crate) fn new(descriptor: &'static StructDescriptor, leaver: Option<GroupLeaver>) -> Self {
         Self {
             descriptor,
             entries: Mutex::new(BTreeMap::new()),
@@ -114,8 +124,8 @@ impl DynContainer {
     }
 
     /// The descriptor this container holds instances of.
-    pub fn descriptor(&self) -> &Arc<DynamicStructDescriptor> {
-        &self.descriptor
+    pub fn descriptor(&self) -> &'static StructDescriptor {
+        self.descriptor
     }
 
     /// Number of stored entries.
@@ -143,16 +153,37 @@ impl DynContainer {
     }
 
     /// Apply an incoming transmission to this container. The
-    /// payload's `DynamicStruct` is stored verbatim; key bytes for
-    /// indexing come from
-    /// [`DynamicStruct::key_bytes`](dots_core::DynamicStruct::key_bytes).
+    /// payload's [`AnyStruct`] is stored verbatim (cloned out of the
+    /// transmission); key bytes for indexing come from
+    /// [`encode_key_bytes`] over the same buffer.
     ///
     /// `remove_obj == Some(true)` headers extract the keyed entry;
     /// otherwise the entry is inserted-or-updated with refreshed
     /// `CloneInfo`. Matches the C++ `Container<>::insert` / `remove`
     /// semantics.
+    ///
+    /// Wire-only payloads ([`dots_model::Payload::Wire`]) are silently
+    /// dropped: typed containers exist only for types whose static
+    /// descriptor is known, so a Wire payload here would mean the
+    /// receiver subscribed to a dynamic type whose container was
+    /// somehow opened — not a supported path.
     pub(crate) fn apply(&self, txn: &Transmission) {
-        let key = txn.payload.key_bytes();
+        let dots_model::Payload::Typed(value) = &txn.payload else {
+            tracing::warn!(
+                type_name = txn.header.type_name.as_deref().unwrap_or("?"),
+                "DynContainer dropped a Wire payload (no static descriptor)"
+            );
+            return;
+        };
+        if !core::ptr::eq(value.descriptor(), self.descriptor) {
+            tracing::warn!(
+                container = self.descriptor.name,
+                payload = value.descriptor().name,
+                "DynContainer received payload for unexpected type"
+            );
+            return;
+        }
+        let key = encode_key_bytes(value);
         let mut entries = self.entries.lock().expect("container mutex poisoned");
 
         if txn.header.remove_obj == Some(true) {
@@ -173,7 +204,7 @@ impl DynContainer {
         entries.insert(
             key,
             DynContainerEntry {
-                value: txn.payload.clone(),
+                value: value.clone(),
                 clone_info: CloneInfo {
                     last_operation: operation,
                     last_update_time: now_time,
@@ -241,8 +272,88 @@ impl<T> Container<T>
 where
     T: StructValue + Default + Send + Clone + 'static,
 {
-    /// Owned snapshot of all current entries, each decoded to `T`.
-    /// Entries whose payload fails to decode are silently skipped.
+    /// Lock the container for batched read access. Returns a
+    /// [`ContainerReadGuard`] whose drop releases the lock — iterate
+    /// or look up via the guard's methods, then drop it.
+    ///
+    /// Prefer this over [`for_each`](Self::for_each) when you want
+    /// `break` / `?` semantics, or over [`get`](Self::get) when you
+    /// need several lookups under the same lock.
+    pub fn lock(&self) -> ContainerReadGuard<'_, T> {
+        ContainerReadGuard {
+            guard: self
+                .inner
+                .entries
+                .lock()
+                .expect("container mutex poisoned"),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Look up the entry whose key matches that of `query`. Only the
+    /// `#[dots(key)]` properties of `query` are used; other fields are
+    /// ignored.
+    ///
+    /// Returns a [`ContainerRef`] holding the container's read lock
+    /// for as long as the borrow is alive — the caller observes `&T`
+    /// directly out of the stored buffer (no clone). Clone the
+    /// specific fields you need, or `(*entry).clone()` for the whole
+    /// value, then drop the ref to release the lock.
+    pub fn get<'a>(&'a self, query: &T) -> Option<ContainerRef<'a, T>> {
+        let key = encode_key_bytes(query);
+        let entries = self
+            .inner
+            .entries
+            .lock()
+            .expect("container mutex poisoned");
+        let entry = entries.get(&key)?;
+        // SAFETY: while `entries` (the guard) is held, the BTreeMap's
+        // entries (and therefore the AnyStruct buffer at this key)
+        // are stable. The `&T` reflects the buffer's contents; the
+        // pointer remains valid for the guard's lifetime.
+        let value: &T = entry
+            .value
+            .as_typed::<T>()
+            .expect("container stored value descriptor must match T");
+        let value_ptr: *const T = value;
+        let clone_info_ptr: *const CloneInfo = &entry.clone_info;
+        Some(ContainerRef {
+            value: value_ptr,
+            clone_info: clone_info_ptr,
+            _guard: entries,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Iterate every stored entry while holding the container's read
+    /// lock. The closure receives `(key_bytes, &T, &CloneInfo)` — all
+    /// borrowed, no clones. Returning from the closure releases the
+    /// lock.
+    ///
+    /// Use [`snapshot`](Self::snapshot) instead if you need to drop
+    /// the lock before processing the entries.
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&[u8], &T, &CloneInfo),
+    {
+        let entries = self
+            .inner
+            .entries
+            .lock()
+            .expect("container mutex poisoned");
+        for (k, entry) in entries.iter() {
+            let value: &T = entry
+                .value
+                .as_typed::<T>()
+                .expect("container stored value descriptor must match T");
+            f(k.as_slice(), value, &entry.clone_info);
+        }
+    }
+
+    /// Owned snapshot of all current entries, each cloned out of the
+    /// stored `AnyStruct` via a pointer cast. Drops the lock before
+    /// returning — useful when the caller wants to process entries
+    /// without blocking the dispatch path.
     pub fn snapshot(&self) -> Vec<ContainerEntry<T>> {
         let entries = self
             .inner
@@ -251,58 +362,151 @@ where
             .expect("container mutex poisoned");
         entries
             .values()
-            .filter_map(|entry| decode_entry::<T>(entry))
+            .map(|entry| {
+                let value: &T = entry
+                    .value
+                    .as_typed::<T>()
+                    .expect("container stored value descriptor must match T");
+                ContainerEntry {
+                    value: value.clone(),
+                    clone_info: entry.clone_info.clone(),
+                }
+            })
             .collect()
-    }
-
-    /// Look up the entry whose key matches that of `query`. Only the
-    /// `#[dots(key)]` properties of `query` are used; other fields are
-    /// ignored. Returns a clone of the stored entry with the value
-    /// decoded to `T`.
-    pub fn get(&self, query: &T) -> Option<ContainerEntry<T>> {
-        let key = encode_key_bytes(query);
-        let entries = self
-            .inner
-            .entries
-            .lock()
-            .expect("container mutex poisoned");
-        let entry = entries.get(&key)?;
-        decode_entry::<T>(entry)
-    }
-
-    /// Run a closure over a typed map of the current entries while
-    /// holding the container's read lock. Decodes every stored
-    /// [`DynamicStruct`] into `T` to build the temporary typed map
-    /// — handy for adhoc inspection without materializing a full
-    /// owned `Vec` snapshot, but O(n) decode per call.
-    pub fn with_entries<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&BTreeMap<Vec<u8>, ContainerEntry<T>>) -> R,
-    {
-        let entries = self
-            .inner
-            .entries
-            .lock()
-            .expect("container mutex poisoned");
-        let typed: BTreeMap<Vec<u8>, ContainerEntry<T>> = entries
-            .iter()
-            .filter_map(|(k, entry)| decode_entry::<T>(entry).map(|e| (k.clone(), e)))
-            .collect();
-        f(&typed)
     }
 }
 
-/// Decode a stored type-erased entry into a typed view.
-fn decode_entry<T>(entry: &DynContainerEntry) -> Option<ContainerEntry<T>>
+/// Borrowed view into a single container entry.
+///
+/// Holds the container's mutex guard so the underlying buffer can't
+/// be mutated or dropped while the borrow is alive. Drops the lock
+/// when it goes out of scope. Implements [`Deref`] to `&T` so field
+/// access reads like `entry.field` — clone the value (or only the
+/// fields you need) before dropping the ref if you want to own
+/// anything past the borrow.
+pub struct ContainerRef<'a, T> {
+    /// Pointer into the BTreeMap entry's `AnyStruct` buffer. Valid
+    /// for the lifetime of `_guard` (the mutex pins the entry).
+    value: *const T,
+    /// Pointer to the `CloneInfo` sitting next to `value` in the
+    /// same `DynContainerEntry`.
+    clone_info: *const CloneInfo,
+    /// Guard listed last so it drops *after* the raw-pointer fields
+    /// (the fields themselves have no Drop, but order encodes intent
+    /// — pointers should never outlive the guard).
+    _guard: MutexGuard<'a, Entries>,
+    /// Encodes the `'a` lifetime + `T` covariance so the borrow
+    /// checker treats `&self -> &T` correctly.
+    _phantom: PhantomData<&'a T>,
+}
+
+impl<T> ContainerRef<'_, T> {
+    /// Metadata recorded by the container when this entry was last
+    /// inserted or updated.
+    pub fn clone_info(&self) -> &CloneInfo {
+        // SAFETY: pointer was taken from a `&CloneInfo` borrowed
+        // through the still-held mutex guard, so the pointee is
+        // valid for `&self`'s lifetime.
+        #[allow(unsafe_code)]
+        unsafe {
+            &*self.clone_info
+        }
+    }
+}
+
+impl<T> Deref for ContainerRef<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: same reasoning as `clone_info` — pointer is into
+        // an `AnyStruct` buffer that the mutex guard pins.
+        #[allow(unsafe_code)]
+        unsafe {
+            &*self.value
+        }
+    }
+}
+
+/// Read guard returned by [`Container::lock`].
+///
+/// Holds the container's mutex for the guard's lifetime — iterate or
+/// look up via its methods, then drop the guard to release the lock.
+/// Dispatch updates to this container block while the guard is alive.
+pub struct ContainerReadGuard<'a, T> {
+    guard: MutexGuard<'a, Entries>,
+    _phantom: PhantomData<fn() -> T>,
+}
+
+impl<T> ContainerReadGuard<'_, T>
 where
-    T: StructValue + Default + Send + 'static,
+    T: StructValue + 'static,
 {
-    let bytes = entry.value.encode();
-    let value: T = decode_typed_from_slice(&bytes).ok()?;
-    Some(ContainerEntry {
-        value,
-        clone_info: entry.clone_info.clone(),
-    })
+    /// Borrowed iterator over `(key_bytes, &T, &CloneInfo)` tuples.
+    /// No allocation, no clone — values are read directly from the
+    /// stored `AnyStruct` buffers.
+    pub fn iter(&self) -> ContainerIter<'_, T> {
+        ContainerIter {
+            inner: self.guard.iter(),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Number of entries currently held.
+    pub fn len(&self) -> usize {
+        self.guard.len()
+    }
+
+    /// `true` if no entries are held.
+    pub fn is_empty(&self) -> bool {
+        self.guard.is_empty()
+    }
+
+    /// Look up the entry whose key matches `query` (only `#[dots(key)]`
+    /// properties matter). Cheaper than [`Container::get`] when you
+    /// already hold the guard — no second mutex lock.
+    pub fn get(&self, query: &T) -> Option<(&T, &CloneInfo)> {
+        let key = encode_key_bytes(query);
+        let entry = self.guard.get(&key)?;
+        let value: &T = entry
+            .value
+            .as_typed::<T>()
+            .expect("container stored value descriptor must match T");
+        Some((value, &entry.clone_info))
+    }
+}
+
+impl<'iter, 'guard, T> IntoIterator for &'iter ContainerReadGuard<'guard, T>
+where
+    T: StructValue + 'static,
+{
+    type Item = (&'iter [u8], &'iter T, &'iter CloneInfo);
+    type IntoIter = ContainerIter<'iter, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Borrowed iterator produced by [`ContainerReadGuard::iter`].
+pub struct ContainerIter<'a, T> {
+    inner: std::collections::btree_map::Iter<'a, Vec<u8>, DynContainerEntry>,
+    _phantom: PhantomData<fn() -> T>,
+}
+
+impl<'a, T> Iterator for ContainerIter<'a, T>
+where
+    T: StructValue + 'static,
+{
+    type Item = (&'a [u8], &'a T, &'a CloneInfo);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (k, entry) = self.inner.next()?;
+        let value: &T = entry
+            .value
+            .as_typed::<T>()
+            .expect("container stored value descriptor must match T");
+        Some((k.as_slice(), value, &entry.clone_info))
+    }
 }
 
 // ===== Container construction =====
@@ -319,18 +523,18 @@ where
 /// are constructed via [`crate::Connection::container`] or by
 /// [`crate::View`].
 pub(crate) fn make_dyn_container(
-    descriptor: Arc<DynamicStructDescriptor>,
+    descriptor: &'static StructDescriptor,
     dispatch: &Arc<Mutex<DispatchState>>,
     leaver: Option<GroupLeaver>,
 ) -> Arc<DynContainer> {
-    let container = Arc::new(DynContainer::new(descriptor.clone(), leaver));
+    let container = Arc::new(DynContainer::new(descriptor, leaver));
     let entry = DynContainerDispatchEntry {
         container: Arc::downgrade(&container),
     };
     dispatch
         .lock()
         .expect("dispatch mutex poisoned")
-        .register(descriptor.name.clone(), Box::new(entry));
+        .register(descriptor.name.into(), Box::new(entry));
     container
 }
 
@@ -348,9 +552,7 @@ pub(crate) fn make_container<T>(
 where
     T: StructValue + Default + Send + 'static,
 {
-    let descriptor =
-        Arc::new(DynamicStructDescriptor::from_static(T::type_descriptor()));
-    let inner = make_dyn_container(descriptor, dispatch, leaver);
+    let inner = make_dyn_container(T::type_descriptor(), dispatch, leaver);
     Container::from_dyn(inner)
 }
 

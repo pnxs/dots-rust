@@ -325,6 +325,28 @@ impl DynamicStruct {
         buf
     }
 
+    /// Project any `&dyn StructValue` (typed or `AnyStruct`) into a
+    /// `DynamicStruct` — useful for the dynamic-subscriber path where
+    /// the receiver wants the runtime-shaped view even though the
+    /// wire-decode may have produced a layout-compatible
+    /// [`crate::AnyStruct`].
+    ///
+    /// Goes through the descriptor-driven CBOR encode/decode pipeline
+    /// because the wire-only representation has no shared bits with
+    /// the typed layout — the tagged union must be rebuilt
+    /// field-by-field. The cost is one CBOR encode + decode, which is
+    /// the same overhead the receiver was already paying before the
+    /// `Payload::Typed` optimization; this path is intentionally only
+    /// used by the dynamic-subscriber shim, not by typed containers.
+    pub fn from_struct_value(value: &dyn crate::StructValue) -> Self {
+        let descriptor = Arc::new(DynamicStructDescriptor::from_static(value.descriptor()));
+        let bytes = crate::layout::encode_to_vec(value);
+        Self::decode(descriptor, &bytes).expect(
+            "descriptor-driven encode + decode roundtrip must succeed: \
+             same descriptor on both sides",
+        )
+    }
+
     /// Borrow this value as a [`Publishable`].
     ///
     /// Runtime-checks the descriptor's `substruct_only` flag — this is

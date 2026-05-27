@@ -11,14 +11,14 @@ use dots_model::{
     StructDescriptorData, StructPropertyData,
 };
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Inner")]
 struct Inner {
     #[dots(tag = 1)]
     label: Option<String>,
 }
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Sample", cached, persistent)]
 struct Sample {
     #[dots(tag = 1, key)]

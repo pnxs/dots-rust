@@ -11,7 +11,7 @@ use std::sync::Arc;
 use dots_core::{DynamicStruct, DynamicStructDescriptor, DynamicValue, encode_to_vec};
 use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Pin")]
 struct Pin {
     #[dots(tag = 1)]
@@ -20,7 +20,7 @@ struct Pin {
     weight: Option<u32>,
 }
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Wire")]
 struct Wire {
     #[dots(tag = 1, key)]

@@ -20,7 +20,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use dots_core::{StructValue, decode_typed_from_slice, dots, encode_key_bytes};
+use dots_core::{StructValue, dots, encode_key_bytes};
 use dots_model::{DotsHeader, Transmission, filter::DotsFilter};
 
 use crate::connection::ViewDispatch;
@@ -132,15 +132,14 @@ where
     T: StructValue + Default + Send + Clone + 'static,
 {
     /// Look up the cached value for `key_bytes`, returning a clone
-    /// of the entry's value (decoded from the stored
-    /// [`dots_core::DynamicStruct`]) if present.
+    /// of the entry's value (borrowed `&T` out of the stored
+    /// [`dots_core::AnyStruct`] via a descriptor-identity cast).
     fn cached_value(&self, key_bytes: &[u8]) -> Option<T> {
         self.container
             .as_dyn()
             .with_entries_dyn(|entries| {
                 let entry = entries.get(key_bytes)?;
-                let bytes = entry.value.encode();
-                decode_typed_from_slice::<T>(&bytes).ok()
+                entry.value.as_typed::<T>().cloned()
             })
     }
 }
@@ -150,14 +149,18 @@ where
     T: StructValue + Default + Send + Clone + 'static,
 {
     fn dispatch(&self, txn: &Transmission) {
-        // Decode into the typed T. If the payload doesn't decode
-        // cleanly we drop the event silently — this matches the
-        // unfiltered subscription path's tolerance for partial /
+        // Borrow `&T` straight out of the payload's `AnyStruct`. If
+        // the payload is Wire (no static descriptor) or the
+        // descriptor identity doesn't match `T`, drop the event —
+        // matches the unfiltered subscription path's tolerance for
         // unfamiliar payloads.
-        let bytes = txn.payload.encode();
-        let Ok(decoded) = decode_typed_from_slice::<T>(&bytes) else {
+        let dots_model::Payload::Typed(any) = &txn.payload else {
             return;
         };
+        let Some(typed) = any.as_typed::<T>() else {
+            return;
+        };
+        let decoded: T = typed.clone();
 
         // Classify the transition by consulting the pre-update
         // container state for this key. Mirrors C++ `Event<T>::mt()`

@@ -25,6 +25,7 @@
 
 #![allow(unsafe_code)]
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::any::Any;
@@ -75,12 +76,22 @@ impl AnyStruct {
         descriptor: &'static StructDescriptor,
         bytes: &[u8],
     ) -> Result<Self, DecodeError> {
-        let mut out = Self::new(descriptor);
         let mut decoder = minicbor::Decoder::new(bytes);
+        Self::decode_from_decoder(descriptor, &mut decoder)
+    }
+
+    /// Decode an `AnyStruct` from an active decoder, advancing it past
+    /// the consumed CBOR map. Used by the framing layer to decode the
+    /// payload while sharing the decoder with the header pass.
+    pub fn decode_from_decoder(
+        descriptor: &'static StructDescriptor,
+        decoder: &mut CborDecoder<'_>,
+    ) -> Result<Self, DecodeError> {
+        let mut out = Self::new(descriptor);
         // SAFETY: `out.data` was allocated for `descriptor.layout()` and
         // zero-initialized; per-property writes go through typed thunks.
         unsafe {
-            decode_into_raw(descriptor, out.data.as_ptr(), &mut out.valid, &mut decoder)?;
+            decode_into_raw(descriptor, out.data.as_ptr(), &mut out.valid, decoder)?;
         }
         Ok(out)
     }
@@ -98,6 +109,117 @@ impl AnyStruct {
     /// equivalent typed struct.
     pub fn data_ptr(&self) -> *const u8 {
         self.data.as_ptr()
+    }
+
+    /// Borrow the layout-compatible buffer as a typed `&T`. Returns
+    /// `None` if `T`'s descriptor is not the same `&'static
+    /// StructDescriptor` this `AnyStruct` was allocated for.
+    ///
+    /// The identity check is `core::ptr::eq` — sound because
+    /// `#[derive(DotsStruct)]` emits a single `'static` descriptor per
+    /// type, so any two `AnyStruct`s built for `T` carry the same
+    /// pointer.
+    pub fn as_typed<T: StructValue>(&self) -> Option<&T> {
+        if core::ptr::eq(self.descriptor, T::type_descriptor()) {
+            // SAFETY: descriptor identity guarantees the buffer was
+            // allocated with `T`'s layout and initialized through `T`'s
+            // property thunks. A `&T` over the same memory is sound.
+            Some(unsafe { &*(self.data.as_ptr() as *const T) })
+        } else {
+            None
+        }
+    }
+
+    /// Move the layout-compatible buffer into a typed `Box<T>`,
+    /// consuming this `AnyStruct` without running its destructor.
+    /// Returns `Err(self)` on a descriptor mismatch so the caller can
+    /// recover the value.
+    pub fn into_typed<T: StructValue>(self) -> Result<Box<T>, Self> {
+        if !core::ptr::eq(self.descriptor, T::type_descriptor()) {
+            return Err(self);
+        }
+        let ptr = self.data.as_ptr() as *mut T;
+        // Don't run Drop — the allocation now belongs to the Box.
+        // `T`'s own Drop will run when the Box is dropped, and the
+        // global allocator will free `descriptor.layout()` (== T's
+        // layout) at that time.
+        core::mem::forget(self);
+        // SAFETY: descriptor identity guarantees `T`'s layout matches;
+        // the buffer was allocated through the global allocator with
+        // that layout; ownership transfers to the Box.
+        Ok(unsafe { Box::from_raw(ptr) })
+    }
+
+    /// Mutable typed view, same identity check as [`as_typed`].
+    pub fn as_typed_mut<T: StructValue>(&mut self) -> Option<&mut T> {
+        if core::ptr::eq(self.descriptor, T::type_descriptor()) {
+            // SAFETY: see `as_typed`.
+            Some(unsafe { &mut *(self.data.as_ptr() as *mut T) })
+        } else {
+            None
+        }
+    }
+
+    /// Build an `AnyStruct` by cloning the contents of any
+    /// `&dyn StructValue`. Used to materialise an owning, type-erased
+    /// copy from a borrowed typed value (e.g. `&Foo`).
+    pub fn from_struct_value(value: &dyn StructValue) -> Self {
+        Self::from_struct_value_with_mask(value, PropertySet::from_bits(u32::MAX))
+    }
+
+    /// Build an `AnyStruct` by cloning only the properties whose tag
+    /// is set in `mask`. Properties outside the mask are left `None`
+    /// (zero bit-pattern, set by `Self::new`).
+    ///
+    /// Used by the broker's publish-with-mask path to materialise a
+    /// payload that the cache and re-fanout layers can hand around
+    /// without re-encoding the unmasked properties on every replay.
+    pub fn from_struct_value_with_mask(value: &dyn StructValue, mask: PropertySet) -> Self {
+        let descriptor = value.descriptor();
+        let mut out = Self::new(descriptor);
+        let effective = value.valid_set() & mask;
+        // SAFETY: `value.data_ptr()` is valid for `&value`'s lifetime;
+        // `out.data` was allocated for `descriptor.layout()` and starts
+        // zero-initialized (`None` for every property). Per-property
+        // clone_in_place reads through the typed thunks.
+        unsafe {
+            for prop in descriptor.properties {
+                if !effective.has(prop.tag) {
+                    continue;
+                }
+                (prop.vtable.clone_in_place)(
+                    value.data_ptr().add(prop.offset),
+                    out.data.as_ptr().add(prop.offset),
+                );
+            }
+        }
+        out.valid = effective;
+        out
+    }
+}
+
+impl core::fmt::Debug for AnyStruct {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AnyStruct")
+            .field("type", &self.descriptor.name)
+            .field("valid", &self.valid)
+            .finish_non_exhaustive()
+    }
+}
+
+// SAFETY: `AnyStruct` owns its allocation; every property type the
+// derive macro supports is `Send` (primitives, `String`, `Vec`, nested
+// `AnyStruct`-derived structs which are themselves built from `Send`
+// fields). The descriptor pointer is `&'static` and thus `Send`.
+unsafe impl Send for AnyStruct {}
+
+// SAFETY: `AnyStruct` only exposes `&self` access to its buffer and
+// holds no interior mutability. Same reasoning as `Send`.
+unsafe impl Sync for AnyStruct {}
+
+impl Clone for AnyStruct {
+    fn clone(&self) -> Self {
+        Self::from_struct_value(self)
     }
 }
 
@@ -598,6 +720,42 @@ pub unsafe fn opt_drop<T>(ptr: *mut u8) {
     // SAFETY: caller-upheld.
     unsafe {
         core::ptr::drop_in_place(ptr as *mut Option<T>);
+    }
+}
+
+/// Clone the `Option<T>` at `src` into `dst`, dropping any existing
+/// value at `dst` first.
+///
+/// # Safety
+///
+/// `src` and `dst` must each point to a valid `Option<T>` (zero-init
+/// counts as `None`).
+pub unsafe fn opt_clone<T: Clone>(src: *const u8, dst: *mut u8) {
+    // SAFETY: caller-upheld.
+    let src_opt = unsafe { &*(src as *const Option<T>) };
+    let cloned: Option<T> = src_opt.clone();
+    let dst_opt = dst as *mut Option<T>;
+    unsafe {
+        core::ptr::drop_in_place(dst_opt);
+        core::ptr::write(dst_opt, cloned);
+    }
+}
+
+/// Clone the `Option<Vec<T>>` at `src` into `dst`. Same shape as
+/// [`opt_clone`] but routed via the `Vec` family so the derive macro
+/// can pick a `Vec`-specific clone without a `DotsField` bound.
+///
+/// # Safety
+///
+/// `src` and `dst` must point to valid `Option<Vec<T>>`.
+pub unsafe fn opt_clone_vec<T: Clone>(src: *const u8, dst: *mut u8) {
+    // SAFETY: caller-upheld.
+    let src_opt = unsafe { &*(src as *const Option<Vec<T>>) };
+    let cloned: Option<Vec<T>> = src_opt.clone();
+    let dst_opt = dst as *mut Option<Vec<T>>;
+    unsafe {
+        core::ptr::drop_in_place(dst_opt);
+        core::ptr::write(dst_opt, cloned);
     }
 }
 

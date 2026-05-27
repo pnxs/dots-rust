@@ -517,12 +517,13 @@ fn snapshot_rows(
     stats: &Container<DotsClientStatistics>,
     rates: &mut RateTracker,
 ) -> Vec<RowData> {
-    let clients_snap: Vec<DotsClient> =
-        clients.with_entries(|m| m.values().map(|e| e.value.clone()).collect());
-    let stats_snap: HashMap<u32, DotsClientStatistics> = stats.with_entries(|m| {
-        m.values()
-            .filter_map(|e| e.value.client_id.map(|id| (id, e.value.clone())))
-            .collect()
+    let mut clients_snap: Vec<DotsClient> = Vec::new();
+    clients.for_each(|_, c, _| clients_snap.push(c.clone()));
+    let mut stats_snap: HashMap<u32, DotsClientStatistics> = HashMap::new();
+    stats.for_each(|_, s, _| {
+        if let Some(id) = s.client_id {
+            stats_snap.insert(id, s.clone());
+        }
     });
 
     let mut alive: HashSet<u32> = HashSet::with_capacity(clients_snap.len());

@@ -10,7 +10,7 @@
 use dots_core::{FieldKind, decode_typed_from_slice, encode_to_vec};
 use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Token")]
 struct Token {
     #[dots(tag = 1, key)]

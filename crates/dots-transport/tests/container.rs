@@ -41,7 +41,7 @@ fn dynamic_for(reg: &Registry, type_name: &str, payload: &dyn StructValue) -> Tr
     };
     let bytes = encode_to_vec(payload);
     let payload = dots_core::DynamicStruct::decode(descriptor, &bytes).unwrap();
-    Transmission { header, payload }
+    Transmission { header, payload: dots_model::Payload::Wire(payload) }
 }
 
 async fn run_no_preload_handshake(
@@ -149,13 +149,14 @@ async fn container_create_then_update_preserves_created_metadata() {
         id: 7_u32,
     });
     let entry = pingers.get(&query).expect("entry exists");
-    assert_eq!(entry.value.message.as_deref(), Some("second"));
-    assert_eq!(entry.clone_info.last_operation, Operation::Update);
-    assert_eq!(entry.clone_info.last_update_sender, Some(22));
-    assert_eq!(entry.clone_info.last_update_time, Some(Timepoint(200.0)));
+    assert_eq!(entry.message.as_deref(), Some("second"));
+    let ci = entry.clone_info();
+    assert_eq!(ci.last_operation, Operation::Update);
+    assert_eq!(ci.last_update_sender, Some(22));
+    assert_eq!(ci.last_update_time, Some(Timepoint(200.0)));
     // created_* preserved from the first publish.
-    assert_eq!(entry.clone_info.created_sender, Some(11));
-    assert_eq!(entry.clone_info.created_time, Some(Timepoint(100.0)));
+    assert_eq!(ci.created_sender, Some(11));
+    assert_eq!(ci.created_time, Some(Timepoint(100.0)));
 
     drop(conn);
     server.await.unwrap();
@@ -235,7 +236,7 @@ async fn container_indexes_by_key_only() {
             sequence: 99999_u64,
         }))
         .expect("found by id");
-    assert_eq!(entry.value.sequence, Some(2));
+    assert_eq!(entry.sequence, Some(2));
 
     drop(conn);
     server.await.unwrap();
@@ -375,16 +376,23 @@ async fn with_entries_iterates_in_place() {
         conn.next().await.unwrap().unwrap();
     }
 
-    let count = pingers.with_entries(|map| map.len());
-    let ids: Vec<u32> = pingers.with_entries(|map| {
-        map.values()
-            .filter_map(|e| e.value.id)
-            .collect()
-    });
-    assert_eq!(count, 2);
-    let mut sorted = ids;
-    sorted.sort();
-    assert_eq!(sorted, vec![1, 2]);
+    // Borrowed iteration via the read guard — no clones of any Pinger.
+    let guard = pingers.lock();
+    assert_eq!(guard.len(), 2);
+    let mut ids: Vec<u32> = Vec::new();
+    for (_k, p, _ci) in &guard {
+        if let Some(id) = p.id {
+            ids.push(id);
+        }
+    }
+    drop(guard);
+    ids.sort();
+    assert_eq!(ids, vec![1, 2]);
+
+    // for_each path still works.
+    let mut count_via_closure = 0;
+    pingers.for_each(|_, _, _| count_via_closure += 1);
+    assert_eq!(count_via_closure, 2);
 
     drop(conn);
     server.await.unwrap();

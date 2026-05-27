@@ -23,7 +23,7 @@ use dots_core::{
 };
 use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug)]
+#[derive(DotsStruct, Default, Debug, Clone)]
 #[dots(name = "Address")]
 struct Address {
     #[dots(tag = 1)]
@@ -32,7 +32,7 @@ struct Address {
     number: Option<u32>,
 }
 
-#[derive(DotsStruct, Default, Debug)]
+#[derive(DotsStruct, Default, Debug, Clone)]
 #[dots(name = "RoundtripData", cached, persistent)]
 struct RoundtripData {
     #[dots(tag = 1, key)]

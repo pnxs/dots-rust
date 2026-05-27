@@ -42,7 +42,7 @@ enum Errno {
     BadMessage,
 }
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Job")]
 struct Job {
     #[dots(tag = 1, key)]

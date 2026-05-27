@@ -54,7 +54,7 @@ fn sample_transmission(id: u32, label: &str) -> Transmission {
         _ => panic!(),
     };
     let payload = DynamicStruct::decode(descriptor, &payload_bytes).unwrap();
-    Transmission { header, payload }
+    Transmission { header, payload: dots_model::Payload::Wire(payload) }
 }
 
 // ----- Synchronous codec exercises (no futures) -----

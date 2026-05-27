@@ -8,7 +8,7 @@
 use dots_core::{AnyStruct, StructValue, decode_typed_from_slice, encode_to_vec};
 use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Sample", cached)]
 struct Sample {
     #[dots(tag = 1, key)]
@@ -122,6 +122,42 @@ fn typed_and_dynamic_paths_produce_identical_bytes() {
     // The descriptor-driven codec is the single source of truth for
     // wire format, so the two paths must agree byte-for-byte.
     assert_eq!(typed_bytes, dynamic_bytes);
+}
+
+#[test]
+fn anystruct_as_typed_returns_matching_pointer() {
+    let original = Sample {
+        id: Some(7),
+        payload: Some("zero-cost".into()),
+        flag: Some(true),
+        counter: Some(42),
+        ratio: Some(2.5),
+    };
+    let typed_bytes = encode_to_vec(&original);
+    let any =
+        AnyStruct::decode_from_slice(Sample::DESCRIPTOR, &typed_bytes).expect("decode succeeds");
+
+    // `as_typed::<T>()` is the free cast — descriptor identity is
+    // the only check; the returned `&T` aliases `AnyStruct`'s buffer.
+    let viewed: &Sample = any.as_typed::<Sample>().expect("descriptor matches");
+    assert!(core::ptr::eq(
+        viewed as *const Sample as *const u8,
+        any.data_ptr(),
+    ));
+    assert_eq!(*viewed, original);
+}
+
+#[test]
+fn anystruct_as_typed_rejects_wrong_t() {
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Other")]
+    struct Other {
+        #[dots(tag = 1)]
+        x: Option<u32>,
+    }
+
+    let any = AnyStruct::new(Sample::DESCRIPTOR);
+    assert!(any.as_typed::<Other>().is_none());
 }
 
 #[test]

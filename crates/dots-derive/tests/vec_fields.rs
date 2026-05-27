@@ -13,7 +13,7 @@
 use dots_core::{AnyStruct, FieldKind, decode_typed_from_slice, encode_to_vec};
 use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Tag")]
 struct Tag {
     #[dots(tag = 1)]
@@ -22,7 +22,7 @@ struct Tag {
     weight: Option<u32>,
 }
 
-#[derive(DotsStruct, Default, Debug, PartialEq)]
+#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
 #[dots(name = "Catalog", cached)]
 struct Catalog {
     #[dots(tag = 1, key)]

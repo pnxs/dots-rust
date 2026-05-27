@@ -316,7 +316,7 @@ where
         txn: &Transmission,
     ) -> Result<T, ConnectionError>
     where
-        T: StructValue + Default,
+        T: StructValue + Default + Clone,
     {
         let expected_type_name = T::type_descriptor().name;
         let type_name = txn
@@ -330,11 +330,21 @@ where
                 got: type_name.into(),
             });
         }
-        // Re-encode the dynamic payload to bytes, then decode as T.
-        // Two passes through the codec — wasteful, but only happens
-        // for handshake messages (twice per connection lifetime).
-        let bytes = txn.payload.encode();
-        decode_typed_from_slice(&bytes).map_err(|e| ConnectionError::DecodeFailure(e.to_string()))
+        match &txn.payload {
+            // Typed: descriptor identity guarantees layout-compatible
+            // memory; borrow `&T` and clone out.
+            dots_model::Payload::Typed(a) => a
+                .as_typed::<T>()
+                .cloned()
+                .ok_or_else(|| ConnectionError::DecodeFailure(
+                    "payload descriptor identity didn't match expected T".into(),
+                )),
+            // Wire: rare; happens only when the registry only had the
+            // dynamic descriptor for this type. Fall back to the
+            // CBOR roundtrip.
+            dots_model::Payload::Wire(d) => decode_typed_from_slice(&d.encode())
+                .map_err(|e| ConnectionError::DecodeFailure(e.to_string())),
+        }
     }
 
     /// Send a typed payload.
@@ -456,7 +466,7 @@ where
     /// `next`/`publish`.
     pub fn subscribe<T>(&self) -> Subscription<T>
     where
-        T: StructValue + Default + Send + 'static,
+        T: StructValue + Default + Send + Clone + 'static,
     {
         let (tx, rx) = mpsc::unbounded_channel();
         let entry: TypedDispatchEntry<T> = TypedDispatchEntry {
@@ -822,14 +832,27 @@ struct TypedDispatchEntry<T> {
 
 impl<T> DispatchEntry for TypedDispatchEntry<T>
 where
-    T: StructValue + Default + Send + 'static,
+    T: StructValue + Default + Send + Clone + 'static,
 {
     fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError> {
         if self.sender.is_closed() {
             return Ok(false);
         }
-        let bytes = txn.payload.encode();
-        let value: T = decode_typed_from_slice(&bytes)?;
+        let value: T = match &txn.payload {
+            dots_model::Payload::Typed(a) => match a.as_typed::<T>() {
+                Some(t) => t.clone(),
+                // Type-name routing matched but descriptor identity
+                // didn't — extremely unlikely, but treat as a decode
+                // mismatch rather than panic.
+                None => return Err(dots_core::DecodeError::message(
+                    "typed dispatch: payload descriptor identity didn't match T",
+                )),
+            },
+            dots_model::Payload::Wire(d) => {
+                let bytes = d.encode();
+                decode_typed_from_slice(&bytes)?
+            }
+        };
         let event = Event {
             header: txn.header.clone(),
             value,

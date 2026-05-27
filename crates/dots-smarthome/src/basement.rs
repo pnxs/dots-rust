@@ -41,7 +41,7 @@ impl Basement {
             
             let existing = lights.get(&LightControl::new(BASEMENT_LIGHT));
             let existing_brightness =
-                existing.as_ref().and_then(|e| e.value.brightness).unwrap_or(0);
+                existing.as_deref().and_then(|e| e.brightness).unwrap_or(0);
 
             if switch.enabled == Some(true) {
                 // Motion detected — turn the light on if it isn't

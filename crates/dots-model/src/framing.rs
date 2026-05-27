@@ -25,8 +25,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use dots_core::{
-    DecodeError, DynamicStruct, DynamicStructDescriptor, PropertySet, StructValue, Transmittable,
-    decode_typed_from_decoder, encode_into_vec,
+    AnyStruct, DecodeError, DynamicStruct, DynamicStructDescriptor, PropertySet, StructDescriptor,
+    StructValue, Transmittable, decode_typed_from_decoder, encode_into_vec, encode_key_bytes,
+    layout::CborEncoder,
 };
 
 use crate::{DotsHeader, Registry};
@@ -44,13 +45,113 @@ pub const SIZE_PREFIX_MARKER: u8 = 0x1A;
 
 /// A complete v2 transmission: header + payload.
 ///
-/// The payload is held in [`DynamicStruct`] form regardless of how it
-/// arrived on the wire. Typed receivers can convert via
-/// [`decode_typed_transmission`] instead of going through `Transmission`.
+/// The payload is held in a [`Payload`] sum that distinguishes
+/// "we have the static descriptor and decoded into a layout-compatible
+/// [`AnyStruct`]" from "we only know the wire-form descriptor and
+/// produced a [`DynamicStruct`]". The typed path lets `Container<T>`
+/// hand out `&T` borrowings via a pointer cast — no CBOR roundtrip.
 #[derive(Debug, Clone)]
 pub struct Transmission {
     pub header: DotsHeader,
-    pub payload: DynamicStruct,
+    pub payload: Payload,
+}
+
+/// The payload half of a [`Transmission`].
+///
+/// Picked by the framing decoder based on the registry: types
+/// registered via [`Registry::register_struct_static`] decode to
+/// [`Payload::Typed`]; types registered only via
+/// [`Registry::register_struct_dynamic`] (descriptor learned at
+/// runtime, no compile-time `T` available) decode to
+/// [`Payload::Wire`].
+#[derive(Debug, Clone)]
+pub enum Payload {
+    /// Decoded into the type's layout-compatible memory buffer.
+    /// Typed consumers borrow `&T` from this directly.
+    Typed(AnyStruct),
+    /// Decoded into the wire-only tagged-union representation. Used
+    /// when the receiver only learned the type at runtime via
+    /// descriptor exchange.
+    Wire(DynamicStruct),
+}
+
+impl Payload {
+    /// CBOR key-bytes for indexing this payload by its `#[dots(key)]`
+    /// properties. Same byte layout regardless of which variant
+    /// produced it.
+    pub fn key_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Typed(a) => encode_key_bytes(a),
+            Self::Wire(d) => d.key_bytes(),
+        }
+    }
+
+    /// Encode the payload to a freshly allocated `Vec<u8>`. Used by
+    /// callers that want the raw wire bytes of just the payload (e.g.
+    /// re-stamped fan-out paths).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        match self {
+            Self::Typed(a) => encode_into_vec(a, &mut buf),
+            Self::Wire(d) => buf = d.encode(),
+        }
+        buf
+    }
+
+    /// Static descriptor for this payload, if it's the Typed variant.
+    /// Returns `None` for `Wire` (no static descriptor available).
+    pub fn static_descriptor(&self) -> Option<&'static StructDescriptor> {
+        match self {
+            Self::Typed(a) => Some(a.descriptor()),
+            Self::Wire(_) => None,
+        }
+    }
+}
+
+impl Transmittable for Payload {
+    fn type_name(&self) -> &str {
+        match self {
+            Self::Typed(a) => Transmittable::type_name(a),
+            Self::Wire(d) => Transmittable::type_name(d),
+        }
+    }
+
+    fn valid_set(&self) -> PropertySet {
+        match self {
+            Self::Typed(a) => Transmittable::valid_set(a),
+            Self::Wire(d) => Transmittable::valid_set(d),
+        }
+    }
+
+    fn key_set(&self) -> PropertySet {
+        match self {
+            Self::Typed(a) => Transmittable::key_set(a),
+            Self::Wire(d) => Transmittable::key_set(d),
+        }
+    }
+
+    fn encode_into(
+        &self,
+        mask: PropertySet,
+        encoder: &mut CborEncoder<'_>,
+    ) -> Result<(), dots_core::EncodeError> {
+        match self {
+            Self::Typed(a) => Transmittable::encode_into(a, mask, encoder),
+            Self::Wire(d) => Transmittable::encode_into(d, mask, encoder),
+        }
+    }
+}
+
+impl From<AnyStruct> for Payload {
+    fn from(value: AnyStruct) -> Self {
+        Self::Typed(value)
+    }
+}
+
+impl From<DynamicStruct> for Payload {
+    fn from(value: DynamicStruct) -> Self {
+        Self::Wire(value)
+    }
 }
 
 /// Errors produced by the framing layer.
@@ -213,9 +314,15 @@ impl Transmission {
     /// Decode a complete v2 frame into a dynamic transmission.
     ///
     /// `registry` resolves the payload's type by name (taken from
-    /// `header.type_name`). Returns the parsed transmission together
-    /// with the total number of bytes consumed (`SIZE_PREFIX_LEN +
-    /// body_size`), so callers can advance their read buffer.
+    /// `header.type_name`). When the registry has the compile-time
+    /// descriptor for the named type, the payload decodes directly
+    /// into a layout-compatible [`AnyStruct`] ([`Payload::Typed`]);
+    /// otherwise it decodes into a [`DynamicStruct`]
+    /// ([`Payload::Wire`]) using the runtime-shaped descriptor.
+    ///
+    /// Returns the parsed transmission together with the total number
+    /// of bytes consumed (`SIZE_PREFIX_LEN + body_size`), so callers
+    /// can advance their read buffer.
     pub fn decode(bytes: &[u8], registry: &Registry) -> Result<(Self, usize), FramingError> {
         let body_size = parse_size_prefix(bytes)? as usize;
         let total = SIZE_PREFIX_LEN + body_size;
@@ -234,8 +341,13 @@ impl Transmission {
             .type_name
             .as_deref()
             .ok_or(FramingError::HeaderMissingTypeName)?;
-        let descriptor = lookup_struct(registry, type_name)?;
-        let payload = DynamicStruct::decode_from_decoder(descriptor, &mut decoder)?;
+
+        let payload = if let Some(stat) = registry.lookup_static_struct(type_name) {
+            Payload::Typed(AnyStruct::decode_from_decoder(stat, &mut decoder)?)
+        } else {
+            let descriptor = lookup_struct(registry, type_name)?;
+            Payload::Wire(DynamicStruct::decode_from_decoder(descriptor, &mut decoder)?)
+        };
 
         Ok((Self { header, payload }, total))
     }
@@ -337,17 +449,22 @@ impl RawTransmission {
         })
     }
 
-    /// Decode the payload bytes into a [`DynamicStruct`] using the type
-    /// named in `header.type_name`. Materialises only on demand — the
+    /// Decode the payload bytes using the type named in
+    /// `header.type_name`. Picks the layout-compatible [`AnyStruct`]
+    /// path when the registry has a static descriptor, otherwise falls
+    /// back to [`DynamicStruct`]. Materialises only on demand — the
     /// hot fan-out path doesn't need this.
-    pub fn decode_payload(&self, registry: &Registry) -> Result<DynamicStruct, FramingError> {
+    pub fn decode_payload(&self, registry: &Registry) -> Result<Payload, FramingError> {
         let type_name = self
             .header
             .type_name
             .as_deref()
             .ok_or(FramingError::HeaderMissingTypeName)?;
+        if let Some(stat) = registry.lookup_static_struct(type_name) {
+            return Ok(Payload::Typed(AnyStruct::decode_from_slice(stat, &self.payload)?));
+        }
         let descriptor = lookup_struct(registry, type_name)?;
-        Ok(DynamicStruct::decode(descriptor, &self.payload)?)
+        Ok(Payload::Wire(DynamicStruct::decode(descriptor, &self.payload)?))
     }
 }
 

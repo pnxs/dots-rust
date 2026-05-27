@@ -58,7 +58,7 @@ fn dynamic_for(reg: &Registry, type_name: &str, payload: &dyn StructValue) -> Tr
     };
     let bytes = encode_to_vec(payload);
     let payload = dots_core::DynamicStruct::decode(descriptor, &bytes).unwrap();
-    Transmission { header, payload }
+    Transmission { header, payload: dots_model::Payload::Wire(payload) }
 }
 
 /// Fake server: receives Connect with preload=true, responds, then

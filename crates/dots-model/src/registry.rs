@@ -69,9 +69,14 @@ impl std::error::Error for RegistryError {}
 /// `&self` — including from the [`crate::App`]-equivalent layer in
 /// `dots-transport`, which auto-registers user types on `subscribe<T>`
 /// while the codec holds a long-lived `Arc<Registry>` for decoding.
+///
+/// Tracks the compile-time `&'static StructDescriptor` separately from
+/// the dynamic projection so the framing layer can pick the
+/// layout-compatible decode path when one is available.
 #[derive(Debug, Default)]
 pub struct Registry {
     entries: RwLock<BTreeMap<String, DescriptorEntry>>,
+    static_structs: RwLock<BTreeMap<String, &'static StructDescriptor>>,
 }
 
 impl Registry {
@@ -90,6 +95,22 @@ impl Registry {
             .write()
             .expect("registry poisoned")
             .insert(d.name.into(), DescriptorEntry::Struct(arc));
+        self.static_structs
+            .write()
+            .expect("registry poisoned")
+            .insert(d.name.into(), d);
+    }
+
+    /// Look up the static descriptor for a registered type, if one
+    /// exists. Returns `None` for types learned via
+    /// [`register_struct_dynamic`](Self::register_struct_dynamic) (no
+    /// compile-time `T` available).
+    pub fn lookup_static_struct(&self, name: &str) -> Option<&'static StructDescriptor> {
+        self.static_structs
+            .read()
+            .expect("registry poisoned")
+            .get(name)
+            .copied()
     }
 
     /// Register a compile-time enum descriptor.
