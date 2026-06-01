@@ -27,6 +27,7 @@ tokio-util = { version = "0.7", default-features = false }
 bytes = "1"
 rustc-hash = "2"
 smallvec = "1"
+parking_lot = "0.12"
 
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }

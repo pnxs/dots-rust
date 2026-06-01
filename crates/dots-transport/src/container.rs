@@ -13,9 +13,11 @@
 //!   stored `AnyStruct`s via a descriptor-identity-checked pointer
 //!   cast — no CBOR roundtrip. The borrowed accessors are
 //!   [`get`](Container::get) (single entry, returns a guard-backed
-//!   [`ContainerRef`]) and [`for_each`](Container::for_each)
-//!   (iterate while the lock is held). [`snapshot`](Container::snapshot)
-//!   stays as the explicit owned-`Vec` path.
+//!   [`ContainerRef`]), [`for_each`](Container::for_each) (iterate
+//!   while the lock is held), and [`lock`](Container::lock) (hold the
+//!   read lock across several lookups via a [`ContainerReadGuard`]).
+//!   [`snapshot`](Container::snapshot) stays as the explicit
+//!   owned-`Vec` path.
 //!
 //! The split lets [`crate::GuestTransceiver`] pre-create empty
 //! containers for every entry in `SUBSCRIBED_TYPES` during the
@@ -29,15 +31,42 @@
 //! (pool-managed) or [`Connection::container`](crate::Connection::container)
 //! (raw, no transceiver).
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
-use dots_core::{AnyStruct, StructDescriptor, StructValue, Timepoint, encode_key_bytes};
+use dots_core::{AnyStruct, StructDescriptor, StructValue, Timepoint, encode_key_bytes, encode_key_into};
 use dots_model::Transmission;
+use parking_lot::{RwLock, RwLockReadGuard};
 
 use crate::connection::{DispatchEntry, DispatchState, GroupLeaver};
+
+thread_local! {
+    /// Reusable buffer for encoding lookup keys on the read path so
+    /// point reads don't heap-allocate a fresh `Vec` per call. The key
+    /// bytes are only *borrowed* for the `BTreeMap` lookup (which
+    /// accepts `&[u8]` via `Borrow<[u8]>`), so a scratch buffer that
+    /// lives only for the duration of the lookup is sufficient.
+    static KEY_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Encode `query`'s `#[dots(key)]` properties into the thread-local
+/// scratch buffer and run `f` with the borrowed key bytes. Avoids the
+/// per-lookup allocation that [`encode_key_bytes`] would incur. Used
+/// by the read paths ([`Container::get`], [`ContainerReadGuard::get`])
+/// where the key is consumed immediately by a `BTreeMap` lookup and
+/// never stored.
+fn with_key_bytes<R>(query: &dyn StructValue, f: impl FnOnce(&[u8]) -> R) -> R {
+    KEY_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        encode_key_into(query, &mut buf);
+        f(&buf)
+    })
+}
 
 /// Per-entry metadata: when the value was first seen, when it was
 /// most recently updated, and what kind of operation produced it.
@@ -82,11 +111,12 @@ impl core::fmt::Debug for DynContainerEntry {
     }
 }
 
-/// One decoded entry from a [`Container<T>`].
+/// One owned entry cloned out of a [`Container<T>`].
 ///
-/// Returned by [`Container<T>::snapshot`] / [`get`](Container::get)
-/// and as the values in the map passed to
-/// [`with_entries`](Container::with_entries).
+/// Returned by [`Container::snapshot`], the explicit owned-`Vec` path.
+/// The borrowed reads ([`get`](Container::get),
+/// [`for_each`](Container::for_each), [`lock`](Container::lock)) hand
+/// back `&T` + `&CloneInfo` directly instead, avoiding the clone.
 #[derive(Debug, Clone)]
 pub struct ContainerEntry<T> {
     pub value: T,
@@ -104,7 +134,13 @@ type Entries = BTreeMap<Vec<u8>, DynContainerEntry>;
 /// type name in the pool and applying the update directly here.
 pub struct DynContainer {
     descriptor: &'static StructDescriptor,
-    entries: Mutex<Entries>,
+    /// Read-mostly storage: dispatch takes the write lock on each
+    /// incoming transmission (bursty), while application reads
+    /// (`get` / `for_each` / `snapshot` / `len`) take the read lock and
+    /// run concurrently. `parking_lot::RwLock` also means the lock
+    /// can't be poisoned, so a panic inside a user closure passed to
+    /// [`Container::for_each`] won't brick every later access.
+    entries: RwLock<Entries>,
     /// Optional RAII leaver — publishes `DotsMember(Leave)` when this
     /// container drops. `Some` only for the
     /// [`crate::GuestTransceiver::container`] path; `None` for raw
@@ -118,7 +154,7 @@ impl DynContainer {
     pub(crate) fn new(descriptor: &'static StructDescriptor, leaver: Option<GroupLeaver>) -> Self {
         Self {
             descriptor,
-            entries: Mutex::new(BTreeMap::new()),
+            entries: RwLock::new(BTreeMap::new()),
             _leaver: leaver,
         }
     }
@@ -130,15 +166,12 @@ impl DynContainer {
 
     /// Number of stored entries.
     pub fn len(&self) -> usize {
-        self.entries.lock().expect("container mutex poisoned").len()
+        self.entries.read().len()
     }
 
     /// `true` if no entries are stored.
     pub fn is_empty(&self) -> bool {
-        self.entries
-            .lock()
-            .expect("container mutex poisoned")
-            .is_empty()
+        self.entries.read().is_empty()
     }
 
     /// Run a closure over the type-erased storage while holding the
@@ -148,7 +181,7 @@ impl DynContainer {
     where
         F: FnOnce(&BTreeMap<Vec<u8>, DynContainerEntry>) -> R,
     {
-        let entries = self.entries.lock().expect("container mutex poisoned");
+        let entries = self.entries.read();
         f(&entries)
     }
 
@@ -157,7 +190,7 @@ impl DynContainer {
     /// transmission); key bytes for indexing come from
     /// [`encode_key_bytes`] over the same buffer.
     ///
-    /// `remove_obj == Some(true)` headers extract the keyed entry;
+    /// `remove_obj == Some(true)` headers remove the keyed entry;
     /// otherwise the entry is inserted-or-updated with refreshed
     /// `CloneInfo`. Matches the C++ `Container<>::insert` / `remove`
     /// semantics.
@@ -184,7 +217,7 @@ impl DynContainer {
             return;
         }
         let key = encode_key_bytes(value);
-        let mut entries = self.entries.lock().expect("container mutex poisoned");
+        let mut entries = self.entries.write();
 
         if txn.header.remove_obj == Some(true) {
             entries.remove(&key);
@@ -193,27 +226,39 @@ impl DynContainer {
 
         let now_sender = txn.header.sender;
         let now_time = txn.header.sent_time;
-        let (operation, created_time, created_sender) = match entries.get(&key) {
-            Some(existing) => (
-                Operation::Update,
-                existing.clone_info.created_time,
-                existing.clone_info.created_sender,
-            ),
-            None => (Operation::Create, now_time, now_sender),
-        };
-        entries.insert(
-            key,
-            DynContainerEntry {
-                value: value.clone(),
-                clone_info: CloneInfo {
-                    last_operation: operation,
-                    last_update_time: now_time,
-                    last_update_sender: now_sender,
-                    created_time,
-                    created_sender,
-                },
-            },
-        );
+        // Single BTree traversal: the entry API locates the slot once,
+        // and we read the prior `created_*` (on update) or seed it (on
+        // create) from that same slot rather than a separate `get`.
+        match entries.entry(key) {
+            Entry::Occupied(mut slot) => {
+                let (created_time, created_sender) = {
+                    let prior = &slot.get().clone_info;
+                    (prior.created_time, prior.created_sender)
+                };
+                slot.insert(DynContainerEntry {
+                    value: value.clone(),
+                    clone_info: CloneInfo {
+                        last_operation: Operation::Update,
+                        last_update_time: now_time,
+                        last_update_sender: now_sender,
+                        created_time,
+                        created_sender,
+                    },
+                });
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(DynContainerEntry {
+                    value: value.clone(),
+                    clone_info: CloneInfo {
+                        last_operation: Operation::Create,
+                        last_update_time: now_time,
+                        last_update_sender: now_sender,
+                        created_time: now_time,
+                        created_sender: now_sender,
+                    },
+                });
+            }
+        }
     }
 }
 
@@ -281,11 +326,7 @@ where
     /// need several lookups under the same lock.
     pub fn lock(&self) -> ContainerReadGuard<'_, T> {
         ContainerReadGuard {
-            guard: self
-                .inner
-                .entries
-                .lock()
-                .expect("container mutex poisoned"),
+            guard: self.inner.entries.read(),
             _phantom: PhantomData,
         }
     }
@@ -300,17 +341,15 @@ where
     /// specific fields you need, or `(*entry).clone()` for the whole
     /// value, then drop the ref to release the lock.
     pub fn get<'a>(&'a self, query: &T) -> Option<ContainerRef<'a, T>> {
-        let key = encode_key_bytes(query);
-        let entries = self
-            .inner
-            .entries
-            .lock()
-            .expect("container mutex poisoned");
-        let entry = entries.get(&key)?;
-        // SAFETY: while `entries` (the guard) is held, the BTreeMap's
-        // entries (and therefore the AnyStruct buffer at this key)
-        // are stable. The `&T` reflects the buffer's contents; the
-        // pointer remains valid for the guard's lifetime.
+        let entries = self.inner.entries.read();
+        // `with_key_bytes` borrows a thread-local scratch buffer only
+        // for the lookup; the returned `&DynContainerEntry` borrows
+        // `entries`, not the scratch, so it outlives the closure.
+        let entry = with_key_bytes(query, |key| entries.get(key))?;
+        // SAFETY: while `entries` (the read guard) is held, the
+        // BTreeMap's entries (and therefore the AnyStruct buffer at
+        // this key) are stable. The `&T` reflects the buffer's
+        // contents; the pointer remains valid for the guard's lifetime.
         let value: &T = entry
             .value
             .as_typed::<T>()
@@ -336,11 +375,7 @@ where
     where
         F: FnMut(&[u8], &T, &CloneInfo),
     {
-        let entries = self
-            .inner
-            .entries
-            .lock()
-            .expect("container mutex poisoned");
+        let entries = self.inner.entries.read();
         for (k, entry) in entries.iter() {
             let value: &T = entry
                 .value
@@ -355,11 +390,7 @@ where
     /// returning — useful when the caller wants to process entries
     /// without blocking the dispatch path.
     pub fn snapshot(&self) -> Vec<ContainerEntry<T>> {
-        let entries = self
-            .inner
-            .entries
-            .lock()
-            .expect("container mutex poisoned");
+        let entries = self.inner.entries.read();
         entries
             .values()
             .map(|entry| {
@@ -378,15 +409,22 @@ where
 
 /// Borrowed view into a single container entry.
 ///
-/// Holds the container's mutex guard so the underlying buffer can't
-/// be mutated or dropped while the borrow is alive. Drops the lock
-/// when it goes out of scope. Implements [`Deref`] to `&T` so field
-/// access reads like `entry.field` — clone the value (or only the
-/// fields you need) before dropping the ref if you want to own
+/// Holds the container's read-lock guard so the underlying buffer
+/// can't be mutated or dropped while the borrow is alive. Drops the
+/// lock when it goes out of scope. Implements [`Deref`] to `&T` so
+/// field access reads like `entry.field` — clone the value (or only
+/// the fields you need) before dropping the ref if you want to own
 /// anything past the borrow.
+///
+/// **Hold it briefly.** While a `ContainerRef` is alive it pins the
+/// container's read lock, which blocks the dispatch path (a writer)
+/// from applying further updates to *this* type. Never hold one
+/// across an `.await` or any long-running work — read what you need,
+/// clone it out, and drop the ref. (Other readers can proceed
+/// concurrently; only writers block.)
 pub struct ContainerRef<'a, T> {
     /// Pointer into the BTreeMap entry's `AnyStruct` buffer. Valid
-    /// for the lifetime of `_guard` (the mutex pins the entry).
+    /// for the lifetime of `_guard` (the read lock pins the entry).
     value: *const T,
     /// Pointer to the `CloneInfo` sitting next to `value` in the
     /// same `DynContainerEntry`.
@@ -394,7 +432,7 @@ pub struct ContainerRef<'a, T> {
     /// Guard listed last so it drops *after* the raw-pointer fields
     /// (the fields themselves have no Drop, but order encodes intent
     /// — pointers should never outlive the guard).
-    _guard: MutexGuard<'a, Entries>,
+    _guard: RwLockReadGuard<'a, Entries>,
     /// Encodes the `'a` lifetime + `T` covariance so the borrow
     /// checker treats `&self -> &T` correctly.
     _phantom: PhantomData<&'a T>,
@@ -405,7 +443,7 @@ impl<T> ContainerRef<'_, T> {
     /// inserted or updated.
     pub fn clone_info(&self) -> &CloneInfo {
         // SAFETY: pointer was taken from a `&CloneInfo` borrowed
-        // through the still-held mutex guard, so the pointee is
+        // through the still-held read guard, so the pointee is
         // valid for `&self`'s lifetime.
         #[allow(unsafe_code)]
         unsafe {
@@ -419,7 +457,7 @@ impl<T> Deref for ContainerRef<'_, T> {
 
     fn deref(&self) -> &T {
         // SAFETY: same reasoning as `clone_info` — pointer is into
-        // an `AnyStruct` buffer that the mutex guard pins.
+        // an `AnyStruct` buffer that the read guard pins.
         #[allow(unsafe_code)]
         unsafe {
             &*self.value
@@ -429,11 +467,11 @@ impl<T> Deref for ContainerRef<'_, T> {
 
 /// Read guard returned by [`Container::lock`].
 ///
-/// Holds the container's mutex for the guard's lifetime — iterate or
+/// Holds the container's read lock for the guard's lifetime — iterate or
 /// look up via its methods, then drop the guard to release the lock.
 /// Dispatch updates to this container block while the guard is alive.
 pub struct ContainerReadGuard<'a, T> {
-    guard: MutexGuard<'a, Entries>,
+    guard: RwLockReadGuard<'a, Entries>,
     _phantom: PhantomData<fn() -> T>,
 }
 
@@ -463,10 +501,9 @@ where
 
     /// Look up the entry whose key matches `query` (only `#[dots(key)]`
     /// properties matter). Cheaper than [`Container::get`] when you
-    /// already hold the guard — no second mutex lock.
+    /// already hold the guard — no second lock acquisition.
     pub fn get(&self, query: &T) -> Option<(&T, &CloneInfo)> {
-        let key = encode_key_bytes(query);
-        let entry = self.guard.get(&key)?;
+        let entry = with_key_bytes(query, |key| self.guard.get(key))?;
         let value: &T = entry
             .value
             .as_typed::<T>()

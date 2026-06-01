@@ -286,6 +286,7 @@ dependencies = [
  "dots-derive",
  "dots-model",
  "futures-util",
+ "parking_lot",
  "rand",
  "rustc-hash",
  "sha2",
