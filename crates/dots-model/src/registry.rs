@@ -24,8 +24,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use dots_core::{
-    DynamicEnumDescriptor, DynamicEnumElement, DynamicFieldKind, DynamicPropertyDescriptor,
-    DynamicStructDescriptor, EnumDescriptor, StructDescriptor, StructFlags,
+    AnyObject, AnyStruct, DynamicEnumDescriptor, DynamicEnumElement, DynamicFieldKind,
+    DynamicPropertyDescriptor, DynamicStruct, DynamicStructDescriptor, DynamicValue,
+    EnumDescriptor, StructDescriptor, StructFlags,
 };
 
 use crate::{EnumDescriptorData, StructDescriptorData};
@@ -62,6 +63,51 @@ impl core::fmt::Display for RegistryError {
 }
 
 impl std::error::Error for RegistryError {}
+
+/// The object recovered from an [`AnyObject`] by [`Registry::from_any`].
+///
+/// Which variant you get depends on what the registry knows about the
+/// contained type:
+///
+/// - [`Typed`](DecodedAny::Typed) — the type was registered from a
+///   compile-time `&'static StructDescriptor`, so the payload decodes
+///   into a layout-compatible [`AnyStruct`] that can be downcast to a
+///   typed `&T` via [`AnyStruct::as_typed`].
+/// - [`Dynamic`](DecodedAny::Dynamic) — the type is only known through
+///   runtime descriptor exchange (no compiled `T`), so the payload
+///   decodes into a wire-only [`DynamicStruct`].
+#[derive(Debug)]
+pub enum DecodedAny {
+    Typed(AnyStruct),
+    Dynamic(DynamicStruct),
+}
+
+/// Errors from [`Registry::from_any`].
+#[derive(Debug)]
+pub enum FromAnyError {
+    /// The contained type name is not registered. By the DOTS
+    /// descriptor contract a publisher exports a type's descriptor
+    /// before any instance referencing it, so this normally signals a
+    /// contract violation (descriptor not yet learned).
+    UnknownType(String),
+    /// The contained type name resolved to an enum, not a struct.
+    NotAStruct(String),
+    /// The opaque payload failed to decode against the resolved
+    /// descriptor.
+    Decode(dots_core::DecodeError),
+}
+
+impl core::fmt::Display for FromAnyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnknownType(name) => write!(f, "contained type `{name}` not in registry"),
+            Self::NotAStruct(name) => write!(f, "contained type `{name}` is an enum, not a struct"),
+            Self::Decode(e) => write!(f, "failed to decode `any` payload: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FromAnyError {}
 
 /// A name-keyed registry of [`DescriptorEntry`]s.
 ///
@@ -148,6 +194,47 @@ impl Registry {
             .expect("registry poisoned")
             .get(name)
             .cloned()
+    }
+
+    /// Recover the DOTS object stored in an [`AnyObject`], resolving the
+    /// contained type by name against this registry.
+    ///
+    /// Prefers the compile-time descriptor when one is registered
+    /// (returning [`DecodedAny::Typed`], which is downcastable to a
+    /// typed `&T`); otherwise falls back to the runtime-learned
+    /// descriptor (returning [`DecodedAny::Dynamic`]). Mirrors dots-cpp
+    /// `from_any`, which resolves the type via the registry and throws
+    /// on an unknown type — here that is [`FromAnyError::UnknownType`].
+    pub fn from_any(&self, any: &AnyObject) -> Result<DecodedAny, FromAnyError> {
+        let name = any.type_name();
+        if let Some(descriptor) = self.lookup_static_struct(name) {
+            return AnyStruct::decode_from_slice(descriptor, any.payload())
+                .map(DecodedAny::Typed)
+                .map_err(FromAnyError::Decode);
+        }
+        match self.lookup(name) {
+            Some(DescriptorEntry::Struct(d)) => DynamicStruct::decode(d, any.payload())
+                .map(DecodedAny::Dynamic)
+                .map_err(FromAnyError::Decode),
+            Some(DescriptorEntry::Enum(_)) => Err(FromAnyError::NotAStruct(name.into())),
+            None => Err(FromAnyError::UnknownType(name.into())),
+        }
+    }
+
+    /// Wrap a [`DynamicStruct`] for `Display` so that `any` fields are
+    /// **expanded inline**: each contained object is decoded via
+    /// [`from_any`](Self::from_any) and printed recursively, instead of
+    /// the opaque `any<Type>[N bytes]` the bare `Display` produces. Any
+    /// `any` field whose contained type the registry can't resolve
+    /// falls back to that opaque form.
+    ///
+    /// Intended for trace/inspection tools (e.g. `dots-trace`) that hold
+    /// the registry and want to see *through* the envelope.
+    pub fn display_struct<'a>(&'a self, value: &'a DynamicStruct) -> StructDisplay<'a> {
+        StructDisplay {
+            value,
+            registry: self,
+        }
     }
 
     /// Number of registered types.
@@ -328,6 +415,7 @@ impl Registry {
             "steady_timepoint" => return Ok(DynamicFieldKind::Timepoint),
             "property_set" => return Ok(DynamicFieldKind::PropertySet),
             "uuid" => return Ok(DynamicFieldKind::Uuid),
+            "any" => return Ok(DynamicFieldKind::Any),
             _ => {}
         }
 
@@ -341,6 +429,101 @@ impl Registry {
             Some(DescriptorEntry::Enum(d)) => Ok(DynamicFieldKind::Enum(d)),
             None => Err(RegistryError::UnknownType(s.into())),
         }
+    }
+}
+
+/// A [`DynamicStruct`] paired with the [`Registry`] that can resolve
+/// its `any` fields, rendered with those fields expanded inline.
+///
+/// Returned by [`Registry::display_struct`]. The rendering mirrors the
+/// bare [`DynamicStruct`] `Display` (descriptor-ordered `Type{ field:
+/// value, … }`, enum variant names resolved) but recurses through
+/// `any` fields — decoding the contained object and printing it in
+/// place. Nested `any` (an expanded object that itself holds an `any`
+/// field) expands too. An unresolved contained type stays opaque.
+pub struct StructDisplay<'a> {
+    value: &'a DynamicStruct,
+    registry: &'a Registry,
+}
+
+impl core::fmt::Display for StructDisplay<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        fmt_struct(self.value, self.registry, f)
+    }
+}
+
+fn fmt_struct(
+    s: &DynamicStruct,
+    reg: &Registry,
+    f: &mut core::fmt::Formatter<'_>,
+) -> core::fmt::Result {
+    f.write_str(&s.descriptor.name)?;
+    f.write_str("{")?;
+    let mut first = true;
+    for prop in &s.descriptor.properties {
+        if !s.valid.has(prop.tag) {
+            continue;
+        }
+        f.write_str(if first { " " } else { ", " })?;
+        first = false;
+        f.write_str(&prop.name)?;
+        f.write_str(": ")?;
+        match s.properties.iter().find(|(t, _)| *t == prop.tag).map(|(_, v)| v) {
+            Some(v) => fmt_value(v, &prop.kind, reg, f)?,
+            None => f.write_str("?")?,
+        }
+    }
+    if !first {
+        f.write_str(" ")?;
+    }
+    f.write_str("}")
+}
+
+fn fmt_value(
+    v: &DynamicValue,
+    kind: &DynamicFieldKind,
+    reg: &Registry,
+    f: &mut core::fmt::Formatter<'_>,
+) -> core::fmt::Result {
+    match (v, kind) {
+        // Resolve enum variant names from the property's descriptor,
+        // matching the bare `DynamicStruct` Display.
+        (DynamicValue::Enum(int_val), DynamicFieldKind::Enum(enum_desc)) => {
+            match enum_desc.element_by_value(*int_val) {
+                Some(elem) => f.write_str(&elem.name),
+                None => write!(f, "{int_val}"),
+            }
+        }
+        // Recurse so nested `any` inside a sub-struct also expands.
+        (DynamicValue::Struct(inner), _) => fmt_struct(inner, reg, f),
+        (DynamicValue::Vec(items), DynamicFieldKind::Vec(inner_kind)) => {
+            f.write_str("[")?;
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                fmt_value(item, inner_kind, reg, f)?;
+            }
+            f.write_str("]")
+        }
+        // The point of this renderer: expand the opaque envelope.
+        (DynamicValue::Any(a), _) => fmt_any(a, reg, f),
+        // Leaves (and any value/kind mismatch): the value's own Display.
+        (other, _) => core::fmt::Display::fmt(other, f),
+    }
+}
+
+fn fmt_any(a: &AnyObject, reg: &Registry, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match reg.from_any(a) {
+        Ok(DecodedAny::Dynamic(s)) => fmt_struct(&s, reg, f),
+        Ok(DecodedAny::Typed(any_struct)) => {
+            // Project the layout-compatible value into the wire-shaped
+            // form so the same registry-aware walk applies.
+            fmt_struct(&DynamicStruct::from_struct_value(&any_struct), reg, f)
+        }
+        // Unknown or undecodable contained type: keep it opaque, same
+        // as the bare `Display`.
+        Err(_) => write!(f, "any<{}>[{} bytes]", a.type_name(), a.payload().len()),
     }
 }
 
@@ -413,5 +596,135 @@ mod tests {
             },
             other => panic!("expected outer Vec, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_any() {
+        let r = Registry::new();
+        assert!(matches!(r.parse_type_name("any"), Ok(DynamicFieldKind::Any)));
+    }
+}
+
+#[cfg(test)]
+mod from_any_tests {
+    use super::*;
+    use dots_core::{Transmittable, to_any};
+    use dots_derive::DotsStruct;
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Ping")]
+    struct Ping {
+        #[dots(tag = 1, key)]
+        id: Option<u32>,
+        #[dots(tag = 2)]
+        note: Option<String>,
+    }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Envelope")]
+    struct Envelope {
+        #[dots(tag = 1, key)]
+        id: Option<u32>,
+        #[dots(tag = 2)]
+        payload: Option<dots_core::AnyObject>,
+    }
+
+    fn envelope_wrapping(ping: &Ping) -> dots_core::DynamicStruct {
+        let envelope = Envelope {
+            id: Some(1),
+            payload: Some(to_any(ping)),
+        };
+        dots_core::DynamicStruct::from_struct_value(&envelope)
+    }
+
+    #[test]
+    fn from_any_typed_when_static_registered() {
+        let registry = Registry::new();
+        registry.register_struct_static(Ping::DESCRIPTOR);
+
+        let ping = Ping {
+            id: Some(42),
+            note: Some("hi".into()),
+        };
+        let any = to_any(&ping);
+
+        match registry.from_any(&any).expect("from_any succeeds") {
+            DecodedAny::Typed(s) => {
+                let recovered = s.as_typed::<Ping>().expect("downcast to Ping");
+                assert_eq!(recovered, &ping);
+            }
+            DecodedAny::Dynamic(_) => panic!("expected Typed, got Dynamic"),
+        }
+    }
+
+    #[test]
+    fn from_any_dynamic_when_only_dynamic_registered() {
+        let registry = Registry::new();
+        // Register only the runtime-shaped descriptor (no static type).
+        let dyn_desc = std::sync::Arc::new(dots_core::DynamicStructDescriptor::from_static(
+            Ping::DESCRIPTOR,
+        ));
+        registry.register_struct_dynamic(dyn_desc);
+
+        let ping = Ping {
+            id: Some(7),
+            note: None,
+        };
+        let any = to_any(&ping);
+
+        match registry.from_any(&any).expect("from_any succeeds") {
+            DecodedAny::Dynamic(s) => {
+                assert_eq!(s.type_name(), "Ping");
+                assert!(s.valid.has(1));
+                assert!(!s.valid.has(2));
+            }
+            DecodedAny::Typed(_) => panic!("expected Dynamic, got Typed"),
+        }
+    }
+
+    #[test]
+    fn from_any_unknown_type_errors() {
+        let registry = Registry::new();
+        let any = dots_core::AnyObject::new("NotRegistered", vec![0xA0]);
+        match registry.from_any(&any) {
+            Err(FromAnyError::UnknownType(name)) => assert_eq!(name, "NotRegistered"),
+            other => panic!("expected UnknownType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn display_struct_expands_any_inline() {
+        let registry = Registry::new();
+        registry.register_struct_static(Ping::DESCRIPTOR);
+
+        let ping = Ping {
+            id: Some(42),
+            note: Some("hi".into()),
+        };
+        let dyn_env = envelope_wrapping(&ping);
+
+        let rendered = format!("{}", registry.display_struct(&dyn_env));
+        assert_eq!(
+            rendered,
+            r#"Envelope{ id: 1, payload: Ping{ id: 42, note: "hi" } }"#
+        );
+    }
+
+    #[test]
+    fn display_struct_keeps_unresolved_any_opaque() {
+        // Ping is not registered, so the contained object can't be
+        // decoded — the renderer falls back to the opaque form.
+        let registry = Registry::new();
+        let ping = Ping {
+            id: Some(42),
+            note: Some("hi".into()),
+        };
+        let dyn_env = envelope_wrapping(&ping);
+
+        let rendered = format!("{}", registry.display_struct(&dyn_env));
+        assert!(
+            rendered.starts_with("Envelope{ id: 1, payload: any<Ping>["),
+            "got: {rendered}"
+        );
     }
 }

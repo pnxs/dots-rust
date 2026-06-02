@@ -12,8 +12,12 @@
 //!   stream every cached descriptor,
 //! - [`App::subscribe_all_types`] for one handler that fires for
 //!   every transmission of every learned type,
-//! - the [`Display`] impl for `DynamicStruct` for human-readable
-//!   payload output.
+//! - [`Registry::display_struct`] for human-readable payload output
+//!   that expands `any` fields inline (the contained object is decoded
+//!   against the registry and printed in place, rather than shown as an
+//!   opaque `any<Type>[N bytes]` blob).
+//!
+//! [`Registry::display_struct`]: dots_model::Registry::display_struct
 //!
 //! ```text
 //! ./dotsd                                              # in one terminal
@@ -40,9 +44,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // see types whose descriptors arrived during preload.
     app.publish(&DotsDescriptorRequest::default());
 
+    // The shared registry lets the handler expand `any` fields inline:
+    // the contained object is decoded and printed in place rather than
+    // shown as an opaque `any<Type>[N bytes]` blob.
+    let registry = app.registry().clone();
+
     // One handler for every type — the composite helper auto-installs
     // a dynamic subscription per descriptor (now and as new ones land).
-    let _all = app.subscribe_all_types(|event| {
+    let _all = app.subscribe_all_types(move |event| {
         let type_name = &event.value.descriptor.name;
         let sender = event
             .header
@@ -59,7 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             ""
         };
-        println!("[{type_name:<26}] from={sender:<4}{from_cache}{removal}  {}", event.value);
+        println!(
+            "[{type_name:<26}] from={sender:<4}{from_cache}{removal}  {}",
+            registry.display_struct(&event.value)
+        );
     });
 
     eprintln!("subscribed to every known type; press Ctrl-C to exit.");

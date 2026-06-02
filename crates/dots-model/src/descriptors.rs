@@ -301,6 +301,7 @@ pub fn field_kind_type_name(kind: &FieldKind) -> String {
         FieldKind::Vec(inner) => format!("vector<{}>", field_kind_type_name(inner)),
         FieldKind::Struct(d) => d.name.into(),
         FieldKind::Enum(d) => d.name.into(),
+        FieldKind::Any => "any".into(),
     }
 }
 
@@ -330,5 +331,6 @@ pub fn dyn_field_kind_type_name(kind: &dots_core::DynamicFieldKind) -> String {
         DynamicFieldKind::Vec(inner) => format!("vector<{}>", dyn_field_kind_type_name(inner)),
         DynamicFieldKind::Struct(d) => d.name.clone(),
         DynamicFieldKind::Enum(d) => d.name.clone(),
+        DynamicFieldKind::Any => "any".into(),
     }
 }

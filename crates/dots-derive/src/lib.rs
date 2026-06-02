@@ -555,6 +555,18 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
     }
 }
 
+/// True if `ty`'s last path segment is `AnyObject` — the DOTS open
+/// `any` field type. Matches both the bare `AnyObject` and the
+/// fully-qualified `dots_core::AnyObject` form.
+fn type_is_any(ty: &Type) -> bool {
+    if let Type::Path(tp) = ty {
+        if let Some(last) = tp.path.segments.last() {
+            return last.ident == "AnyObject";
+        }
+    }
+    false
+}
+
 /// If `ty` is `Vec<X>` for any `X`, return `&X`. Otherwise `None`.
 fn vec_element_type(ty: &Type) -> Option<&Type> {
     let Type::Path(tp) = ty else {
@@ -678,10 +690,20 @@ fn parse_field(field: &Field) -> syn::Result<DotsField<'_>> {
             "DOTS tags are 1-based; tag must be > 0",
         ));
     }
-    if tag > 63 {
+    if tag > 31 {
         return Err(syn::Error::new(
             field.span(),
-            "this iteration supports tags 1..=63 (PropertySet is u64 with bit n = tag n)",
+            "this iteration supports tags 1..=31 (PropertySet is u32 with bit n = tag n)",
+        ));
+    }
+
+    // `any` (and, later, `variant`) properties as keys are disallowed:
+    // comparing opaque heterogeneous blobs as keys is a footgun. Caught
+    // here syntactically by the `AnyObject` type name.
+    if attrs.is_key && type_is_any(inner_ty) {
+        return Err(syn::Error::new(
+            field.span(),
+            "`any` (AnyObject) properties cannot be `#[dots(key)]`",
         ));
     }
 

@@ -243,7 +243,8 @@ fn render_dots_type(ty: &PropertyType) -> String {
 /// Primitives match dots-cpp / dots-rust conventions:
 /// `bool`, `int8..int64`, `uint8..uint64`, `float32/64` → built-ins;
 /// `string` → `String`; `timepoint`/`steady_timepoint` → `Timepoint`;
-/// `duration` → `Duration`; `property_set` → `u64`; `uuid` → `[u8; 16]`.
+/// `duration` → `Duration`; `property_set` → `u64`; `uuid` → `[u8; 16]`;
+/// `any` → `dots_core::AnyObject`.
 /// Unknown identifiers pass through unchanged (they're user types).
 fn render_type(ty: &PropertyType) -> String {
     match ty {
@@ -270,6 +271,10 @@ fn map_primitive(name: &str) -> &str {
         "duration" => "dots_core::Duration",
         "property_set" => "u64",
         "uuid" => "[u8; 16]",
+        // Open `any` — an arbitrary DOTS object stored as an opaque
+        // self-describing envelope. (`variant { ... }` is not yet
+        // supported by the parser.)
+        "any" => "dots_core::AnyObject",
         // Unknown identifier — assume it's a user-defined struct/enum.
         other => other,
     }

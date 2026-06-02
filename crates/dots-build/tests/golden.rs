@@ -112,6 +112,21 @@ fn compile_to_dir_writes_combined_file_with_module_per_input() {
     assert!(combined.contains("pub enum B"));
 }
 
+#[test]
+fn any_field_maps_to_any_object() {
+    // An `any` property maps to `Option<dots_core::AnyObject>`; the
+    // contained type is not part of the static schema.
+    let src = "\
+struct Envelope {
+    1: [key] uint32 id;
+    2: any payload;
+}
+";
+    let file = parse_str(src).expect("parse should succeed");
+    let out = dots_build::generate(&file);
+    assert!(out.contains("pub payload: Option<dots_core::AnyObject>,"));
+}
+
 fn tempdir() -> std::path::PathBuf {
     let base = std::env::temp_dir().join(format!(
         "dots-build-test-{}-{}",

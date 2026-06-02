@@ -7,7 +7,7 @@ use crate::layout::{CborDecoder, CborEncoder};
 /// **Wire layout matches C++ DOTS:** bit `n` of the underlying `u32`
 /// represents tag `n`. Tag `0` is unused (DOTS tags are 1-based, so
 /// bit 0 is always zero in valid encodings); tag `1` is bit `1`,
-/// up to tag `63` at bit `63`.
+/// up to tag `31` at bit `31`.
 ///
 /// This 1:1 tag→bit mapping is what `PropertySet::FromIndex(tag)` does
 /// in dots-cpp (`lib/include/dots/type/PropertySet.h`). Diverging from

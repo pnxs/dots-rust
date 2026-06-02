@@ -286,7 +286,10 @@ impl PropertyCategory {
             Duration => Self::Duration,
             String => Self::String,
             Uuid => Self::Uuid,
-            PropertySet | Vec(_) | Struct(_) | Enum(_) => return None,
+            // `any` payloads are opaque, so they can't be filtered on
+            // server-side (the type identity is in the clear, but the
+            // value is not). Treat as non-comparable.
+            PropertySet | Vec(_) | Struct(_) | Enum(_) | Any => return None,
         })
     }
 

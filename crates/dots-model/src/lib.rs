@@ -54,7 +54,9 @@ pub use framing::{
     Transmission, decode_typed_transmission, encode_frame_with_header, encode_transmission,
     encode_transmission_into, encode_transmission_with_mask_into, parse_size_prefix,
 };
-pub use registry::{DescriptorEntry, Registry, RegistryError};
+pub use registry::{
+    DecodedAny, DescriptorEntry, FromAnyError, Registry, RegistryError, StructDisplay,
+};
 
 /// Register the DOTS-internal types — the handshake messages, the
 /// per-transmission [`DotsHeader`], descriptor-data types, and

@@ -353,6 +353,15 @@ impl App {
         &self.transceiver
     }
 
+    /// The shared type [`Registry`](dots_model::Registry) — the union
+    /// of compile-time types and types learned over the wire. Useful
+    /// for registry-aware rendering, e.g.
+    /// [`Registry::display_struct`](dots_model::Registry::display_struct)
+    /// to expand `any` fields in a trace.
+    pub fn registry(&self) -> &Arc<dots_model::Registry> {
+        self.transceiver.registry()
+    }
+
     pub fn subscribe<T>(
         &self,
         handler: impl FnMut(&Event<T>) + Send + 'static,

@@ -56,6 +56,10 @@ pub enum DynamicFieldKind {
     Vec(Box<DynamicFieldKind>),
     Struct(Arc<DynamicStructDescriptor>),
     Enum(Arc<DynamicEnumDescriptor>),
+    /// Open `any` — an opaque, self-describing object envelope. The
+    /// contained type isn't known from the schema; the value carries
+    /// its own type identity. See [`crate::AnyObject`].
+    Any,
 }
 
 /// Owned property metadata.
@@ -180,6 +184,7 @@ impl DynamicFieldKind {
             FieldKind::Enum(inner) => {
                 Self::Enum(Arc::new(DynamicEnumDescriptor::from_static(inner)))
             }
+            FieldKind::Any => Self::Any,
         }
     }
 }
@@ -218,6 +223,10 @@ pub enum DynamicValue {
     Timepoint(f64),
     /// Fractional-second duration.
     Duration(f64),
+    /// Open `any` value — the decoded `[type-name, payload]` envelope,
+    /// kept opaque. The inner object is *not* decoded here; recovering
+    /// it is a separate, registry-resolved step.
+    Any(crate::AnyObject),
 }
 
 /// A wire-only struct value: descriptor + sparse property map.
@@ -516,6 +525,9 @@ fn encode_value(value: &DynamicValue, e: &mut CborEncoder<'_>) -> Result<(), Enc
         DynamicValue::Struct(inner) => encode_struct(inner, inner.valid, e),
         DynamicValue::Enum(v) => e.i32(*v).map(|_| ()),
         DynamicValue::Timepoint(v) | DynamicValue::Duration(v) => e.f64(*v).map(|_| ()),
+        // Opaque passthrough: re-emit the `[type-name, payload]`
+        // envelope verbatim without touching the inner object.
+        DynamicValue::Any(a) => a.dots_encode(e),
     }
 }
 
@@ -593,6 +605,9 @@ fn decode_value(
         DynamicFieldKind::Enum(_) => Ok(DynamicValue::Enum(d.i32()?)),
         DynamicFieldKind::Timepoint => Ok(DynamicValue::Timepoint(d.f64()?)),
         DynamicFieldKind::Duration => Ok(DynamicValue::Duration(d.f64()?)),
+        // Read the opaque envelope into an `AnyObject` without decoding
+        // the contained object (the descriptor for it may not be known).
+        DynamicFieldKind::Any => Ok(DynamicValue::Any(crate::AnyObject::dots_decode(d)?)),
     }
 }
 
@@ -645,6 +660,11 @@ impl core::fmt::Display for DynamicValue {
             DynamicValue::Enum(v) => write!(f, "{v}"),
             DynamicValue::Timepoint(s) => write!(f, "{s}"),
             DynamicValue::Duration(s) => write!(f, "{s}"),
+            // Opaque: show the type identity and payload size, not the
+            // contained object (decoding it needs a registry).
+            DynamicValue::Any(a) => {
+                write!(f, "any<{}>[{} bytes]", a.type_name(), a.payload().len())
+            }
         }
     }
 }

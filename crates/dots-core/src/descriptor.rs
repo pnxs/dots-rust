@@ -56,6 +56,16 @@ pub enum FieldKind {
     Struct(&'static StructDescriptor),
     /// DOTS enum, statically known at compile time.
     Enum(&'static EnumDescriptor),
+
+    /// Open `any` — an arbitrary DOTS object stored inside a single
+    /// property as a self-describing, opaque CBOR envelope
+    /// (`[type-name, payload-bytes]`). Unlike a nested `Struct`, the
+    /// contained type is *not* derivable from the static schema, so the
+    /// type identity travels inside the value. The runtime
+    /// representation is [`crate::AnyObject`]; recovering the stored
+    /// object is an explicit, registry-resolved decode step
+    /// (`crate::AnyObject` + the broker's `Registry::from_any`).
+    Any,
 }
 
 impl PartialEq for FieldKind {
@@ -66,7 +76,8 @@ impl PartialEq for FieldKind {
             | (I8, I8) | (I16, I16) | (I32, I32) | (I64, I64)
             | (F32, F32) | (F64, F64)
             | (String, String) | (Uuid, Uuid)
-            | (Timepoint, Timepoint) | (Duration, Duration) => true,
+            | (Timepoint, Timepoint) | (Duration, Duration)
+            | (Any, Any) => true,
             (Vec(a), Vec(b)) => core::ptr::eq(*a, *b) || a == b,
             (Struct(a), Struct(b)) => core::ptr::eq(*a, *b),
             (Enum(a), Enum(b)) => core::ptr::eq(*a, *b),

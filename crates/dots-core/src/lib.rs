@@ -22,6 +22,7 @@ extern crate alloc;
 // `macro_tests` module below).
 extern crate self as dots_core;
 
+mod any;
 mod descriptor;
 pub mod dynamic;
 pub mod layout;
@@ -35,6 +36,7 @@ mod value;
 /// dep.
 pub use linkme;
 
+pub use any::{AnyObject, to_any};
 pub use descriptor::{
     DotsTypeKind, EnumDescriptor, EnumElement, FieldKind, PropertyDescriptor, PropertyVtable,
     StructDescriptor, StructFlags,
