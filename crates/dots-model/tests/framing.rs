@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use dots_core::encode_to_vec;
-use dots_derive::DotsStruct;
 use bytes::Bytes;
 use dots_model::{
     DotsHeader, FramingError, MAX_BODY_SIZE, RawTransmission, Registry, SIZE_PREFIX_LEN,
@@ -12,14 +11,19 @@ use dots_model::{
     parse_size_prefix,
 };
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Sample", cached)]
-struct Sample {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    label: Option<String>,
+mod model {
+    use dots_derive::DotsStruct;
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Sample", cached)]
+    pub struct Sample {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub label: Option<String>,
+    }
 }
+use model::*;
 
 fn header_for(payload_type: &str) -> DotsHeader {
     DotsHeader {

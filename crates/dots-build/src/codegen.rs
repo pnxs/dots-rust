@@ -123,7 +123,16 @@ fn emit_property(out: &mut String, prop: &Property) {
 
     let rust_ty = render_type(&prop.ty);
     let field_name = rustify_field_name(&prop.name);
-    let _ = writeln!(out, "    pub {}: Option<{}>,", field_name, rust_ty);
+    if prop.is_key() {
+        // Key properties are always present by contract, so they are
+        // stored as a bare `T` rather than `Option<T>`: an infallible
+        // `&T` accessor, always in the valid-set, and a smaller layout
+        // for scalar keys. The `Default`-derived placeholder doubles as
+        // the decode seed; decoding enforces that the key is present.
+        let _ = writeln!(out, "    pub {field_name}: {rust_ty},");
+    } else {
+        let _ = writeln!(out, "    pub {field_name}: Option<{rust_ty}>,");
+    }
 }
 
 fn emit_enum(out: &mut String, e: &EnumDef) {
@@ -355,7 +364,9 @@ mod tests {
         assert!(out.contains("pub struct DotsClient"));
         assert!(out.contains("#[dots(name = \"DotsClient\", cached, internal)]"));
         assert!(out.contains("#[dots(tag = 1, key)]"));
-        assert!(out.contains("pub id: Option<u32>,"));
+        // Key fields are emitted as bare `T` (not `Option<T>`).
+        assert!(out.contains("pub id: u32,"));
+        assert!(!out.contains("pub id: Option<u32>,"));
         assert!(out.contains("pub published_types: Option<Vec<String>>,"));
     }
 

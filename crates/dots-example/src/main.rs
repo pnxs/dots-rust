@@ -21,41 +21,45 @@ use dots_core::{
     AnyStruct, DynamicStruct, DynamicStructDescriptor, FieldKind, StructValue,
     decode_typed_from_slice, dots, encode_to_vec,
 };
-use dots_derive::DotsStruct;
+mod model {
+    use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, Clone)]
-#[dots(name = "Address")]
-struct Address {
-    #[dots(tag = 1)]
-    street: Option<String>,
-    #[dots(tag = 2)]
-    number: Option<u32>,
+    #[derive(DotsStruct, Default, Debug, Clone)]
+    #[dots(name = "Address")]
+    pub struct Address {
+        #[dots(tag = 1)]
+        pub street: Option<String>,
+        #[dots(tag = 2)]
+        pub number: Option<u32>,
+    }
+
+    #[derive(DotsStruct, Default, Debug, Clone)]
+    #[dots(name = "RoundtripData", cached, persistent)]
+    pub struct RoundtripData {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+
+        #[dots(tag = 2)]
+        pub payload: Option<String>,
+
+        #[dots(tag = 3)]
+        pub counter: Option<u64>,
+
+        #[dots(tag = 4)]
+        pub flag: Option<bool>,
+
+        #[dots(tag = 5)]
+        pub home: Option<Address>,
+
+        #[dots(tag = 6)]
+        pub raw: Option<Vec<u8>>,           // CBOR array of u8
+
+        #[dots(tag = 7)]
+        pub counters: Option<Vec<u32>>,     // CBOR array of u32
+    }
 }
 
-#[derive(DotsStruct, Default, Debug, Clone)]
-#[dots(name = "RoundtripData", cached, persistent)]
-struct RoundtripData {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-
-    #[dots(tag = 2)]
-    payload: Option<String>,
-
-    #[dots(tag = 3)]
-    counter: Option<u64>,
-
-    #[dots(tag = 4)]
-    flag: Option<bool>,
-
-    #[dots(tag = 5)]
-    home: Option<Address>,
-
-    #[dots(tag = 6)]
-    raw: Option<Vec<u8>>,           // CBOR array of u8
-
-    #[dots(tag = 7)]
-    counters: Option<Vec<u32>>,     // CBOR array of u32
-}
+use model::*;
 
 fn print_summary(label: &str, value: &dyn StructValue) {
     let d = value.descriptor();

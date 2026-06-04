@@ -104,6 +104,19 @@ impl<T, U: Into<T>> DotsAssignGeneric<T> for DotsAssign<U> {
     }
 }
 
+/// Coerce a value into a bare `#[dots(key)]` field's `T` (target type
+/// inferred from the struct-literal field). Used by the per-type
+/// companion macro the `dots!` macro delegates to. Unlike
+/// [`DotsAssign`], the result is `T`, not `Option<T>`.
+#[doc(hidden)]
+#[inline]
+pub fn __dots_into_bare<U, T>(value: U) -> T
+where
+    U: Into<T>,
+{
+    value.into()
+}
+
 /// Construct a DOTS struct literal with terse syntax.
 ///
 /// Each field's value is coerced into the field's `Option<T>` type:
@@ -154,7 +167,8 @@ mod macro_tests {
     fn dots_macro_recurses_into_nested_struct_literal() {
         let w = dots!(Wrap {
             tag: "outer",
-            inner: Foo { id: 7, name: "n" },
+            inner: Foo { id: 7, name: "n", ..Default::default() },
+            ..Default::default()
         });
         assert_eq!(w.tag.as_deref(), Some("outer"));
         let inner = w.inner.expect("inner set");
@@ -165,7 +179,7 @@ mod macro_tests {
 
     #[test]
     fn dots_macro_constructs_partial_struct() {
-        let foo = dots!(Foo { id: 42, name: "hi" });
+        let foo = dots!(Foo { id: 42, name: "hi", ..Default::default() });
         assert_eq!(foo.id, Some(42));
         assert_eq!(foo.name.as_deref(), Some("hi"));
         assert_eq!(foo.flag, None);
@@ -174,20 +188,20 @@ mod macro_tests {
 
     #[test]
     fn dots_macro_handles_typed_integer_literals() {
-        let foo = dots!(Foo { big_id: 9000_u64, flag: true });
+        let foo = dots!(Foo { big_id: 9000_u64, flag: true, ..Default::default() });
         assert_eq!(foo.big_id, Some(9000));
         assert_eq!(foo.flag, Some(true));
     }
 
     #[test]
     fn dots_macro_supports_trailing_comma() {
-        let foo = dots!(Foo { id: 1, });
+        let foo = dots!(Foo { id: 1, ..Default::default() });
         assert_eq!(foo.id, Some(1));
     }
 
     #[test]
     fn dots_macro_with_no_fields_yields_default() {
-        let foo = dots!(Foo {});
+        let foo = dots!(Foo { ..Default::default() });
         assert_eq!(foo, Foo::default());
     }
 
@@ -196,11 +210,11 @@ mod macro_tests {
         // `Option<u64>` flows verbatim — `Some(_)` stays `Some(_)`,
         // `None` stays `None`. No second `Some(_)` wrap.
         let upstream: Option<u64> = Some(7);
-        let foo = dots!(Foo { big_id: upstream });
+        let foo = dots!(Foo { big_id: upstream, ..Default::default() });
         assert_eq!(foo.big_id, Some(7));
 
         let cleared: Option<u64> = None;
-        let foo = dots!(Foo { big_id: cleared });
+        let foo = dots!(Foo { big_id: cleared, ..Default::default() });
         assert_eq!(foo.big_id, None);
     }
 
@@ -209,7 +223,7 @@ mod macro_tests {
         // Inner-type `Into` runs even when wrapped in `Option` —
         // `Option<&str>` lands in an `Option<String>` field.
         let upstream: Option<&str> = Some("hi");
-        let foo = dots!(Foo { name: upstream });
+        let foo = dots!(Foo { name: upstream, ..Default::default() });
         assert_eq!(foo.name.as_deref(), Some("hi"));
     }
 }

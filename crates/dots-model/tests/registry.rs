@@ -10,54 +10,58 @@
 use std::sync::Arc;
 
 use dots_core::{DynamicStruct, DynamicStructDescriptor, decode_typed_from_slice, encode_to_vec};
-use dots_derive::{DotsEnum, DotsStruct};
 use dots_model::{
     EnumDescriptorData, Registry, RegistryError, StructDescriptorData,
 };
 
 // ----- Fixture types (the "sender" side has these compiled) -----
 
-#[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
-#[dots(name = "Severity")]
-enum Severity {
-    #[default]
-    #[dots(tag = 1)]
-    Info,
-    #[dots(tag = 2)]
-    Warning,
-    #[dots(tag = 3)]
-    Error,
-}
+mod model {
+    use dots_derive::{DotsEnum, DotsStruct};
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Address")]
-struct Address {
-    #[dots(tag = 1)]
-    street: Option<String>,
-    #[dots(tag = 2)]
-    number: Option<u32>,
-}
+    #[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
+    #[dots(name = "Severity")]
+    pub enum Severity {
+        #[default]
+        #[dots(tag = 1)]
+        Info,
+        #[dots(tag = 2)]
+        Warning,
+        #[dots(tag = 3)]
+        Error,
+    }
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "LogEntry", cached)]
-struct LogEntry {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    message: Option<String>,
-    #[dots(tag = 3)]
-    severity: Option<Severity>,
-    #[dots(tag = 4)]
-    payload: Option<Vec<u8>>,
-    #[dots(tag = 5)]
-    counters: Option<Vec<u32>>,
-    #[dots(tag = 6)]
-    sender: Option<Address>,
-    #[dots(tag = 7)]
-    cc: Option<Vec<Address>>,
-    #[dots(tag = 8)]
-    severities_seen: Option<Vec<Severity>>,
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Address")]
+    pub struct Address {
+        #[dots(tag = 1)]
+        pub street: Option<String>,
+        #[dots(tag = 2)]
+        pub number: Option<u32>,
+    }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "LogEntry", cached)]
+    pub struct LogEntry {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub message: Option<String>,
+        #[dots(tag = 3)]
+        pub severity: Option<Severity>,
+        #[dots(tag = 4)]
+        pub payload: Option<Vec<u8>>,
+        #[dots(tag = 5)]
+        pub counters: Option<Vec<u32>>,
+        #[dots(tag = 6)]
+        pub sender: Option<Address>,
+        #[dots(tag = 7)]
+        pub cc: Option<Vec<Address>>,
+        #[dots(tag = 8)]
+        pub severities_seen: Option<Vec<Severity>>,
+    }
 }
+use model::*;
 
 // ----- Build a "received" registry the way a broker would -----
 

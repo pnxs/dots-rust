@@ -26,6 +26,9 @@ use dots_core::{
     PropertySet, Publishable, StructValue, Transmittable, decode_typed_from_slice, dots,
 };
 use dots_model::{DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello, DotsServerCapabilities, Registry, Transmission, encode_transmission_into, encode_transmission_with_mask_into, DotsCacheInfo};
+// `dots!` companion macros (see guest.rs note).
+#[allow(unused_imports)]
+use dots_model::*;
 use futures_util::{SinkExt, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;

@@ -11,31 +11,35 @@
 //! - nested DOTS structs (`Vec<Inner>`)
 
 use dots_core::{AnyStruct, FieldKind, decode_typed_from_slice, encode_to_vec};
-use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Tag")]
-struct Tag {
-    #[dots(tag = 1)]
-    name: Option<String>,
-    #[dots(tag = 2)]
-    weight: Option<u32>,
-}
+mod model {
+    use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Catalog", cached)]
-struct Catalog {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    raw: Option<Vec<u8>>,           // array of u8 (matches dots-cpp)
-    #[dots(tag = 3)]
-    counters: Option<Vec<u32>>,     // array of primitives
-    #[dots(tag = 4)]
-    labels: Option<Vec<String>>,    // array of owned strings
-    #[dots(tag = 5)]
-    tags: Option<Vec<Tag>>,         // array of nested DOTS structs
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Tag")]
+    pub struct Tag {
+        #[dots(tag = 1)]
+        pub name: Option<String>,
+        #[dots(tag = 2)]
+        pub weight: Option<u32>,
+    }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Catalog", cached)]
+    pub struct Catalog {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub raw: Option<Vec<u8>>,           // array of u8 (matches dots-cpp)
+        #[dots(tag = 3)]
+        pub counters: Option<Vec<u32>>,     // array of primitives
+        #[dots(tag = 4)]
+        pub labels: Option<Vec<String>>,    // array of owned strings
+        #[dots(tag = 5)]
+        pub tags: Option<Vec<Tag>>,         // array of nested DOTS structs
+    }
 }
+use model::*;
 
 #[test]
 fn field_kinds_route_correctly() {
@@ -143,12 +147,18 @@ fn vec_u32_uses_array_wire_format() {
 #[test]
 fn empty_vec_is_distinct_from_unset() {
     // An empty Vec is `Some(vec![])` — encoded but with array length 0.
-    // Unset is `None` — not in the map at all.
+    // Unset is `None` — not in the map at all. Both carry the key
+    // (tag 1) so they satisfy the decode-time key contract; the
+    // distinction under test is purely in the `counters` field.
     let with_empty = Catalog {
+        id: Some(1),
         counters: Some(vec![]),
         ..Default::default()
     };
-    let with_unset = Catalog::default();
+    let with_unset = Catalog {
+        id: Some(1),
+        ..Default::default()
+    };
 
     let b1 = encode_to_vec(&with_empty);
     let b2 = encode_to_vec(&with_unset);

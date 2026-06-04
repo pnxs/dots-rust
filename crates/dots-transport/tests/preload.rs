@@ -19,12 +19,13 @@
 use std::sync::Arc;
 
 use dots_core::{StructValue, decode_typed_from_slice, dots, encode_to_vec};
-use dots_derive::DotsStruct;
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
     Registry, StructDescriptorData, Transmission, encode_transmission,
     registry_with_internal_types,
 };
+#[allow(unused_imports)]
+use dots_model::*;
 use dots_transport::{
     ConnectionBuilder, ConnectionError, GuestTransceiver, TransmissionCodec,
 };
@@ -32,14 +33,19 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio_util::codec::Framed;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Pinger", cached)]
-struct Pinger {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    message: Option<String>,
+mod model {
+    use dots_derive::DotsStruct;
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Pinger", cached)]
+    pub struct Pinger {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub message: Option<String>,
+    }
 }
+use model::*;
 
 fn registry() -> Arc<Registry> {
     let reg = registry_with_internal_types();
@@ -304,7 +310,7 @@ async fn finish_preload_errors_when_not_in_early_subscribe() {
 
 #[tokio::test]
 async fn driver_ships_enum_descriptors_before_struct_descriptors() {
-    use dots_derive::DotsEnum;
+    use dots_derive::{DotsEnum, DotsStruct};
 
     #[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
     #[dots(name = "Color")]

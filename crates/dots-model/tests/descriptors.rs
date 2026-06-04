@@ -5,37 +5,41 @@ use std::sync::Arc;
 use dots_core::{
     DynamicStruct, DynamicStructDescriptor, DynamicValue, decode_typed_from_slice, encode_to_vec,
 };
-use dots_derive::DotsStruct;
 use dots_model::{
     DotsStructFlags, DotsStructScope, EnumDescriptorData, EnumElementDescriptor,
     StructDescriptorData, StructPropertyData,
 };
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Inner")]
-struct Inner {
-    #[dots(tag = 1)]
-    label: Option<String>,
-}
+mod model {
+    use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Sample", cached, persistent)]
-struct Sample {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    payload: Option<String>,
-    #[dots(tag = 3)]
-    flag: Option<bool>,
-    #[dots(tag = 4)]
-    raw: Option<Vec<u8>>,
-    #[dots(tag = 5)]
-    counters: Option<Vec<u32>>,
-    #[dots(tag = 6)]
-    inner: Option<Inner>,
-    #[dots(tag = 7)]
-    inners: Option<Vec<Inner>>,
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Inner")]
+    pub struct Inner {
+        #[dots(tag = 1)]
+        pub label: Option<String>,
+    }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Sample", cached, persistent)]
+    pub struct Sample {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub payload: Option<String>,
+        #[dots(tag = 3)]
+        pub flag: Option<bool>,
+        #[dots(tag = 4)]
+        pub raw: Option<Vec<u8>>,
+        #[dots(tag = 5)]
+        pub counters: Option<Vec<u32>>,
+        #[dots(tag = 6)]
+        pub inner: Option<Inner>,
+        #[dots(tag = 7)]
+        pub inners: Option<Vec<Inner>>,
+    }
 }
+use model::*;
 
 // ----- DotsStructFlags -----
 

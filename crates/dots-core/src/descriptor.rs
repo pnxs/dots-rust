@@ -102,11 +102,25 @@ impl Eq for FieldKind {}
 /// because `None` is bit-pattern zero for every primitive `T` plus
 /// `String`, `Vec<T>`, and `Box<_>` (niche optimization).
 pub struct PropertyVtable {
-    /// Layout of `Option<T>` for this property — used for sub-validation
-    /// and (later) potential per-property allocation strategies.
+    /// Layout of the field's storage type — `Option<T>` for ordinary
+    /// (optional) properties, or bare `T` for `#[dots(key)]` properties
+    /// stored unwrapped. Used for sub-validation and (later) potential
+    /// per-property allocation strategies.
     pub layout: Layout,
 
-    /// Returns whether the property is `Some(_)`.
+    /// Initialize a freshly zero-allocated slot to a valid value.
+    ///
+    /// For `Option<T>` fields this is a no-op: the zeroed buffer is
+    /// already a valid `None`. For bare-`T` key fields (whose zeroed
+    /// bits may be an *invalid* `T`, e.g. a null-pointer `String`) this
+    /// writes a valid `T::default()` so the slot is always sound to
+    /// read, drop, and overwrite. Called once per property by
+    /// [`AnyStruct::new`](crate::layout::AnyStruct::new) right after
+    /// zero-allocation, keeping the buffer fully valid at all times.
+    pub init: unsafe fn(*mut u8),
+
+    /// Returns whether the property is `Some(_)`. Bare-`T` key fields
+    /// are always set, so their thunk returns `true` unconditionally.
     pub is_set: unsafe fn(*const u8) -> bool,
 
     /// Reads the inner `T` (assumes `Some(_)`) and writes it to the
@@ -259,6 +273,21 @@ impl StructDescriptor {
     /// Iterate just the key properties.
     pub fn key_properties(&self) -> impl Iterator<Item = &'static PropertyDescriptor> {
         self.properties.iter().filter(|p| p.is_key)
+    }
+
+    /// Bitmask of all `#[dots(key)]` property tags. Every valid instance
+    /// of this type must have at least these properties set; decoding
+    /// rejects any wire value whose set of present tags doesn't include
+    /// the whole mask. For bare-`T` keys this is the contract that makes
+    /// the unwrapped storage sound.
+    pub fn key_mask(&self) -> crate::PropertySet {
+        let mut set = crate::PropertySet::EMPTY;
+        for prop in self.properties {
+            if prop.is_key {
+                set = set.with_tag(prop.tag);
+            }
+        }
+        set
     }
 
     /// `Layout` matching the typed struct — used by `AnyStruct::new` to

@@ -5,33 +5,38 @@
 //! typed path and the dynamic `AnyStruct` path. The two paths must
 //! produce byte-identical wire output for the same logical value.
 
+use dots_core::dots;
 use dots_core::{AnyStruct, StructValue, decode_typed_from_slice, encode_to_vec};
-use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Sample", cached)]
-struct Sample {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    payload: Option<String>,
-    #[dots(tag = 3)]
-    counter: Option<u64>,
-    #[dots(tag = 4)]
-    flag: Option<bool>,
-    #[dots(tag = 5)]
-    ratio: Option<f64>,
+mod model {
+    use dots_derive::DotsStruct;
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Sample", cached)]
+    pub struct Sample {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub payload: Option<String>,
+        #[dots(tag = 3)]
+        pub counter: Option<u64>,
+        #[dots(tag = 4)]
+        pub flag: Option<bool>,
+        #[dots(tag = 5)]
+        pub ratio: Option<f64>,
+    }
 }
+use model::*;
 
 #[test]
 fn typed_roundtrip_all_fields_set() {
-    let original = Sample {
-        id: Some(42),
-        payload: Some("hello".into()),
-        counter: Some(9000),
-        flag: Some(true),
-        ratio: Some(1.25),
-    };
+    let original = dots!(Sample {
+        id: 42u32,
+        payload: "hello".into(),
+        counter: 9000u64,
+        flag: true,
+        ratio: 1.25,
+    });
     let bytes = encode_to_vec(&original);
     let decoded: Sample = decode_typed_from_slice(&bytes).expect("decode succeeds");
     assert_eq!(original, decoded);
@@ -39,13 +44,10 @@ fn typed_roundtrip_all_fields_set() {
 
 #[test]
 fn typed_roundtrip_partial_object() {
-    let original = Sample {
-        id: Some(7),
-        payload: None,
-        counter: Some(1),
-        flag: None,
-        ratio: None,
-    };
+    let original = dots!(Sample {
+        id: 7u32,
+        counter: 1u64,
+    });
     let bytes = encode_to_vec(&original);
     let decoded: Sample = decode_typed_from_slice(&bytes).expect("decode succeeds");
     assert_eq!(original, decoded);
@@ -53,22 +55,25 @@ fn typed_roundtrip_partial_object() {
 }
 
 #[test]
-fn typed_roundtrip_empty_object() {
+fn empty_keyed_object_encodes_but_decode_rejects_missing_key() {
+    // A keyed struct with nothing set still *encodes* to an empty map
+    // (encode doesn't validate)...
     let original = Sample::default();
     let bytes = encode_to_vec(&original);
     // Empty CBOR map is a single byte: 0xa0.
     assert_eq!(bytes, [0xa0]);
-    let decoded: Sample = decode_typed_from_slice(&bytes).expect("decode succeeds");
-    assert_eq!(original, decoded);
-    assert!(decoded.valid_set().is_empty());
+    // ...but decoding now rejects it: every DOTS instance must carry its
+    // `#[dots(key)]` properties (tag 1 here). This holds for `Option<T>`
+    // keys as well as bare-`T` keys — it's the key *contract*, not the
+    // storage form.
+    assert!(decode_typed_from_slice::<Sample>(&bytes).is_err());
 }
 
 #[test]
 fn wire_format_is_sparse_map_keyed_by_tag() {
-    let s = Sample {
-        id: Some(42),
-        ..Default::default()
-    };
+    let s = dots!(Sample {
+        id: 42_u32,
+    });
     let bytes = encode_to_vec(&s);
     // 0xa1     = map of 1 pair
     // 0x01     = unsigned 1 (the property tag)
@@ -90,12 +95,11 @@ fn unknown_tags_are_skipped_for_forward_compat() {
 
 #[test]
 fn dynamic_decode_yields_same_logical_value() {
-    let original = Sample {
-        id: Some(11),
-        payload: Some("dyn".into()),
-        flag: Some(false),
-        ..Default::default()
-    };
+    let original = dots!(Sample {
+        id: 11_u32,
+        payload: "dyn".into(),
+        flag: false,
+    });
     let typed_bytes = encode_to_vec(&original);
 
     let any = AnyStruct::decode_from_slice(Sample::DESCRIPTOR, &typed_bytes)
@@ -149,6 +153,7 @@ fn anystruct_as_typed_returns_matching_pointer() {
 
 #[test]
 fn anystruct_as_typed_rejects_wrong_t() {
+    use dots_derive::DotsStruct;
     #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
     #[dots(name = "Other")]
     struct Other {
@@ -162,14 +167,15 @@ fn anystruct_as_typed_rejects_wrong_t() {
 
 #[test]
 fn dynamic_anystruct_zeroinit_decodes_safely() {
-    // Decode bytes that touch only some properties; verify the
-    // AnyStruct's all-fields-None starting state plus per-tag writes
-    // don't trip Drop or leak when the value goes out of scope.
+    // Decode bytes that touch only some properties (plus the required
+    // key); verify the AnyStruct's init + per-tag writes don't trip Drop
+    // or leak when the value goes out of scope.
     let bytes = encode_to_vec(&Sample {
+        id: Some(1),
         payload: Some("only payload".into()),
         ..Default::default()
     });
     let any = AnyStruct::decode_from_slice(Sample::DESCRIPTOR, &bytes).expect("decode succeeds");
-    assert_eq!(any.valid_set().len(), 1);
+    assert_eq!(any.valid_set().len(), 2);
     drop(any);
 }

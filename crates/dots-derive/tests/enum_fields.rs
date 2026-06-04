@@ -16,44 +16,47 @@ use dots_core::{
     AnyStruct, DynamicStruct, DynamicStructDescriptor, DynamicValue, FieldKind,
     decode_typed_from_slice, encode_to_vec,
 };
-use dots_derive::{DotsEnum, DotsStruct};
+mod model {
+    use dots_derive::{DotsEnum, DotsStruct};
 
-#[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
-#[dots(name = "Status")]
-enum Status {
-    #[default]
-    #[dots(tag = 1)]
-    Idle,
-    #[dots(tag = 2)]
-    Running,
-    #[dots(tag = 3)]
-    Failed,
-}
+    #[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
+    #[dots(name = "Status")]
+    pub enum Status {
+        #[default]
+        #[dots(tag = 1)]
+        Idle,
+        #[dots(tag = 2)]
+        Running,
+        #[dots(tag = 3)]
+        Failed,
+    }
 
-#[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
-#[dots(name = "Errno")]
-enum Errno {
-    #[default]
-    #[dots(tag = 1, value = 0)]
-    Ok,
-    #[dots(tag = 2, value = -1)]
-    Refused,
-    #[dots(tag = 3, value = -42)]
-    BadMessage,
-}
+    #[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
+    #[dots(name = "Errno")]
+    pub enum Errno {
+        #[default]
+        #[dots(tag = 1, value = 0)]
+        Ok,
+        #[dots(tag = 2, value = -1)]
+        Refused,
+        #[dots(tag = 3, value = -42)]
+        BadMessage,
+    }
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Job")]
-struct Job {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    status: Option<Status>,
-    #[dots(tag = 3)]
-    last_error: Option<Errno>,
-    #[dots(tag = 4)]
-    history: Option<Vec<Status>>,
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Job")]
+    pub struct Job {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub status: Option<Status>,
+        #[dots(tag = 3)]
+        pub last_error: Option<Errno>,
+        #[dots(tag = 4)]
+        pub history: Option<Vec<Status>>,
+    }
 }
+use model::*;
 
 // ----- Descriptor metadata -----
 

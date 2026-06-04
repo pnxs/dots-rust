@@ -25,6 +25,11 @@ use dots_model::{
     StructDescriptorData, Transmission, encode_transmission_into, encode_transmission_with_mask_into,
     filter::DotsFilter,
 };
+// Bring the per-type `dots!` companion macros (`__dots_ctor_*`,
+// `#[macro_export]`ed by `#[derive(DotsStruct)]` in dots-model) into
+// scope so `dots!(DotsHeader { .. })` resolves cross-crate.
+#[allow(unused_imports)]
+use dots_model::*;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Notify, mpsc};

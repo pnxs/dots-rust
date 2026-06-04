@@ -9,26 +9,31 @@
 //!   outer encode/decode, then decodes back to the original via its
 //!   static descriptor.
 
-use dots_core::{AnyObject, FieldKind, decode_typed_from_slice, encode_to_vec, to_any};
-use dots_derive::DotsStruct;
+use dots_core::{FieldKind, decode_typed_from_slice, encode_to_vec, to_any};
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Ping")]
-struct Ping {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    note: Option<String>,
-}
+mod model {
+    use dots_core::AnyObject;
+    use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Envelope")]
-struct Envelope {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    payload: Option<AnyObject>,
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Ping")]
+    pub struct Ping {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub note: Option<String>,
+    }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Envelope")]
+    pub struct Envelope {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub payload: Option<AnyObject>,
+    }
 }
+use model::*;
 
 #[test]
 fn any_field_kind_is_any() {

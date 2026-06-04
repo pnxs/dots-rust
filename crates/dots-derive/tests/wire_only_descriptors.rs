@@ -9,35 +9,39 @@
 use std::sync::Arc;
 
 use dots_core::{DynamicStruct, DynamicStructDescriptor, DynamicValue, encode_to_vec};
-use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Pin")]
-struct Pin {
-    #[dots(tag = 1)]
-    label: Option<String>,
-    #[dots(tag = 2)]
-    weight: Option<u32>,
-}
+mod model {
+    use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Wire")]
-struct Wire {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    label: Option<String>,
-    #[dots(tag = 3)]
-    flag: Option<bool>,
-    #[dots(tag = 4)]
-    raw: Option<Vec<u8>>,
-    #[dots(tag = 5)]
-    counters: Option<Vec<u32>>,
-    #[dots(tag = 6)]
-    pins: Option<Vec<Pin>>,
-    #[dots(tag = 7)]
-    primary_pin: Option<Pin>,
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Pin")]
+    pub struct Pin {
+        #[dots(tag = 1)]
+        pub label: Option<String>,
+        #[dots(tag = 2)]
+        pub weight: Option<u32>,
+    }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Wire")]
+    pub struct Wire {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub label: Option<String>,
+        #[dots(tag = 3)]
+        pub flag: Option<bool>,
+        #[dots(tag = 4)]
+        pub raw: Option<Vec<u8>>,
+        #[dots(tag = 5)]
+        pub counters: Option<Vec<u32>>,
+        #[dots(tag = 6)]
+        pub pins: Option<Vec<Pin>>,
+        #[dots(tag = 7)]
+        pub primary_pin: Option<Pin>,
+    }
 }
+use model::*;
 
 fn dyn_descriptor() -> Arc<DynamicStructDescriptor> {
     Arc::new(DynamicStructDescriptor::from_static(Wire::DESCRIPTOR))

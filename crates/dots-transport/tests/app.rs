@@ -24,7 +24,8 @@ fn app_lock() -> MutexGuard<'static, ()> {
 }
 
 use dots_core::{StructValue, decode_typed_from_slice, dots, encode_to_vec};
-use dots_derive::DotsStruct;
+#[allow(unused_imports)]
+use dots_model::*;
 use dots_model::{
     DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect, DotsMsgConnectResponse,
     DotsMsgHello, Registry, StructDescriptorData, Transmission, encode_transmission,
@@ -37,27 +38,32 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Pinger", cached)]
-struct Pinger {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    message: Option<String>,
-}
+mod model {
+    use dots_derive::DotsStruct;
 
-/// Used in the early-subscribe wire-flow test below to exercise the
-/// publish-only path: monomorphizing `app.publish::<PreloadPubOnly>`
-/// puts the type in `PUBLISHED_TYPES` (so its descriptor ships during
-/// EarlySubscribe), but nothing in this test binary calls
-/// `subscribe::<PreloadPubOnly>` so it stays out of `SUBSCRIBED_TYPES`
-/// (so no auto-`DotsMember(Join)` is emitted for it).
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "PreloadPubOnly", cached)]
-struct PreloadPubOnly {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Pinger", cached)]
+    pub struct Pinger {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub message: Option<String>,
+    }
+
+    /// Used in the early-subscribe wire-flow test below to exercise the
+    /// publish-only path: monomorphizing `app.publish::<PreloadPubOnly>`
+    /// puts the type in `PUBLISHED_TYPES` (so its descriptor ships during
+    /// EarlySubscribe), but nothing in this test binary calls
+    /// `subscribe::<PreloadPubOnly>` so it stays out of `SUBSCRIBED_TYPES`
+    /// (so no auto-`DotsMember(Join)` is emitted for it).
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "PreloadPubOnly", cached)]
+    pub struct PreloadPubOnly {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+    }
 }
+use model::*;
 
 fn registry() -> Arc<Registry> {
     let reg = registry_with_internal_types();

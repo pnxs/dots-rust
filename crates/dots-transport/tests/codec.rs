@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use dots_core::{DynamicStruct, decode_typed_from_slice, dots, encode_to_vec};
-use dots_derive::DotsStruct;
+#[allow(unused_imports)]
+use dots_model::*;
 use dots_model::{
     DotsHeader, FramingError, MAX_BODY_SIZE, Registry, SIZE_PREFIX_MARKER, StructDescriptorData,
     Transmission,
@@ -20,14 +21,19 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Sample", cached)]
-struct Sample {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    label: Option<String>,
+mod model {
+    use dots_derive::DotsStruct;
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Sample", cached)]
+    pub struct Sample {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub label: Option<String>,
+    }
 }
+use model::*;
 
 fn populated_registry() -> Arc<Registry> {
     let reg = Registry::new();

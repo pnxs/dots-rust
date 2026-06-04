@@ -7,20 +7,24 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dots_core::dots;
-use dots_derive::DotsStruct;
 use dots_model::{Registry, filter::predicate, registry_with_internal_types};
 use dots_transport::{ConnectionBuilder, GuestTransceiver, HostTransceiver, ViewOp};
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Pinger", cached)]
-struct Pinger {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    message: Option<String>,
-    #[dots(tag = 3)]
-    sequence: Option<u64>,
+mod model {
+    use dots_derive::DotsStruct;
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Pinger", cached)]
+    pub struct Pinger {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub message: Option<String>,
+        #[dots(tag = 3)]
+        pub sequence: Option<u64>,
+    }
 }
+use model::*;
 
 fn registry() -> Arc<Registry> {
     Arc::new(registry_with_internal_types())

@@ -8,16 +8,20 @@
 //! arbitrary binary blobs use `Vec<u8>` (DOTS `vector<uint8>`).
 
 use dots_core::{FieldKind, decode_typed_from_slice, encode_to_vec};
-use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Token")]
-struct Token {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    fingerprint: Option<[u8; 16]>,
+mod model {
+    use dots_derive::DotsStruct;
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Token")]
+    pub struct Token {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub fingerprint: Option<[u8; 16]>,
+    }
 }
+use model::*;
 
 #[test]
 fn uuid_field_kind_is_uuid() {

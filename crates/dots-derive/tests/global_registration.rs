@@ -21,21 +21,25 @@
 //! caches and the application proceeds.
 
 use dots_core::{GlobalRegistration, PUBLISHED_TYPES, SUBSCRIBED_TYPES};
-use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Foo")]
-struct Foo {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-}
+mod model {
+    use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Bar")]
-struct Bar {
-    #[dots(tag = 1)]
-    note: Option<String>,
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Foo")]
+    pub struct Foo {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+    }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Bar")]
+    pub struct Bar {
+        #[dots(tag = 1)]
+        pub note: Option<String>,
+    }
 }
+use model::*;
 
 #[test]
 fn subscribing_a_type_adds_it_to_subscribed_types() {

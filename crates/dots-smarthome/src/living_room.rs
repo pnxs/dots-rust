@@ -4,11 +4,12 @@
 //! publish the same `brightness` to both `LIVING_ROOM_COUCH_LIGHT`
 //! and `LIVING_ROOM_CEILING_LIGHT`.
 
-use dots_core::dots;
 use dots_transport::{App, SubscriptionHandle};
 
+use dots_core::dots;
+
 use crate::ids::{LIVING_ROOM_CEILING_LIGHT, LIVING_ROOM_COUCH_LIGHT, LIVING_ROOM_MASTER_DIMMER};
-use crate::model::{Dimmer, LightControl};
+use crate::model::*;
 
 pub struct LivingRoom {
     /// Hold the subscription so dropping the component removes the
@@ -21,7 +22,8 @@ impl LivingRoom {
         let client = app.client();
         let sub = app.subscribe::<Dimmer>(move |event| {
             let dimmer = &event.value;
-            if dimmer.id.as_deref() != Some(LIVING_ROOM_MASTER_DIMMER) {
+            // `id` is now a bare-`String` key: use the infallible getter.
+            if dimmer.id != LIVING_ROOM_MASTER_DIMMER {
                 return;
             }
 

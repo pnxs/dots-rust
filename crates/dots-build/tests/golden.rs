@@ -49,7 +49,8 @@ fn generated_source_contains_expected_items() {
     // DotsClient checks
     assert!(out.contains("pub struct DotsClient"));
     assert!(out.contains("#[dots(name = \"DotsClient\", cached, internal)]"));
-    assert!(out.contains("pub id: Option<u32>,"));
+    // Key field is bare `T`, not `Option<T>`.
+    assert!(out.contains("pub id: u32,"));
     assert!(out.contains("pub published_types: Option<Vec<String>>,"));
     // DotsConnectionState reference passes through unchanged.
     assert!(out.contains("pub connection_state: Option<DotsConnectionState>,"));

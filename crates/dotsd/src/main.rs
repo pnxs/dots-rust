@@ -32,9 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dots_core::dots;
-use dots_model::{
-    DotsClient, DotsClientStatistics, DotsConnectionState, DotsStatistics,
-};
+use dots_model::*;
 use dots_transport::{
     ConnectionTransition, Endpoint, EndpointHandle, GuestStats, HostTransceiver, parse_endpoint,
 };

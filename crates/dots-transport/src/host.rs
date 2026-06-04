@@ -36,6 +36,9 @@ use dots_model::{
     encode_frame_with_header, encode_transmission_into, encode_transmission_with_mask_into,
     filter::DotsFilter,
 };
+// `dots!` companion macros (see guest.rs note).
+#[allow(unused_imports)]
+use dots_model::*;
 
 use crate::filter::CompiledPredicate;
 use futures_util::StreamExt;

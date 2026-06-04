@@ -22,6 +22,9 @@ use std::sync::{Arc, Mutex, Weak};
 
 use dots_core::{StructValue, dots, encode_key_bytes};
 use dots_model::{DotsHeader, Transmission, filter::DotsFilter};
+// `dots!` companion macros (see guest.rs note).
+#[allow(unused_imports)]
+use dots_model::*;
 
 use crate::connection::ViewDispatch;
 use crate::container::{Container, ContainerEntry};

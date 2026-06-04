@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use dots_core::{StructValue, dots, encode_to_vec};
-use dots_derive::DotsStruct;
+#[allow(unused_imports)]
+use dots_model::*;
 use dots_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
     Registry, Transmission, encode_transmission, registry_with_internal_types,
@@ -17,6 +18,20 @@ use dots_transport::{Connection, ConnectionBuilder, ConnectionError, Transmissio
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio_util::codec::Framed;
+
+mod model {
+    use dots_derive::DotsStruct;
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Demo")]
+    pub struct Demo {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub note: Option<String>,
+    }
+}
+use model::*;
 
 fn registry() -> Arc<Registry> {
     Arc::new(registry_with_internal_types())
@@ -330,15 +345,6 @@ async fn establish_errors_when_server_closes_before_hello() {
 }
 
 // ----- Post-handshake usage -----
-
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Demo")]
-struct Demo {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    note: Option<String>,
-}
 
 #[tokio::test]
 async fn send_typed_after_handshake_reaches_server() {

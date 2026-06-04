@@ -31,7 +31,7 @@ mod tests {
     #[test]
     fn generated_status_uses_temporal_newtypes() {
         let s = StatusReport {
-            server_name: Some("srv".into()),
+            server_name: "srv".into(),
             start_time: Some(dots_core::Timepoint(123.0)),
             uptime: Some(dots_core::Duration(45.0)),
         };

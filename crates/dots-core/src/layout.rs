@@ -60,10 +60,28 @@ pub struct AnyStruct {
 }
 
 impl AnyStruct {
-    /// Allocate a fresh, all-fields-`None` instance for the given descriptor.
+    /// Allocate a fresh instance for the given descriptor.
+    ///
+    /// `Option<T>` fields begin as `None` (the zero bit-pattern). Bare-`T`
+    /// key fields, whose zeroed bytes may be an invalid `T`, are then
+    /// initialized to a valid `T::default()` via their `init` thunk, so
+    /// the whole buffer is a valid struct value from this point on — a
+    /// precondition every other thunk (`drop`/`decode`/`clone`) and the
+    /// `as_typed` reinterpret rely on. The placeholder key value is
+    /// transient: it is overwritten by decode/clone, and the `valid` set
+    /// (not the bytes) is the source of truth for which properties are
+    /// really present.
     pub fn new(descriptor: &'static StructDescriptor) -> Self {
         let layout = descriptor.layout();
         let data = allocate_zeroed(layout);
+        for prop in descriptor.properties {
+            // SAFETY: `prop.offset` is in-range for `descriptor`'s layout
+            // by construction; the slot is freshly zero-allocated, which
+            // is exactly the precondition `init` expects.
+            unsafe {
+                (prop.vtable.init)(data.as_ptr().add(prop.offset));
+            }
+        }
         Self {
             descriptor,
             valid: PropertySet::EMPTY,
@@ -472,6 +490,18 @@ unsafe fn decode_into_raw(
             }
         }
     }
+    // Key contract: every `#[dots(key)]` property must be present. This
+    // is what dotsd guarantees for real instances; enforcing it here
+    // means a malformed/partial wire value is rejected as a decode error
+    // rather than producing a struct with a bogus placeholder key (and,
+    // for bare-`T` keys, it keeps `as_typed` honest). Keyless types have
+    // an empty mask, so this is a no-op for them.
+    let key_mask = descriptor.key_mask();
+    if (*valid & key_mask) != key_mask {
+        return Err(DecodeError::message(
+            "decoded DOTS struct is missing one or more `#[dots(key)]` properties",
+        ));
+    }
     Ok(())
 }
 
@@ -822,4 +852,116 @@ where
         core::ptr::write(p, Some(out));
     }
     Ok(())
+}
+
+// ===== Bare-`T` key thunk family (Approach A) =====
+//
+// A `#[dots(key)]` property may be stored as a bare `T` rather than
+// `Option<T>`: a key is, by contract, always present, so the optional
+// wrapper buys nothing and only costs a discriminant. The trade-off is
+// that a zeroed buffer is *not* automatically a valid `T` for non-`Copy`
+// keys (a zeroed `String` is a null-pointer `String` — UB to read or
+// drop). We keep the buffer sound by giving key slots an `init` thunk
+// that writes a valid `T::default()` immediately after zero-allocation
+// (see `AnyStruct::new`). From that point every slot is a valid `T`, so
+// the decode/drop/clone thunks below can drop-then-write exactly like
+// their `opt_*` cousins — there is never an invalid-bits window.
+
+/// No-op initializer for `Option<T>` fields: a zeroed slot is already a
+/// valid `None`, so nothing to do.
+///
+/// # Safety
+///
+/// `ptr` must point to a zero-initialized `Option<T>` slot (trivially
+/// satisfied; the body touches nothing).
+pub unsafe fn init_noop(_ptr: *mut u8) {}
+
+/// Initialize a bare-`T` key slot to `T::default()`, writing over the
+/// (possibly invalid) zeroed bytes *without* dropping them.
+///
+/// # Safety
+///
+/// `ptr` must point to a `T`-sized, `T`-aligned slot that is **not yet
+/// initialized** (e.g. freshly zero-allocated). The old bytes are
+/// overwritten with `core::ptr::write`, so they are never dropped —
+/// which is exactly what we need, since zeroed bytes may be an invalid
+/// `T`.
+pub unsafe fn key_init<T: Default>(ptr: *mut u8) {
+    // SAFETY: caller-upheld; `write` does not drop the prior bytes.
+    unsafe {
+        core::ptr::write(ptr as *mut T, T::default());
+    }
+}
+
+/// A bare-`T` key is always set.
+///
+/// # Safety
+///
+/// Trivially safe; signature matches the vtable slot.
+pub unsafe fn key_is_set(_ptr: *const u8) -> bool {
+    true
+}
+
+/// Encode the bare `T` at `ptr`.
+///
+/// # Safety
+///
+/// `ptr` must point to a valid `T`.
+pub unsafe fn key_encode<T>(ptr: *const u8, e: &mut CborEncoder<'_>) -> Result<(), EncodeError>
+where
+    T: DotsField,
+{
+    // SAFETY: caller-upheld.
+    let v = unsafe { &*(ptr as *const T) };
+    v.dots_encode(e)
+}
+
+/// Decode a `T` from the decoder and write it to the bare-`T` slot at
+/// `ptr`, dropping the previous value first.
+///
+/// # Safety
+///
+/// `ptr` must point to a valid `T` (the slot is kept valid by `key_init`
+/// at allocation and by every prior write), live for the call.
+pub unsafe fn key_decode<T>(ptr: *mut u8, d: &mut CborDecoder<'_>) -> Result<(), DecodeError>
+where
+    T: DotsField,
+{
+    let value: T = T::dots_decode(d)?;
+    let p = ptr as *mut T;
+    // SAFETY: `p` points to a valid `T` per caller contract; drop-then-
+    // write is sound because the slot is always initialized.
+    unsafe {
+        core::ptr::drop_in_place(p);
+        core::ptr::write(p, value);
+    }
+    Ok(())
+}
+
+/// Drop the bare `T` at `ptr` in place.
+///
+/// # Safety
+///
+/// `ptr` must point to a valid `T`.
+pub unsafe fn key_drop<T>(ptr: *mut u8) {
+    // SAFETY: caller-upheld.
+    unsafe {
+        core::ptr::drop_in_place(ptr as *mut T);
+    }
+}
+
+/// Clone the bare `T` at `src` into the bare-`T` slot at `dst`, dropping
+/// any existing value at `dst` first.
+///
+/// # Safety
+///
+/// `src` and `dst` must each point to a valid `T`.
+pub unsafe fn key_clone<T: Clone>(src: *const u8, dst: *mut u8) {
+    // SAFETY: caller-upheld.
+    let cloned: T = unsafe { (*(src as *const T)).clone() };
+    let p = dst as *mut T;
+    unsafe {
+        core::ptr::drop_in_place(p);
+        core::ptr::write(p, cloned);
+    }
 }

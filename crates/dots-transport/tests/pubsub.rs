@@ -13,33 +13,39 @@
 use std::sync::Arc;
 
 use dots_core::{PropertySet, StructValue, decode_typed_from_slice, dots, encode_to_vec};
-use dots_derive::DotsStruct;
 use dots_model::{
     DotsHeader, DotsMsgConnectResponse, DotsMsgHello, Registry, Transmission,
     encode_transmission, registry_with_internal_types,
 };
+#[allow(unused_imports)]
+use dots_model::*;
 use dots_transport::{Connection, TransmissionCodec};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio_util::codec::Framed;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Pinger", cached)]
-struct Pinger {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    message: Option<String>,
-    #[dots(tag = 3)]
-    sequence: Option<u64>,
-}
+mod model {
+    use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Bonk")]
-struct Bonk {
-    #[dots(tag = 1)]
-    note: Option<String>,
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Pinger", cached)]
+    pub struct Pinger {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub message: Option<String>,
+        #[dots(tag = 3)]
+        pub sequence: Option<u64>,
+    }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Bonk")]
+    pub struct Bonk {
+        #[dots(tag = 1)]
+        pub note: Option<String>,
+    }
 }
+use model::*;
 
 fn registry() -> Arc<Registry> {
     let reg = registry_with_internal_types();

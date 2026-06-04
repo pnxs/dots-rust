@@ -11,13 +11,14 @@
 //! ```
 
 use std::time::Duration;
-use dots_core::dots;
 use dots_smarthome::ids::{
     BASEMENT_MOTION_SWITCH, LIVING_ROOM_MASTER_DIMMER, STAIRWELL_LOWER_SWITCH,
     STAIRWELL_UPPER_SWITCH,
 };
+use dots_core::dots;
 use dots_smarthome::model::{Dimmer, StatelessSwitch, Switch};
 use dots_transport::App;
+use dots_smarthome::*;
 
 const APP_NAME: &str = "smart-home-sim";
 

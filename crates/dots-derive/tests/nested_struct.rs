@@ -9,27 +9,31 @@
 //!   descriptor is reachable through the parent's descriptor tree.
 
 use dots_core::{AnyStruct, FieldKind, StructValue, decode_typed_from_slice, encode_to_vec};
-use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Address")]
-struct Address {
-    #[dots(tag = 1)]
-    street: Option<String>,
-    #[dots(tag = 2)]
-    number: Option<u32>,
-}
+mod model {
+    use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Person", cached)]
-struct Person {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    name: Option<String>,
-    #[dots(tag = 3)]
-    home: Option<Address>,
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Address")]
+    pub struct Address {
+        #[dots(tag = 1)]
+        pub street: Option<String>,
+        #[dots(tag = 2)]
+        pub number: Option<u32>,
+    }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Person", cached)]
+    pub struct Person {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub name: Option<String>,
+        #[dots(tag = 3)]
+        pub home: Option<Address>,
+    }
 }
+use model::*;
 
 #[test]
 fn nested_field_kind_is_struct() {

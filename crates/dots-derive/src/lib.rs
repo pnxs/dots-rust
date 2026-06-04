@@ -87,24 +87,56 @@ fn expand_dots_struct(expr: &syn::ExprStruct) -> TokenStream2 {
     }
 
     let path = &expr.path;
-    let field_assignments = expr.fields.iter().map(|fv| {
-        let member = &fv.member;
-        let value_tokens = expand_dots_field_value(&fv.expr);
-        quote! { #member: #value_tokens }
-    });
-    let rest_tokens = match &expr.rest {
-        Some(rest) => quote! { ..#rest },
-        None => quote! { ..::core::default::Default::default() },
+
+    // With an explicit `..rest` base, keep the original struct-literal
+    // expansion: the base supplies the remaining fields, so there's no
+    // key contract to enforce and no companion needed. (Bare-`T` keys
+    // combined with `..rest` are an unsupported edge for now.)
+    if let Some(rest) = &expr.rest {
+        let field_assignments = expr.fields.iter().map(|fv| {
+            let member = &fv.member;
+            let value_tokens = expand_dots_field_value(&fv.expr);
+            quote! { #member: #value_tokens }
+        });
+        return quote! {
+            {
+                #[allow(clippy::needless_update)]
+                #path {
+                    #(#field_assignments,)*
+                    ..#rest
+                }
+            }
+        };
+    }
+
+    // No base: delegate to the type's companion macro (Escape B). It
+    // knows which fields are keys, so it can default absent optionals to
+    // `None`, coerce bare-`T` keys, and `compile_error!` on a missing
+    // key — none of which this schema-blind proc-macro can do itself.
+    let Some(last) = path.segments.last() else {
+        return syn::Error::new_spanned(path, "dots!: type path must not be empty").to_compile_error();
     };
+    let macro_ident = ctor_macro_ident(&last.ident);
+    let field_pairs = expr.fields.iter().map(|fv| {
+        let member = &fv.member;
+        let value = dots_value_for_companion(&fv.expr);
+        quote! { #member : #value }
+    });
 
     quote! {
-        {
-            #[allow(clippy::needless_update)]
-            #path {
-                #(#field_assignments,)*
-                #rest_tokens
-            }
-        }
+        #macro_ident! { @ty #path ; #( #field_pairs ),* }
+    }
+}
+
+/// Value-expression preprocessing for the companion path: a nested
+/// struct literal is rewritten recursively (so it too routes through its
+/// type's companion), everything else is passed through verbatim. The
+/// per-field coercion (`Some`-wrap / bare-key) happens inside the
+/// companion macro, not here.
+fn dots_value_for_companion(expr: &syn::Expr) -> TokenStream2 {
+    match expr {
+        syn::Expr::Struct(inner) => expand_dots_struct(inner),
+        other => quote! { #other },
     }
 }
 
@@ -144,9 +176,15 @@ struct FieldAttrs {
 
 struct DotsField<'a> {
     ident: &'a Ident,
+    /// The value type `T`. For ordinary `Option<T>` fields this is the
+    /// `Option`'s inner type; for a bare-`T` key (`bare_key == true`) it
+    /// is the field type itself.
     inner_ty: &'a Type,
     tag: u32,
     is_key: bool,
+    /// True when this is a `#[dots(key)]` field written as bare `T`
+    /// (not `Option<T>`): stored unwrapped, always-set, accessed as `&T`.
+    bare_key: bool,
     kind: TokenStream2,
     /// `///` doc-comment lines on the field, with the leading `=`
     /// stripped. Used to populate the generated `new`-constructor's
@@ -225,6 +263,9 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let flags_expr = build_flags_expr(&container);
 
+    // Per-type companion macro that `dots!` delegates to (Escape B).
+    let companion = companion_macro(struct_ident, &fields);
+
     // Per-field constants for the filter DSL (one PropertySet
     // projection-bit, plus a typed `Attr<Self, V>` handle for leaf
     // value types that the wire predicate value-slots support).
@@ -263,6 +304,37 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         let has_ident = Ident::new(&format!("has_{bare}"), ident.span());
         let with_ident = Ident::new(&format!("with_{bare}"), ident.span());
         let clear_ident = Ident::new(&format!("clear_{bare}"), ident.span());
+
+        if f.bare_key {
+            // Bare-`T` key: always present, so the getter is infallible
+            // (`&T`, no `Option`) and there is no `clear_*` — a key can't
+            // be unset. The contract (key always set) is enforced at
+            // construction and at decode.
+            return quote! {
+                #[doc = concat!("Borrow the `", stringify!(#ident), "` key property (always set).")]
+                #[inline]
+                pub fn #ident(&self) -> &#inner_ty {
+                    &self.#ident
+                }
+
+                #[doc = concat!("Always `true`: `", stringify!(#ident), "` is a key property and is always set.")]
+                #[inline]
+                pub fn #has_ident(&self) -> bool {
+                    true
+                }
+
+                #[doc = concat!("Builder: set the `", stringify!(#ident), "` key property.")]
+                #[inline]
+                pub fn #with_ident<__V>(mut self, value: __V) -> Self
+                where
+                    __V: ::core::convert::Into<#inner_ty>,
+                {
+                    self.#ident = value.into();
+                    self
+                }
+            };
+        }
+
         quote! {
             #[doc = concat!("Borrow the `", stringify!(#ident), "` property if set.")]
             #[inline]
@@ -312,7 +384,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         });
         let new_inits = key_fields.iter().map(|f| {
             let ident = f.ident;
-            quote! { #ident: ::core::option::Option::Some(#ident.into()) }
+            if f.bare_key {
+                quote! { #ident: #ident.into() }
+            } else {
+                quote! { #ident: ::core::option::Option::Some(#ident.into()) }
+            }
         });
 
         // Build a per-key argument doc list. Each `///` line on a key
@@ -363,9 +439,16 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let valid_set_arms = fields.iter().map(|f| {
         let ident = f.ident;
         let tag = f.tag;
-        quote! {
-            if self.#ident.is_some() {
+        if f.bare_key {
+            // Bare-`T` key is always present.
+            quote! {
                 set = set.with_tag(#tag);
+            }
+        } else {
+            quote! {
+                if self.#ident.is_some() {
+                    set = set.with_tag(#tag);
+                }
             }
         }
     });
@@ -513,6 +596,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ::dots_core::layout::decode_struct_default::<Self>(d)
             }
         }
+
+        #companion
     };
 
     Ok(output)
@@ -529,11 +614,28 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
     let inner_ty = f.inner_ty;
     let vtable_ident = vtable_ident(f.ident);
 
+    if f.bare_key {
+        // Bare-`T` key: stored unwrapped. Slot starts at `T::default()`
+        // (via `key_init`) so every thunk can assume a valid `T`.
+        return quote! {
+            static #vtable_ident: ::dots_core::PropertyVtable = ::dots_core::PropertyVtable {
+                layout: ::core::alloc::Layout::new::<#inner_ty>(),
+                init: ::dots_core::layout::key_init::<#inner_ty>,
+                is_set: ::dots_core::layout::key_is_set,
+                encode_value: ::dots_core::layout::key_encode::<#inner_ty>,
+                decode_value: ::dots_core::layout::key_decode::<#inner_ty>,
+                drop_in_place: ::dots_core::layout::key_drop::<#inner_ty>,
+                clone_in_place: ::dots_core::layout::key_clone::<#inner_ty>,
+            };
+        };
+    }
+
     if let Some(elem_ty) = vec_element_type(inner_ty) {
         // `inner_ty` is `Vec<elem_ty>` (and elem_ty is not `u8`).
         return quote! {
             static #vtable_ident: ::dots_core::PropertyVtable = ::dots_core::PropertyVtable {
                 layout: ::core::alloc::Layout::new::<::core::option::Option<#inner_ty>>(),
+                init: ::dots_core::layout::init_noop,
                 is_set: ::dots_core::layout::opt_is_set::<#inner_ty>,
                 encode_value: ::dots_core::layout::opt_encode_vec::<#elem_ty>,
                 decode_value: ::dots_core::layout::opt_decode_vec::<#elem_ty>,
@@ -546,6 +648,7 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
     quote! {
         static #vtable_ident: ::dots_core::PropertyVtable = ::dots_core::PropertyVtable {
             layout: ::core::alloc::Layout::new::<::core::option::Option<#inner_ty>>(),
+            init: ::dots_core::layout::init_noop,
             is_set: ::dots_core::layout::opt_is_set::<#inner_ty>,
             encode_value: ::dots_core::layout::opt_encode::<#inner_ty>,
             decode_value: ::dots_core::layout::opt_decode::<#inner_ty>,
@@ -633,6 +736,115 @@ fn vtable_ident(field_ident: &Ident) -> Ident {
     )
 }
 
+/// Name of the per-type companion `macro_rules!` the `dots!` macro
+/// delegates to. Derived deterministically from the type's identifier so
+/// the `dots!` proc-macro can construct the same name from the call-site
+/// path's last segment. Both `expand` (which defines it) and `dots`
+/// (which calls it) must agree on this formula.
+fn ctor_macro_ident(type_ident: &Ident) -> Ident {
+    Ident::new(&format!("__dots_ctor_{type_ident}"), type_ident.span())
+}
+
+/// Generate the per-type companion macro for `dots!`.
+///
+/// This is the "Escape B" mechanism: a schema-aware `macro_rules!` the
+/// derive emits because the `dots!` proc-macro itself is schema-blind
+/// (it sees only the call-site fields, not which are keys). For each
+/// provided `field: value`, the macro routes the value through the
+/// right coercion — bare `T` for `#[dots(key)]` fields, `Option<T>` for
+/// the rest — and emits a *complete* struct literal so that an omitted
+/// non-key field defaults to `None` while an omitted **bare key** lands
+/// on a `compile_error!`. That's the compile-time key enforcement.
+fn companion_macro(struct_ident: &Ident, fields: &[DotsField<'_>]) -> TokenStream2 {
+    let macro_name = ctor_macro_ident(struct_ident);
+
+    let entry_inits = fields.iter().map(|f| {
+        let fident = f.ident;
+        quote! {
+            #fident: #macro_name!(@pick #fident ; $($fname : $fval),*)
+        }
+    });
+
+    let pick_arms = fields.iter().map(|f| {
+        let fident = f.ident;
+        let found_body = if f.bare_key {
+            // Bare key: convert into the field's `T` (target inferred).
+            quote! { ::dots_core::__dots_into_bare($v) }
+        } else {
+            // Optional field: same coercion `dots!` always used —
+            // bare value → `Some`, `Option` passes through, inner `Into`.
+            quote! {{
+                #[allow(unused_imports)]
+                use ::dots_core::DotsAssignGeneric as _;
+                ::dots_core::DotsAssign($v).into_dots_field()
+            }}
+        };
+        let missing_body = if f.bare_key {
+            let msg = format!(
+                "dots!: missing required `#[dots(key)]` field `{}` for `{}`",
+                unraw(fident),
+                struct_ident
+            );
+            quote! { ::core::compile_error!(#msg) }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
+        quote! {
+            (@pick #fident ; #fident : $v:expr $(, $rn:ident : $rv:expr)*) => { #found_body };
+            (@pick #fident ; $on:ident : $ov:expr $(, $rn:ident : $rv:expr)*) => {
+                #macro_name!(@pick #fident ; $($rn : $rv),*)
+            };
+            (@pick #fident ;) => { #missing_body };
+        }
+    });
+
+    quote! {
+        // Defined with a macro-2.0 `pub use` re-export rather than
+        // `#[macro_export]`. `#[macro_export]` places the macro at the
+        // crate root but a *derive-generated* one is then unreachable by
+        // path from a sibling module in its own crate (you may only
+        // refer to it by bare name, which doesn't cross module
+        // boundaries) — fatal for generated `mod model { .. }` types.
+        // A `pub use` re-export is path-addressable both same-crate
+        // (`crate::path::__dots_ctor_T`) and cross-crate, and is brought
+        // into bare scope by a glob import of the type's module.
+        // `#[allow(non_local_definitions)]`: a `#[macro_export]` macro
+        // emitted by a derive on a *function-local* struct is a non-local
+        // definition; harmless here (the macro is name-mangled per type).
+        #[doc(hidden)]
+        #[macro_export]
+        #[allow(non_local_definitions)]
+        macro_rules! #macro_name {
+            // Entry: `dots!` expands to `__dots_ctor_T! { @ty <path> ; f: v, ... }`.
+            // Emit a complete struct literal; each field picks its value
+            // from the provided list (or defaults / errors).
+            (@ty $ty:path ; $($fname:ident : $fval:expr),* $(,)?) => {{
+                #[allow(clippy::needless_update)]
+                $ty {
+                    #( #entry_inits ),*
+                }
+            }};
+            #( #pick_arms )*
+        }
+        // Two bindings, because stable Rust offers no single one that
+        // covers every consumer of a *derive-generated* macro:
+        //   * `#[macro_export]` (above) → crate-root home, reachable
+        //     cross-crate and from binaries via `use thatcrate::*`;
+        //   * `pub(crate) use` (below) → binds the macro at the type's
+        //     own module, the only way a *same-crate sibling module*
+        //     (e.g. a reactor using a generated `mod model`) can reach
+        //     it — bare names don't cross modules and absolute paths to
+        //     `#[macro_export]` macros are forbidden.
+        // Consumers glob-import the type's module (`use crate::model::*`)
+        // or crate (`use dots_model::*`). The two bindings collide only
+        // for a type declared at its crate's *root* module, so DOTS
+        // structs must live in a module (generated code always does).
+        #[doc(hidden)]
+        #[allow(unused_imports)]
+        pub(crate) use #macro_name;
+    }
+}
+
 /// `Ident::to_string` keeps the `r#` raw-ident prefix. Strip it so
 /// raw-keyword fields like `r#type` flow cleanly into wire names and
 /// derived identifiers (e.g. `PROP_TYPE` rather than the invalid
@@ -672,14 +884,26 @@ fn parse_field(field: &Field) -> syn::Result<DotsField<'_>> {
         .as_ref()
         .ok_or_else(|| syn::Error::new(field.span(), "field must be named"))?;
 
-    let inner_ty = option_inner_type(&field.ty).ok_or_else(|| {
-        syn::Error::new(
-            field.ty.span(),
-            "DotsStruct fields must be `Option<T>` so partial-object semantics are explicit",
-        )
-    })?;
-
     let attrs = parse_field_attrs(&field.attrs)?;
+
+    // Field-type rule:
+    //   * ordinary properties must be `Option<T>` (partial-object
+    //     semantics are explicit);
+    //   * a `#[dots(key)]` property may instead be a bare `T` — a key is
+    //     always present by contract, so the `Option` wrapper is dropped.
+    //     It's still allowed to be `Option<T>` for back-compat.
+    let (inner_ty, bare_key) = match option_inner_type(&field.ty) {
+        Some(inner) => (inner, false),
+        None if attrs.is_key => (&field.ty, true),
+        None => {
+            return Err(syn::Error::new(
+                field.ty.span(),
+                "DotsStruct fields must be `Option<T>` so partial-object semantics are explicit \
+                 (only `#[dots(key)]` fields may be a bare `T`)",
+            ));
+        }
+    };
+
     let tag = attrs.tag.ok_or_else(|| {
         syn::Error::new(field.span(), "field is missing `#[dots(tag = N)]` attribute")
     })?;
@@ -715,6 +939,7 @@ fn parse_field(field: &Field) -> syn::Result<DotsField<'_>> {
         inner_ty,
         tag,
         is_key: attrs.is_key,
+        bare_key,
         kind,
         doc_lines,
     })

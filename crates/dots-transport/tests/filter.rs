@@ -1,32 +1,39 @@
 //! Predicate evaluator: compile + matches against a synthetic
 //! `Sample` type.
 
-use dots_core::{DynamicStruct, DynamicStructDescriptor, DynamicValue, PropertySet, Timepoint, dots};
-use dots_derive::DotsStruct;
+use dots_core::{DynamicStruct, DynamicStructDescriptor, DynamicValue, PropertySet, dots};
 use dots_model::filter::{
     DotsCompareOp, DotsPredicate, DotsPredicateKind, DotsPredicateLeaf, DotsPredicateNode,
     DotsPredicateValue,
 };
+#[allow(unused_imports)]
+use dots_model::*;
 use dots_transport::filter::CompiledPredicate;
 
-#[derive(DotsStruct, Default, Debug, Clone)]
-#[dots(name = "Sample", cached)]
-struct Sample {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    name: Option<String>,
-    #[dots(tag = 3)]
-    score: Option<i64>,
-    #[dots(tag = 4)]
-    flag: Option<bool>,
-    #[dots(tag = 5)]
-    ratio: Option<f64>,
-    #[dots(tag = 6)]
-    moment: Option<Timepoint>,
-    #[dots(tag = 7)]
-    badge: Option<[u8; 16]>,
+mod model {
+    use dots_core::Timepoint;
+    use dots_derive::DotsStruct;
+
+    #[derive(DotsStruct, Default, Debug, Clone)]
+    #[dots(name = "Sample", cached)]
+    pub struct Sample {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub name: Option<String>,
+        #[dots(tag = 3)]
+        pub score: Option<i64>,
+        #[dots(tag = 4)]
+        pub flag: Option<bool>,
+        #[dots(tag = 5)]
+        pub ratio: Option<f64>,
+        #[dots(tag = 6)]
+        pub moment: Option<Timepoint>,
+        #[dots(tag = 7)]
+        pub badge: Option<[u8; 16]>,
+    }
 }
+use model::*;
 
 fn descriptor() -> DynamicStructDescriptor {
     DynamicStructDescriptor::from_static(Sample::DESCRIPTOR)

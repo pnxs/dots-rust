@@ -6,45 +6,61 @@
 //! Types without any `#[dots(key)]` field skip the emission to avoid
 //! colliding with a hand-written `new` on the same type.
 
-use dots_derive::DotsStruct;
+mod model {
+    use dots_derive::DotsStruct;
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "OneKey")]
-struct OneKey {
-    #[dots(tag = 1, key)]
-    id: Option<String>,
-    #[dots(tag = 2)]
-    value: Option<u32>,
-}
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "OneKey")]
+    pub struct OneKey {
+        #[dots(tag = 1, key)]
+        pub id: Option<String>,
+        #[dots(tag = 2)]
+        pub value: Option<u32>,
+    }
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "TwoKeys")]
-struct TwoKeys {
-    #[dots(tag = 1, key)]
-    region: Option<String>,
-    #[dots(tag = 2, key)]
-    serial: Option<u32>,
-    #[dots(tag = 3)]
-    note: Option<String>,
-}
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "TwoKeys")]
+    pub struct TwoKeys {
+        #[dots(tag = 1, key)]
+        pub region: Option<String>,
+        #[dots(tag = 2, key)]
+        pub serial: Option<u32>,
+        #[dots(tag = 3)]
+        pub note: Option<String>,
+    }
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Keyless")]
-struct Keyless {
-    #[dots(tag = 1)]
-    note: Option<String>,
-}
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Keyless")]
+    pub struct Keyless {
+        #[dots(tag = 1)]
+        pub note: Option<String>,
+    }
 
-impl Keyless {
-    // Hand-written `new` on a keyless type — must NOT collide with a
-    // derive-emitted one. If `derive` accidentally emitted `new()` for
-    // keyless types this whole crate would fail to compile.
-    pub fn new() -> Self {
-        Self {
-            note: Some("hand-written".into()),
+    impl Keyless {
+        // Hand-written `new` on a keyless type — must NOT collide with a
+        // derive-emitted one. If `derive` accidentally emitted `new()` for
+        // keyless types this whole crate would fail to compile.
+        pub fn new() -> Self {
+            Self {
+                note: Some("hand-written".into()),
+            }
         }
     }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Documented")]
+    pub struct Documented {
+        /// Stable client identifier (must be unique per region).
+        #[dots(tag = 1, key)]
+        pub client_id: Option<String>,
+        /// Two-letter ISO region code.
+        #[dots(tag = 2, key)]
+        pub region: Option<String>,
+        #[dots(tag = 3)]
+        pub payload: Option<u32>,
+    }
 }
+use model::*;
 
 #[test]
 fn single_key_new_sets_key_field() {
@@ -67,19 +83,6 @@ fn multi_key_new_takes_positional_args_in_declaration_order() {
     assert_eq!(k.region.as_deref(), Some("eu"));
     assert_eq!(k.serial, Some(42));
     assert_eq!(k.note, None);
-}
-
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Documented")]
-struct Documented {
-    /// Stable client identifier (must be unique per region).
-    #[dots(tag = 1, key)]
-    client_id: Option<String>,
-    /// Two-letter ISO region code.
-    #[dots(tag = 2, key)]
-    region: Option<String>,
-    #[dots(tag = 3)]
-    payload: Option<u32>,
 }
 
 #[test]

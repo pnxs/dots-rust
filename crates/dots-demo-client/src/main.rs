@@ -23,20 +23,23 @@
 
 use std::time::Duration;
 use dots_core::{PUBLISHED_TYPES, SUBSCRIBED_TYPES, dots};
-use dots_derive::DotsStruct;
 use dots_model::DotsCacheInfo;
 use dots_transport::App;
 
-#[derive(DotsStruct, Default, Debug, Clone)]
-#[dots(name = "Pinger", cached)]
-struct Pinger {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    message: Option<String>,
-    #[dots(tag = 3)]
-    sequence: Option<u64>,
+mod model {
+    use dots_derive::DotsStruct;
+    #[derive(DotsStruct, Default, Debug, Clone)]
+    #[dots(name = "Pinger", cached)]
+    pub struct Pinger {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub message: Option<String>,
+        #[dots(tag = 3)]
+        pub sequence: Option<u64>,
+    }
 }
+use model::*;
 
 const CLIENT_NAME: &str = "dots-demo-client";
 

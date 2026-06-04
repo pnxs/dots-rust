@@ -9,21 +9,36 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dots_core::dots;
-use dots_derive::DotsStruct;
 use dots_model::{DotsClientStatistics, DotsStatistics, Registry, registry_with_internal_types};
+#[allow(unused_imports)]
+use dots_model::*;
 use dots_transport::{Connection, ConnectionBuilder, GuestTransceiver, HostTransceiver};
 use tokio::net::{UnixListener, UnixStream};
 
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Pinger", cached)]
-struct Pinger {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    message: Option<String>,
-    #[dots(tag = 3)]
-    sequence: Option<u64>,
+mod model {
+    use dots_derive::DotsStruct;
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Pinger", cached)]
+    pub struct Pinger {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub message: Option<String>,
+        #[dots(tag = 3)]
+        pub sequence: Option<u64>,
+    }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Bonk")]
+    pub struct Bonk {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub label: Option<String>,
+    }
 }
+use model::*;
 
 fn registry() -> Arc<Registry> {
     Arc::new(registry_with_internal_types())
@@ -1142,6 +1157,7 @@ async fn cleanup_flag_drops_publisher_entries_on_disconnect() {
     // A type with both `cached` and `cleanup` flags: when its
     // publisher disconnects, the host should drop matching entries
     // from the pool and fan out a removal to any subscriber.
+    use dots_derive::DotsStruct;
     #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
     #[dots(name = "TempClient", cached, cleanup)]
     struct TempClient {
@@ -1687,15 +1703,6 @@ async fn subscribe_new_struct_type_fires_for_wire_descriptor_arrivals() {
 
     gt.exit();
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
-}
-
-#[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
-#[dots(name = "Bonk")]
-struct Bonk {
-    #[dots(tag = 1, key)]
-    id: Option<u32>,
-    #[dots(tag = 2)]
-    label: Option<String>,
 }
 
 #[tokio::test]

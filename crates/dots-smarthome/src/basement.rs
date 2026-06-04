@@ -9,12 +9,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dots_core::dots;
 use dots_transport::{App, SubscriptionHandle};
 use tokio::task::JoinHandle;
 
+use dots_core::dots;
+
 use crate::ids::{BASEMENT_LIGHT, BASEMENT_MOTION_SWITCH};
-use crate::model::{LightControl, Switch};
+use crate::model::*;
 
 pub struct Basement {
     _sub: SubscriptionHandle,
@@ -35,7 +36,8 @@ impl Basement {
 
         let sub = app.subscribe::<Switch>(move |event| {
             let switch = &event.value;
-            if switch.id.as_deref() != Some(BASEMENT_MOTION_SWITCH) {
+            // `id` is now a bare-`String` key: use the infallible getter.
+            if switch.id != BASEMENT_MOTION_SWITCH {
                 return;
             }
             
