@@ -64,7 +64,7 @@ impl std::error::Error for ViewError {}
 /// network I/O happens on the guest driver's loop.
 pub struct View<T>
 where
-    T: StructValue + Default + Send + 'static + dots_core::GlobalRegistration,
+    T: StructValue + Send + 'static + dots_core::GlobalRegistration,
 {
     subscription_id: u32,
     type_name: String,
@@ -84,7 +84,7 @@ pub(crate) struct ViewState<T> {
 
 impl<T> ViewState<T>
 where
-    T: StructValue + Default + Send + 'static,
+    T: StructValue + Send + 'static,
 {
     fn new(container: Container<T>) -> Self {
         Self {
@@ -132,7 +132,7 @@ pub struct ViewEvent<T> {
 
 impl<T> ViewState<T>
 where
-    T: StructValue + Default + Send + Clone + 'static,
+    T: StructValue + Send + Clone + 'static,
 {
     /// Look up the cached value for `key_bytes`, returning a clone
     /// of the entry's value (borrowed `&T` out of the stored
@@ -149,7 +149,7 @@ where
 
 impl<T> ViewDispatch for ViewState<T>
 where
-    T: StructValue + Default + Send + Clone + 'static,
+    T: StructValue + Send + Clone + 'static,
 {
     fn dispatch(&self, txn: &Transmission) {
         // Borrow `&T` straight out of the payload's `AnyStruct`. If
@@ -226,7 +226,7 @@ impl<T> Drop for ViewSubscription<T> {
 
 impl<T> View<T>
 where
-    T: StructValue + Default + Send + Clone + 'static + dots_core::GlobalRegistration,
+    T: StructValue + Send + Clone + 'static + dots_core::GlobalRegistration,
 {
     pub(crate) fn open(
         transceiver: &Arc<GuestTransceiver>,
@@ -330,7 +330,7 @@ where
 
 impl<T> Drop for View<T>
 where
-    T: StructValue + Default + Send + 'static + dots_core::GlobalRegistration,
+    T: StructValue + Send + 'static + dots_core::GlobalRegistration,
 {
     fn drop(&mut self) {
         if let Some(tx) = self.transceiver.upgrade() {

@@ -854,7 +854,7 @@ impl HostTransceiver {
     /// — this is a belt-and-braces guard).
     pub fn cached_values<T>(&self) -> Vec<T>
     where
-        T: StructValue + Default + Clone,
+        T: StructValue + Clone,
     {
         let type_name = T::type_descriptor().name;
         let payloads: Vec<dots_model::Payload> = {
@@ -2452,7 +2452,7 @@ where
 
 fn decode_handshake<T>(raw: &RawTransmission, expected: &str) -> Result<T, HostError>
 where
-    T: StructValue + Default,
+    T: StructValue,
 {
     let actual = raw.header.type_name.as_deref().unwrap_or("");
     if actual != expected {

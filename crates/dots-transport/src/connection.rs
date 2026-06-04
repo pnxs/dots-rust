@@ -319,7 +319,7 @@ where
         txn: &Transmission,
     ) -> Result<T, ConnectionError>
     where
-        T: StructValue + Default + Clone,
+        T: StructValue + Clone,
     {
         let expected_type_name = T::type_descriptor().name;
         let type_name = txn
@@ -469,7 +469,7 @@ where
     /// `next`/`publish`.
     pub fn subscribe<T>(&self) -> Subscription<T>
     where
-        T: StructValue + Default + Send + Clone + 'static,
+        T: StructValue + Send + Clone + 'static,
     {
         let (tx, rx) = mpsc::unbounded_channel();
         let entry: TypedDispatchEntry<T> = TypedDispatchEntry {
@@ -501,7 +501,7 @@ where
     /// be called from within `select!` arms holding `&mut self`.
     pub fn container<T>(&self) -> crate::Container<T>
     where
-        T: StructValue + Default + Send + 'static,
+        T: StructValue + Send + 'static,
     {
         crate::container::make_container(&self.dispatch, None)
     }
@@ -835,7 +835,7 @@ struct TypedDispatchEntry<T> {
 
 impl<T> DispatchEntry for TypedDispatchEntry<T>
 where
-    T: StructValue + Default + Send + Clone + 'static,
+    T: StructValue + Send + Clone + 'static,
 {
     fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError> {
         if self.sender.is_closed() {

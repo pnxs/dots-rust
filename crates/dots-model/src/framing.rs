@@ -359,7 +359,7 @@ impl Transmission {
 /// Caller is responsible for any `header.type_name` validation.
 pub fn decode_typed_transmission<T>(bytes: &[u8]) -> Result<(DotsHeader, T, usize), FramingError>
 where
-    T: StructValue + Default,
+    T: StructValue,
 {
     let body_size = parse_size_prefix(bytes)? as usize;
     let total = SIZE_PREFIX_LEN + body_size;

@@ -315,7 +315,7 @@ impl<T> Container<T> {
 
 impl<T> Container<T>
 where
-    T: StructValue + Default + Send + Clone + 'static,
+    T: StructValue + Send + Clone + 'static,
 {
     /// Lock the container for batched read access. Returns a
     /// [`ContainerReadGuard`] whose drop releases the lock — iterate
@@ -587,7 +587,7 @@ pub(crate) fn make_container<T>(
     leaver: Option<GroupLeaver>,
 ) -> Container<T>
 where
-    T: StructValue + Default + Send + 'static,
+    T: StructValue + Send + 'static,
 {
     let inner = make_dyn_container(T::type_descriptor(), dispatch, leaver);
     Container::from_dyn(inner)
@@ -599,7 +599,7 @@ where
 /// than by type name.
 pub(crate) fn view_dispatch_update<T>(container: &Container<T>, txn: &Transmission)
 where
-    T: StructValue + Default + Send + 'static,
+    T: StructValue + Send + 'static,
 {
     container.inner.apply(txn);
 }

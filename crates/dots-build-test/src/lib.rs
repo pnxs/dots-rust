@@ -15,16 +15,14 @@ mod tests {
 
     #[test]
     fn generated_pinger_has_expected_descriptor_name() {
-        let p = Pinger::default();
+        let p = Pinger::new(1u32);
         assert_eq!(p.descriptor().name, "Pinger");
     }
 
     #[test]
     fn generated_dots_client_has_connection_state_field() {
-        let c = DotsClient {
-            connection_state: Some(DotsConnectionState::Connected),
-            ..Default::default()
-        };
+        let mut c = DotsClient::new(1u32);
+        c.connection_state = Some(DotsConnectionState::Connected);
         assert_eq!(c.connection_state, Some(DotsConnectionState::Connected));
     }
 

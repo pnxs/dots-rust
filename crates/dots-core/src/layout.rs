@@ -62,10 +62,11 @@ pub struct AnyStruct {
 impl AnyStruct {
     /// Allocate a fresh instance for the given descriptor.
     ///
-    /// `Option<T>` fields begin as `None` (the zero bit-pattern). Bare-`T`
-    /// key fields, whose zeroed bytes may be an invalid `T`, are then
-    /// initialized to a valid `T::default()` via their `init` thunk, so
-    /// the whole buffer is a valid struct value from this point on — a
+    /// Every property slot is then seeded via its `init` thunk: an
+    /// `Option<T>` field is written to a real `None` and a bare-`T` key
+    /// to `T::default()` (the zeroed bytes are not relied on to be a
+    /// valid value — see [`opt_init`]/[`key_init`]), so the whole buffer
+    /// is a valid struct value from this point on — a
     /// precondition every other thunk (`drop`/`decode`/`clone`) and the
     /// `as_typed` reinterpret rely on. The placeholder key value is
     /// transient: it is overwritten by decode/clone, and the `valid` set
@@ -507,11 +508,12 @@ unsafe fn decode_into_raw(
 
 /// Decode a CBOR slice into a typed struct.
 ///
-/// Constructs a default-valued `T` (which for DOTS structs is all-`None`)
-/// and applies the wire updates onto it via the descriptor.
+/// Seeds a zeroed `T` (all-`None`, with bare-`T` keys initialized via
+/// their `init` thunks) and applies the wire updates onto it via the
+/// descriptor. Does not require `T: Default`.
 pub fn decode_typed_from_slice<T>(bytes: &[u8]) -> Result<T, DecodeError>
 where
-    T: StructValue + Default,
+    T: StructValue,
 {
     let mut decoder = minicbor::Decoder::new(bytes);
     decode_typed_from_decoder(&mut decoder)
@@ -520,22 +522,66 @@ where
 /// Decode a typed struct from an active decoder. Useful when the
 /// caller is reading a stream of CBOR items and needs to know how
 /// many bytes were consumed (via `decoder.position()`).
+///
+/// Mirrors [`AnyStruct::new`] on a stack buffer: a zero-initialized `T`
+/// is a valid `None` for every `Option<T>` field, then each property's
+/// `init` thunk seeds its slot (a bare-`T` key becomes `T::default()`),
+/// leaving the whole buffer a valid `T` before the first wire write.
+/// This is what lets us drop the `T: Default` bound — the seed is built
+/// from the descriptor's thunks, not the type's `Default` impl.
 pub fn decode_typed_from_decoder<T>(decoder: &mut CborDecoder<'_>) -> Result<T, DecodeError>
 where
-    T: StructValue + Default,
+    T: StructValue,
 {
-    let mut value = T::default();
-    let descriptor = StructValue::descriptor(&value);
+    let descriptor = T::type_descriptor();
+    let mut slot = core::mem::MaybeUninit::<T>::zeroed();
+    let base = slot.as_mut_ptr() as *mut u8;
+    // SAFETY: `T: StructValue` enforces the layout invariant — `descriptor`
+    // matches `T`'s `(size, align)` and the offsets come from
+    // `offset_of!(T, _)`. The buffer is zero-initialized (a valid `None`
+    // for every `Option<T>`); each `init` thunk then seeds its slot, so
+    // from here on every byte is a valid `T`.
+    unsafe {
+        for prop in descriptor.properties {
+            (prop.vtable.init)(base.add(prop.offset));
+        }
+    }
     let mut valid = PropertySet::EMPTY;
-    let base = (&raw mut value) as *mut u8;
-    // SAFETY: `T: StructValue` enforces the layout invariant — its
-    // descriptor matches `T`'s `(size, align)` and the field offsets
-    // come from `offset_of!(T, _)`. Treating `&mut value` as `*mut u8`
-    // for byte-precise field writes via typed thunks is sound.
+    // If decode bails (bad wire, missing key), the seeded buffer is a
+    // fully-valid `T` that must be dropped through the property thunks —
+    // `assume_init().drop()` can't run because we never reach it. The
+    // guard handles that; it's `forget`-ten on the success path.
+    let guard = RawStructGuard { descriptor, base };
+    // SAFETY: the buffer is a valid `T` (see above); typed thunks write
+    // at descriptor offsets.
     unsafe {
         decode_into_raw(descriptor, base, &mut valid, decoder)?;
     }
-    Ok(value)
+    core::mem::forget(guard);
+    // SAFETY: decode succeeded, so the buffer is a fully-initialized `T`.
+    Ok(unsafe { slot.assume_init() })
+}
+
+/// Drops every property slot of a raw, descriptor-seeded struct buffer.
+/// Used to clean up a partially-decoded stack buffer when decode errors
+/// before the value is moved out (see [`decode_typed_from_decoder`]).
+struct RawStructGuard {
+    descriptor: &'static StructDescriptor,
+    base: *mut u8,
+}
+
+impl Drop for RawStructGuard {
+    fn drop(&mut self) {
+        for prop in self.descriptor.properties {
+            // SAFETY: every slot was seeded via its `init` thunk and is
+            // left a valid value by the decode thunks even on error
+            // (`dots_decode` reads the new value before overwriting the
+            // old), so dropping in place through the thunk is sound.
+            unsafe {
+                (prop.vtable.drop_in_place)(self.base.add(prop.offset));
+            }
+        }
+    }
 }
 
 fn allocate_zeroed(layout: Layout) -> NonNull<u8> {
@@ -652,26 +698,6 @@ pub fn encode_struct_value(
             encoder,
         )
     }
-}
-
-/// Safe wrapper used by the manual `DotsField` impl that the proc-macro
-/// emits for derived DOTS structs. Constructs `T::default()` (an
-/// all-`None` instance) and applies wire updates over it.
-pub fn decode_struct_default<T>(decoder: &mut CborDecoder<'_>) -> Result<T, DecodeError>
-where
-    T: StructValue + Default,
-{
-    let mut value = T::default();
-    let descriptor = StructValue::descriptor(&value);
-    let mut valid = PropertySet::EMPTY;
-    let base = (&raw mut value) as *mut u8;
-    // SAFETY: `T: StructValue` enforces layout consistency between
-    // `T` and its descriptor (size, align, offsets); writing through
-    // typed thunks at those offsets is sound.
-    unsafe {
-        decode_into_raw(descriptor, base, &mut valid, decoder)?;
-    }
-    Ok(value)
 }
 
 // ===== Generic per-type thunk helpers =====
@@ -867,14 +893,28 @@ where
 // the decode/drop/clone thunks below can drop-then-write exactly like
 // their `opt_*` cousins — there is never an invalid-bits window.
 
-/// No-op initializer for `Option<T>` fields: a zeroed slot is already a
-/// valid `None`, so nothing to do.
+/// Initializer for an `Option<T>` slot: writes a real `None`, over the
+/// (possibly invalid) zeroed bytes *without* dropping them.
+///
+/// A zeroed slot is **not** universally a valid `None`. For most types
+/// the niche that `Option` uses is at the all-zero value, but it need
+/// not be: `Option<AnyObject>`, for instance, puts its niche in a
+/// `String`/`Vec` length field, so the zero pattern is neither `None`
+/// nor a valid `Some` — reading or dropping it is UB. Writing `None`
+/// explicitly makes every `Option<T>` slot valid regardless of where
+/// the niche lives.
 ///
 /// # Safety
 ///
-/// `ptr` must point to a zero-initialized `Option<T>` slot (trivially
-/// satisfied; the body touches nothing).
-pub unsafe fn init_noop(_ptr: *mut u8) {}
+/// `ptr` must point to an `Option<T>`-sized, `Option<T>`-aligned slot
+/// that is safe to overwrite without dropping (e.g. freshly
+/// zero-allocated). `write` does not drop the prior bytes.
+pub unsafe fn opt_init<T>(ptr: *mut u8) {
+    // SAFETY: caller-upheld; `write` does not drop the prior bytes.
+    unsafe {
+        core::ptr::write(ptr as *mut Option<T>, None);
+    }
+}
 
 /// Initialize a bare-`T` key slot to `T::default()`, writing over the
 /// (possibly invalid) zeroed bytes *without* dropping them.

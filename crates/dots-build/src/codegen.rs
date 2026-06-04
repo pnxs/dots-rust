@@ -75,7 +75,20 @@ fn emit_struct(out: &mut String, s: &StructDef) {
         let _ = writeln!(out, "/// {line}");
     }
     emit_struct_wire_shape(out, s);
-    let _ = writeln!(out, "#[derive(DotsStruct, Default, Debug, Clone, PartialEq)]");
+    // A keyed struct stores its `#[dots(key)]` fields as bare `T`, so a
+    // derived `Default` could only fill them with a placeholder key —
+    // a value that violates "keys are always present by contract". The
+    // decode and `new` paths no longer rely on `Default` (the decode
+    // seed comes from the descriptor's `init` thunks), so we omit it for
+    // keyed structs: construct them with `Foo::new(keys…)` or `dots!`.
+    // Keyless structs keep `Default` — an all-`None` value is meaningful
+    // and convenient there.
+    let has_key = s.properties.iter().any(|p| p.is_key());
+    if has_key {
+        let _ = writeln!(out, "#[derive(DotsStruct, Debug, Clone, PartialEq)]");
+    } else {
+        let _ = writeln!(out, "#[derive(DotsStruct, Default, Debug, Clone, PartialEq)]");
+    }
 
     // Build the #[dots(...)] container attribute: name, plus flags.
     let mut dots_attr_parts: Vec<String> = Vec::new();
@@ -127,8 +140,9 @@ fn emit_property(out: &mut String, prop: &Property) {
         // Key properties are always present by contract, so they are
         // stored as a bare `T` rather than `Option<T>`: an infallible
         // `&T` accessor, always in the valid-set, and a smaller layout
-        // for scalar keys. The `Default`-derived placeholder doubles as
-        // the decode seed; decoding enforces that the key is present.
+        // for scalar keys. The decode seed comes from the descriptor's
+        // `init` thunk (`T::default()` on the inner key type), not the
+        // struct's `Default`; decoding enforces that the key is present.
         let _ = writeln!(out, "    pub {field_name}: {rust_ty},");
     } else {
         let _ = writeln!(out, "    pub {field_name}: Option<{rust_ty}>,");

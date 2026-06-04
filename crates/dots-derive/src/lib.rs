@@ -390,6 +390,14 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 quote! { #ident: ::core::option::Option::Some(#ident.into()) }
             }
         });
+        // Every non-key property is `Option<T>` and starts `None`. We set
+        // these explicitly rather than via `..Default::default()` so the
+        // type doesn't have to derive `Default` (which, for a struct with
+        // bare-`T` keys, would only ever produce a bogus placeholder key).
+        let new_rest_inits = fields.iter().filter(|f| !f.is_key).map(|f| {
+            let ident = f.ident;
+            quote! { #ident: ::core::option::Option::None }
+        });
 
         // Build a per-key argument doc list. Each `///` line on a key
         // field flows into the `# Arguments` section so IDE hover on
@@ -430,7 +438,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             pub fn new(#( #params ),*) -> Self {
                 Self {
                     #( #new_inits, )*
-                    ..::core::default::Default::default()
+                    #( #new_rest_inits, )*
                 }
             }
         }
@@ -578,8 +586,9 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
         // `DotsField` lets this struct appear as a nested field inside
         // another DOTS struct. Encoding/decoding go through the same
-        // descriptor-driven path used at the top level. Requires the
-        // user to also `#[derive(Default)]` for nested decode to work.
+        // descriptor-driven path used at the top level. The seed is built
+        // from the descriptor's `init` thunks, so no `Default` impl is
+        // required on the nested type.
         impl ::dots_core::DotsField for #struct_ident {
             #[inline]
             fn dots_encode(
@@ -593,7 +602,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             fn dots_decode(
                 d: &mut ::dots_core::layout::CborDecoder<'_>,
             ) -> ::core::result::Result<Self, ::dots_core::DecodeError> {
-                ::dots_core::layout::decode_struct_default::<Self>(d)
+                ::dots_core::layout::decode_typed_from_decoder::<Self>(d)
             }
         }
 
@@ -635,7 +644,7 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
         return quote! {
             static #vtable_ident: ::dots_core::PropertyVtable = ::dots_core::PropertyVtable {
                 layout: ::core::alloc::Layout::new::<::core::option::Option<#inner_ty>>(),
-                init: ::dots_core::layout::init_noop,
+                init: ::dots_core::layout::opt_init::<#inner_ty>,
                 is_set: ::dots_core::layout::opt_is_set::<#inner_ty>,
                 encode_value: ::dots_core::layout::opt_encode_vec::<#elem_ty>,
                 decode_value: ::dots_core::layout::opt_decode_vec::<#elem_ty>,
@@ -648,7 +657,7 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
     quote! {
         static #vtable_ident: ::dots_core::PropertyVtable = ::dots_core::PropertyVtable {
             layout: ::core::alloc::Layout::new::<::core::option::Option<#inner_ty>>(),
-            init: ::dots_core::layout::init_noop,
+            init: ::dots_core::layout::opt_init::<#inner_ty>,
             is_set: ::dots_core::layout::opt_is_set::<#inner_ty>,
             encode_value: ::dots_core::layout::opt_encode::<#inner_ty>,
             decode_value: ::dots_core::layout::opt_decode::<#inner_ty>,

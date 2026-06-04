@@ -55,6 +55,11 @@ fn generated_source_contains_expected_items() {
     // DotsConnectionState reference passes through unchanged.
     assert!(out.contains("pub connection_state: Option<DotsConnectionState>,"));
 
+    // A keyed struct does NOT derive `Default` (a bare-`T` key has no
+    // meaningful default); a keyless one still does.
+    assert!(out.contains("#[derive(DotsStruct, Debug, Clone, PartialEq)]\n#[dots(name = \"DotsClient\""));
+    assert!(out.contains("#[derive(DotsStruct, Default, Debug, Clone, PartialEq)]\n#[dots(name = \"DotsStatistics\""));
+
     // DotsResourceUsage uses Duration newtype for user/system CPU time.
     assert!(out.contains("pub user_cpu_time: Option<dots_core::Duration>,"));
     assert!(out.contains("pub system_cpu_time: Option<dots_core::Duration>,"));

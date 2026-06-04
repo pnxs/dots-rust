@@ -254,7 +254,7 @@ impl GuestTransceiver {
     /// [`View<T>`] whose drop tears down the subscription.
     pub fn view<T>(self: &Arc<Self>, filter: DotsFilter) -> Result<crate::View<T>, crate::ViewError>
     where
-        T: StructValue + Default + Send + Clone + 'static + dots_core::GlobalRegistration,
+        T: StructValue + Send + Clone + 'static + dots_core::GlobalRegistration,
     {
         crate::view::View::open(self, filter)
     }
@@ -349,7 +349,7 @@ impl GuestTransceiver {
         handler: impl FnMut(&Event<T>) + Send + 'static,
     ) -> SubscriptionHandle
     where
-        T: StructValue + Default + Send + 'static + dots_core::GlobalRegistration,
+        T: StructValue + Send + 'static + dots_core::GlobalRegistration,
     {
         // Ensure the pool's container for T exists — `container::<T>`
         // joins the group exactly once per type and attaches the
@@ -366,7 +366,7 @@ impl GuestTransceiver {
     /// stream.
     pub fn subscribe_stream<T>(self: &Arc<Self>) -> crate::Subscription<T>
     where
-        T: StructValue + Default + Send + 'static + dots_core::GlobalRegistration,
+        T: StructValue + Send + 'static + dots_core::GlobalRegistration,
     {
         let _ = self.container::<T>();
         connection_subscribe::<T>(&self.dispatch)
@@ -504,7 +504,7 @@ impl GuestTransceiver {
     /// `Arc<DynContainer>`.
     pub fn container<T>(self: &Arc<Self>) -> Container<T>
     where
-        T: StructValue + Default + Send + 'static + dots_core::GlobalRegistration,
+        T: StructValue + Send + 'static + dots_core::GlobalRegistration,
     {
         T::register_as_subscribed();
         let descriptor = T::type_descriptor();
@@ -1129,7 +1129,7 @@ fn register_callback<T, F>(
     handler: F,
 ) -> SubscriptionHandle
 where
-    T: StructValue + Default + Send + 'static,
+    T: StructValue + Send + 'static,
     F: FnMut(&Event<T>) + Send + 'static,
 {
     let entry: CallbackDispatchEntry<T, F> = CallbackDispatchEntry {
@@ -1156,7 +1156,7 @@ struct CallbackDispatchEntry<T, F> {
 
 impl<T, F> DispatchEntry for CallbackDispatchEntry<T, F>
 where
-    T: StructValue + Default + Send + 'static,
+    T: StructValue + Send + 'static,
     F: FnMut(&Event<T>) + Send + 'static,
 {
     fn dispatch(
@@ -1239,7 +1239,7 @@ where
 /// requiring a `Connection`-typed receiver.
 fn connection_subscribe<T>(dispatch: &Arc<Mutex<DispatchState>>) -> crate::Subscription<T>
 where
-    T: StructValue + Default + Send + 'static,
+    T: StructValue + Send + 'static,
 {
     let (tx, rx) = mpsc::unbounded_channel();
     let entry = StreamDispatchEntry::<T> {
@@ -1261,7 +1261,7 @@ struct StreamDispatchEntry<T> {
 
 impl<T> DispatchEntry for StreamDispatchEntry<T>
 where
-    T: StructValue + Default + Send + 'static,
+    T: StructValue + Send + 'static,
 {
     fn dispatch(
         &mut self,

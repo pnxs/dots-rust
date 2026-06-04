@@ -70,6 +70,23 @@ fn empty_keyed_object_encodes_but_decode_rejects_missing_key() {
 }
 
 #[test]
+fn missing_key_decode_error_drops_already_decoded_owned_fields() {
+    // Hand-encode {2: "hello"} — the owned `payload` is set but the key
+    // (tag 1) is absent. Decode writes a real heap `String` into the
+    // seeded buffer, then rejects the value for the missing key. The
+    // typed decoder must drop that partially-built buffer through the
+    // property thunks; a leak or double-free would trip the allocator /
+    // debug UB checks here.
+    let mut buf = Vec::new();
+    let mut e = dots_core::minicbor::Encoder::new(&mut buf);
+    e.map(1).unwrap();
+    e.u32(2).unwrap();
+    e.str("hello").unwrap();
+
+    assert!(decode_typed_from_slice::<Sample>(&buf).is_err());
+}
+
+#[test]
 fn wire_format_is_sparse_map_keyed_by_tag() {
     let s = dots!(Sample {
         id: 42_u32,

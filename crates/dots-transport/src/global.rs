@@ -122,7 +122,7 @@ pub fn remove<P: Publishable>(value: &P) {
 /// See [`GuestTransceiver::subscribe`](crate::GuestTransceiver::subscribe).
 pub fn subscribe<T>(handler: impl FnMut(&Event<T>) + Send + 'static) -> SubscriptionHandle
 where
-    T: StructValue + Default + Send + 'static + GlobalRegistration,
+    T: StructValue + Send + 'static + GlobalRegistration,
 {
     client().subscribe(handler)
 }
@@ -130,7 +130,7 @@ where
 /// See [`GuestTransceiver::subscribe_stream`](crate::GuestTransceiver::subscribe_stream).
 pub fn subscribe_stream<T>() -> Subscription<T>
 where
-    T: StructValue + Default + Send + 'static + GlobalRegistration,
+    T: StructValue + Send + 'static + GlobalRegistration,
 {
     client().subscribe_stream::<T>()
 }
@@ -162,7 +162,7 @@ where
 /// See [`GuestTransceiver::container`](crate::GuestTransceiver::container).
 pub fn container<T>() -> Container<T>
 where
-    T: StructValue + Default + Send + 'static + GlobalRegistration,
+    T: StructValue + Send + 'static + GlobalRegistration,
 {
     client().container::<T>()
 }
@@ -170,7 +170,7 @@ where
 /// See [`GuestTransceiver::view`](crate::GuestTransceiver::view).
 pub fn view<T>(filter: DotsFilter) -> Result<View<T>, ViewError>
 where
-    T: StructValue + Default + Send + Clone + 'static + GlobalRegistration,
+    T: StructValue + Send + Clone + 'static + GlobalRegistration,
 {
     client().view::<T>(filter)
 }
