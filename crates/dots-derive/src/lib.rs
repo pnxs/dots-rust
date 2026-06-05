@@ -71,6 +71,53 @@ pub fn derive_dots_enum(input: TokenStream) -> TokenStream {
 /// Function-like macro `dots!` — terse constructor for DOTS structs.
 ///
 /// Doc lives on the re-export in `dots-core::dots`.
+///
+/// # Unknown fields are a compile error
+///
+/// The no-base form delegates to the type's companion macro, which
+/// builds a *complete* struct literal field-by-field. A provided name
+/// that matches no declared field would otherwise be silently dropped,
+/// so the companion macro guards against it: assigning a non-existent
+/// field name fails to compile.
+///
+/// ```compile_fail
+/// use dots_core::dots;
+/// mod model {
+///     use dots_derive::DotsStruct;
+///     #[derive(DotsStruct)]
+///     #[dots(name = "Foo")]
+///     pub struct Foo {
+///         #[dots(tag = 1, key)]
+///         pub id: u32,
+///         #[dots(tag = 2)]
+///         pub note: Option<String>,
+///     }
+/// }
+/// use model::*;
+/// // error: dots!: no field `bogus` on `Foo`
+/// let _ = dots!(Foo { id: 1_u32, bogus: 5_u32 });
+/// ```
+///
+/// The same assignment with only declared fields compiles fine:
+///
+/// ```
+/// use dots_core::dots;
+/// mod model {
+///     use dots_derive::DotsStruct;
+///     #[derive(DotsStruct)]
+///     #[dots(name = "Foo")]
+///     pub struct Foo {
+///         #[dots(tag = 1, key)]
+///         pub id: u32,
+///         #[dots(tag = 2)]
+///         pub note: Option<String>,
+///     }
+/// }
+/// use model::*;
+/// let foo = dots!(Foo { id: 1_u32, note: "hi" });
+/// assert_eq!(*foo.id(), 1);
+/// assert_eq!(foo.note().map(String::as_str), Some("hi"));
+/// ```
 #[proc_macro]
 pub fn dots(input: TokenStream) -> TokenStream {
     let expr = parse_macro_input!(input as syn::ExprStruct);
@@ -774,6 +821,29 @@ fn companion_macro(struct_ident: &Ident, fields: &[DotsField<'_>]) -> TokenStrea
         }
     });
 
+    // `@check` arms: one per declared field name that expands to `()`,
+    // plus a catch-all that `compile_error!`s. The entry arm runs a
+    // `@check` for every *provided* field name, so a name that matches no
+    // declared field hits the catch-all. Without this, the entry arm's
+    // per-field `@pick` simply never selects an unknown field's value and
+    // silently drops it — assigning a typo'd / non-existent field would
+    // compile clean. The catch-all turns that into a compile error.
+    let known_idents = fields.iter().map(|f| f.ident);
+    let check_arms = quote! {
+        #( (@check #known_idents) => { () }; )*
+        (@check $other:ident) => {
+            ::core::compile_error!(
+                ::core::concat!(
+                    "dots!: no field `",
+                    ::core::stringify!($other),
+                    "` on `",
+                    ::core::stringify!(#struct_ident),
+                    "`"
+                )
+            )
+        };
+    };
+
     let pick_arms = fields.iter().map(|f| {
         let fident = f.ident;
         let found_body = if f.bare_key {
@@ -828,11 +898,17 @@ fn companion_macro(struct_ident: &Ident, fields: &[DotsField<'_>]) -> TokenStrea
             // Emit a complete struct literal; each field picks its value
             // from the provided list (or defaults / errors).
             (@ty $ty:path ; $($fname:ident : $fval:expr),* $(,)?) => {{
+                // Reject any provided field name that isn't declared on
+                // the type before building the literal. Each `@check`
+                // expands to `()` for a known name or `compile_error!`
+                // for an unknown one.
+                $( #macro_name!(@check $fname); )*
                 #[allow(clippy::needless_update)]
                 $ty {
                     #( #entry_inits ),*
                 }
             }};
+            #check_arms
             #( #pick_arms )*
         }
         // Two bindings, because stable Rust offers no single one that
