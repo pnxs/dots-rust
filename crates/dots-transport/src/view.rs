@@ -291,15 +291,19 @@ where
         mut handler: impl FnMut(&ViewEvent<T>) + Send + 'static,
     ) -> ViewSubscription<T> {
         // Sync replay: call the handler over the current container
-        // entries with synthetic Create-shaped events.
+        // entries with synthetic Create-shaped events. `from_cache`
+        // counts down `N-1 … 1, 0` over the snapshot (matching the
+        // broker's cache-replay semantics) so a handler can detect the
+        // last current-state entry via `from_cache == 0`.
         let snapshot: Vec<ContainerEntry<T>> = self.state.container.snapshot();
-        for entry in snapshot {
+        let total = snapshot.len();
+        for (i, entry) in snapshot.into_iter().enumerate() {
             let header = dots!(DotsHeader {
                 type_name: self.type_name.clone(),
                 attributes: <T as dots_core::Transmittable>::valid_set(&entry.value),
                 sender: entry.clone_info.last_update_sender,
                 sent_time: entry.clone_info.last_update_time,
-                from_cache: 0_u32,
+                from_cache: (total - 1 - i) as u32,
                 remove_obj: false,
                 is_from_myself: false,
                 subscription_id: self.subscription_id,

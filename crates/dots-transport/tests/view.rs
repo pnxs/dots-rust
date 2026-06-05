@@ -300,3 +300,92 @@ async fn view_preload_from_existing_cache() {
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_a_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_b_handle).await;
 }
+
+/// `View::subscribe` synchronously replays the view's *current*
+/// container snapshot to the new handler. `from_cache` must count down
+/// `N-1 … 0` over that snapshot (matching the broker's cache-replay
+/// semantics), so a handler can detect the final current-state entry
+/// via `from_cache == 0` — rather than every replayed event claiming to
+/// be the last.
+#[tokio::test]
+async fn view_subscribe_replay_counts_down_from_cache() {
+    let host = HostTransceiver::new("test-host");
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    // Publisher seeds two in-view entries (sequence < 100) plus one
+    // out-of-view entry.
+    let (host_io_b, guest_io_b) = tokio::io::duplex(16384);
+    host.accept(host_io_b);
+    let conn_b = ConnectionBuilder::new(guest_io_b, "publisher", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt_b, driver_b) =
+        GuestTransceiver::from_connection(registry.clone(), conn_b, [Pinger::DESCRIPTOR], []);
+    let driver_b_handle = tokio::spawn(driver_b.run());
+
+    gt_b.publish(&dots!(Pinger { id: 1_u32, message: "a", sequence: 10_u64 }));
+    gt_b.publish(&dots!(Pinger { id: 2_u32, message: "b", sequence: 200_u64 })); // out of view
+    gt_b.publish(&dots!(Pinger { id: 3_u32, message: "c", sequence: 50_u64 }));
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.cache_size("Pinger") == 3 {
+            break;
+        }
+    }
+    assert_eq!(host.cache_size("Pinger"), 3);
+
+    // Subscriber opens a View and waits for its local container to be
+    // populated by the wire preload (2 matching entries).
+    let (host_io_a, guest_io_a) = tokio::io::duplex(16384);
+    host.accept(host_io_a);
+    let conn_a = ConnectionBuilder::new(guest_io_a, "subscriber", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt_a, driver_a) =
+        GuestTransceiver::from_connection(registry.clone(), conn_a, [], []);
+    let driver_a_handle = tokio::spawn(driver_a.run());
+
+    let view = gt_a
+        .view::<Pinger>(predicate(Pinger::SEQUENCE.lt(100_u64)).build())
+        .unwrap();
+
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if view.container().len() >= 2 {
+            break;
+        }
+    }
+    assert_eq!(view.container().len(), 2, "wire preload should populate the container");
+
+    // Now subscribe: the sync replay over the populated container runs
+    // before `subscribe` returns. Capture the `from_cache` per event.
+    let replayed: Arc<Mutex<Vec<Option<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+    let replayed_for_handler = replayed.clone();
+    let _sub = view.subscribe(move |event| {
+        replayed_for_handler
+            .lock()
+            .unwrap()
+            .push(event.header.from_cache);
+    });
+
+    let mut got = replayed.lock().unwrap().clone();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![Some(0), Some(1)],
+        "two-entry snapshot replay must count from_cache down to 0, not emit all-zeros"
+    );
+
+    drop(view);
+    gt_a.exit();
+    gt_b.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_a_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_b_handle).await;
+}
