@@ -113,8 +113,10 @@ pub type Client = Arc<GuestTransceiver>;
 
 /// Type-erased future for the guest-side I/O loop. Used by [`App`] so
 /// it can hold a driver without exposing its underlying stream type
-/// (TCP, UDS, etc.) in the [`App`] struct.
-type DriverFuture = Pin<Box<dyn Future<Output = Result<(), GuestError>> + Send>>;
+/// (TCP, UDS, etc.) in the [`App`] struct. Also returned by
+/// [`connect_over_stream`] for callers (e.g. test harnesses) that want
+/// to spawn the driver themselves rather than via [`App::run`].
+pub type DriverFuture = Pin<Box<dyn Future<Output = Result<(), GuestError>> + Send>>;
 
 /// High-level DOTS client.
 ///
@@ -284,59 +286,11 @@ impl App {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let registry = Arc::new(dots_model::registry_with_internal_types());
-        let mut builder =
-            ConnectionBuilder::new(stream, client_name, registry.clone()).preload(true);
-        if let Some(s) = secret {
-            builder = builder.with_auth(s);
-        }
-        let conn: Connection<S> = builder.connect().await?;
-
-        // Hand the link-time `PUBLISHED_TYPES` / `SUBSCRIBED_TYPES`
-        // slices to the transceiver. The `#[derive(DotsStruct)]` macro
-        // emits `linkme` entries inside `register_as_published` /
-        // `register_as_subscribed`; each `publish::<T>` /
-        // `subscribe::<T>` / `container::<T>` monomorphization pulls
-        // those entries into the binary, so these slices reflect the
-        // binary's actual link-time intent. The driver's Phase 1
-        // walks them transitively (registering and shipping every
-        // nested struct/enum descriptor in declaration order) and
-        // Phase 1b emits `DotsMember(Join, T.name)` for each
-        // subscribed type so the broker starts cache replay before
-        // `preloadClientFinished`. Mirrors dots-cpp's `Application`
-        // passing `io::global_subscribe_types()` into
-        // `GuestTransceiver::open`.
-        let published_types = PUBLISHED_TYPES
-            .iter()
-            .copied()
-            .filter(|d| !d.flags.is_internal());
-        let subscribed_types = SUBSCRIBED_TYPES
-            .iter()
-            .copied()
-            .filter(|d| !d.flags.is_internal());
-
-        let (transceiver, mut driver) = GuestTransceiver::from_connection(
-            registry,
-            conn,
-            published_types,
-            subscribed_types,
-        );
-        // Run the EarlySubscribe phase (descriptor exchange, Join for
-        // every subscribed type, finish_preload) before returning, so
-        // the connection is in `Connected` state by the time the caller
-        // receives the `App`. Cache events that arrive during this
-        // phase have no user-side subscribers yet — they're dropped.
-        // Live events flow normally once `App::run` starts.
-        driver.early_subscribe().await?;
-        // Install the transceiver as the process-wide singleton so
-        // `dots_transport::global::{publish, subscribe, container, …}`
-        // resolve to it. Panics if another `App` is already active —
-        // matches dots-cpp's single-`Application` constraint.
-        crate::global::init(transceiver.clone());
-        let driver_future: DriverFuture = Box::pin(driver.run());
+        let (transceiver, driver) =
+            build_parts(stream, client_name, secret, true, true).await?;
         Ok(App {
             transceiver,
-            driver: Some(driver_future),
+            driver: Some(driver),
         })
     }
 
@@ -474,4 +428,107 @@ impl Drop for App {
     fn drop(&mut self) {
         crate::global::destroy();
     }
+}
+
+/// Connect a guest over an already-established byte stream and run the
+/// handshake + EarlySubscribe phase, returning the
+/// [`GuestTransceiver`] handle and the driver future.
+///
+/// This is the carrier-agnostic core behind [`App::connect_tcp`] /
+/// [`App::connect_unix`]: it works over *any*
+/// `AsyncRead + AsyncWrite + Unpin + Send` stream, including an
+/// in-memory [`tokio::io::duplex`] pipe. It is primarily intended for
+/// test harnesses (see the `dots-testing` crate) that wire a guest to
+/// an in-process [`crate::HostTransceiver`] without a socket.
+///
+/// The guest collects the same link-time `PUBLISHED_TYPES` /
+/// `SUBSCRIBED_TYPES` slices that [`App`] uses, ships their descriptors
+/// during EarlySubscribe, and returns once the connection reaches
+/// `Connected`.
+///
+/// When `install_global` is `true`, the transceiver is installed as
+/// the process-wide [`crate::global`] singleton so the `global::*` free
+/// functions resolve to it — and, as with [`App`], the caller becomes
+/// responsible for releasing it via [`crate::global::destroy`]. Passing
+/// `true` while another global is already installed panics, matching
+/// dots-cpp's single-`Application` constraint. Pass `false` for
+/// additional ("spoof") guests that should not own the global slot.
+///
+/// The returned [`DriverFuture`] must be polled (e.g.
+/// `tokio::spawn(driver)`) for the connection to make progress.
+pub async fn connect_over_stream<S>(
+    stream: S,
+    client_name: &str,
+    secret: Option<&str>,
+    preload: bool,
+    install_global: bool,
+) -> Result<(Arc<GuestTransceiver>, DriverFuture), AppError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    build_parts(stream, client_name, secret, preload, install_global).await
+}
+
+/// Shared connect core for [`App::build_app`] and
+/// [`connect_over_stream`]. See [`connect_over_stream`] for the
+/// behavior of each parameter.
+async fn build_parts<S>(
+    stream: S,
+    client_name: &str,
+    secret: Option<&str>,
+    preload: bool,
+    install_global: bool,
+) -> Result<(Arc<GuestTransceiver>, DriverFuture), AppError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let registry = Arc::new(dots_model::registry_with_internal_types());
+    let mut builder =
+        ConnectionBuilder::new(stream, client_name, registry.clone()).preload(preload);
+    if let Some(s) = secret {
+        builder = builder.with_auth(s);
+    }
+    let conn: Connection<S> = builder.connect().await?;
+
+    // Hand the link-time `PUBLISHED_TYPES` / `SUBSCRIBED_TYPES`
+    // slices to the transceiver. The `#[derive(DotsStruct)]` macro
+    // emits `linkme` entries inside `register_as_published` /
+    // `register_as_subscribed`; each `publish::<T>` /
+    // `subscribe::<T>` / `container::<T>` monomorphization pulls
+    // those entries into the binary, so these slices reflect the
+    // binary's actual link-time intent. The driver's Phase 1
+    // walks them transitively (registering and shipping every
+    // nested struct/enum descriptor in declaration order) and
+    // Phase 1b emits `DotsMember(Join, T.name)` for each
+    // subscribed type so the broker starts cache replay before
+    // `preloadClientFinished`. Mirrors dots-cpp's `Application`
+    // passing `io::global_subscribe_types()` into
+    // `GuestTransceiver::open`.
+    let published_types = PUBLISHED_TYPES
+        .iter()
+        .copied()
+        .filter(|d| !d.flags.is_internal());
+    let subscribed_types = SUBSCRIBED_TYPES
+        .iter()
+        .copied()
+        .filter(|d| !d.flags.is_internal());
+
+    let (transceiver, mut driver) =
+        GuestTransceiver::from_connection(registry, conn, published_types, subscribed_types);
+    // Run the EarlySubscribe phase (descriptor exchange, Join for
+    // every subscribed type, finish_preload) before returning, so
+    // the connection is in `Connected` state by the time the caller
+    // receives the transceiver. Cache events that arrive during this
+    // phase have no user-side subscribers yet — they're dropped.
+    // Live events flow normally once the driver runs.
+    driver.early_subscribe().await?;
+    // Install the transceiver as the process-wide singleton so
+    // `dots_transport::global::{publish, subscribe, container, …}`
+    // resolve to it. Panics if another global is already active —
+    // matches dots-cpp's single-`Application` constraint.
+    if install_global {
+        crate::global::init(transceiver.clone());
+    }
+    let driver_future: DriverFuture = Box::pin(driver.run());
+    Ok((transceiver, driver_future))
 }

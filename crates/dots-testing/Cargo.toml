@@ -1,0 +1,23 @@
+[package]
+name = "dots-testing"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "In-process Host + Guest test harness for dots-rust — write unit tests against the global DOTS API without a broker socket."
+
+[dependencies]
+dots-core.workspace = true
+dots-model.workspace = true
+dots-transport.workspace = true
+
+tokio = { workspace = true, features = ["io-util", "sync", "rt", "time", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+dots-derive.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync", "rt", "rt-multi-thread", "time", "macros"] }
+
+[lints]
+workspace = true
