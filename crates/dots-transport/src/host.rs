@@ -1421,8 +1421,6 @@ impl HostTransceiver {
                                 attributes: e.attributes,
                                 sender: e.last_update_sender,
                                 from_cache: from_cache,
-                                remove_obj: false,
-                                is_from_myself: false,
                             });
                             (header, e.payload.clone())
                         })
@@ -1563,15 +1561,15 @@ impl HostTransceiver {
                     if matches_payload(&sub.compiled, &e.payload) {
                         let attrs = e.attributes;
                         let effective = (project | key_set) & attrs;
+                        // `from_cache` is assigned the descending
+                        // countdown below (once the match total is
+                        // known), so it is intentionally left unset here.
                         let header = dots!(DotsHeader {
                             type_name: group_name.to_string(),
                             sent_time: e.last_update_time,
                             server_sent_time: now_timepoint(),
                             attributes: effective,
                             sender: e.last_update_sender,
-                            from_cache: 0_u32,
-                            remove_obj: false,
-                            is_from_myself: false,
                             subscription_id: subscription_id,
                         });
                         out.push((header, e.payload.clone(), k.clone()));
@@ -1980,17 +1978,16 @@ fn handle_connected_message(
     }
 
     // Build the outbound header: preserve `sender` if the guest set
-    // it, else stamp with the broker's view; refresh server_sent_time;
-    // default `is_from_myself` to false (the receiving guest flips it
-    // to true on loopback when comparing sender to its own client_id).
+    // it, else stamp with the broker's view; refresh server_sent_time.
+    // `is_from_myself` is intentionally left untouched here — the
+    // receiving guest computes it from `sender` vs. its own client id
+    // (see `connection::stamp_is_from_myself`), so the broker is not
+    // the authority on that flag.
     let mut header = raw.header.clone();
     if header.sender.is_none() {
         header.sender = Some(client_id);
     }
     header.server_sent_time = Some(now_timepoint());
-    if header.is_from_myself.is_none() {
-        header.is_from_myself = Some(false);
-    }
 
     // Decode the payload to `DynamicStruct` only if needed — i.e.
     // the type is cached (cache merge needs the dynamic form) or
@@ -2273,7 +2270,6 @@ fn removal_txn(type_name: &str, entry: CachedEntry) -> Transmission {
         attributes: entry.attributes,
         sender: HOST_ID,
         remove_obj: true,
-        is_from_myself: false,
     });
     Transmission {
         header,

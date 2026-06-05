@@ -440,8 +440,9 @@ where
     /// [`subscribe`](Self::subscribe)). The raw `Transmission` is also
     /// returned so callers can additionally inspect it.
     pub async fn next(&mut self) -> Option<Result<Transmission, TransportError>> {
-        let result = self.framed.next().await;
-        if let Some(Ok(ref txn)) = result {
+        let mut result = self.framed.next().await;
+        if let Some(Ok(ref mut txn)) = result {
+            stamp_is_from_myself(&mut txn.header, self.client_id);
             self.dispatch_to_subscribers(txn);
         }
         result
@@ -569,6 +570,18 @@ where
     ) {
         dispatch_external(dispatch, txn);
     }
+}
+
+/// Stamp `is_from_myself` on an inbound header the way dots-cpp's
+/// guest-side `Connection::handleReceive` does: an object is "from
+/// myself" exactly when the `sender` id the broker preserved on the
+/// transmission equals this guest's own client id. The broker keeps the
+/// originating guest's `sender` through fan-out, so the *receiver* is
+/// the authority on this flag — not the broker. With no client id yet
+/// (pre-handshake, or a host-side dispatch that has no single owning
+/// client), it is `false`.
+pub(crate) fn stamp_is_from_myself(header: &mut DotsHeader, my_client_id: Option<u32>) {
+    header.is_from_myself = Some(my_client_id.is_some() && header.sender == my_client_id);
 }
 
 /// Dispatch a transmission to all subscribers of its `type_name`,

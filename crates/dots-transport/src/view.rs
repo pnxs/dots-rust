@@ -304,8 +304,6 @@ where
                 sender: entry.clone_info.last_update_sender,
                 sent_time: entry.clone_info.last_update_time,
                 from_cache: (total - 1 - i) as u32,
-                remove_obj: false,
-                is_from_myself: false,
                 subscription_id: self.subscription_id,
             });
             handler(&ViewEvent {

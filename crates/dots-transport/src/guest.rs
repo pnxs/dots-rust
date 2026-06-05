@@ -946,11 +946,18 @@ where
                     continue;
                 }
                 maybe_in = stream.next() => match maybe_in {
-                    Some(Ok(txn)) => {
+                    Some(Ok(mut txn)) => {
                         tracing::trace!(
                             type_name = ?txn.header.type_name,
                             sender = ?txn.header.sender,
                             "dispatching incoming transmission"
+                        );
+                        // Decide `is_from_myself` on the receiving side
+                        // (matching dots-cpp): true iff the preserved
+                        // sender id equals our own client id.
+                        crate::connection::stamp_is_from_myself(
+                            &mut txn.header,
+                            self.transceiver.client_id(),
                         );
                         Connection::<S>::dispatch_external(&dispatch, &txn);
                     }
