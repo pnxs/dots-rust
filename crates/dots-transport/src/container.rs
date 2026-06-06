@@ -231,24 +231,99 @@ impl DynContainer {
         // create) from that same slot rather than a separate `get`.
         match entries.entry(key) {
             Entry::Occupied(mut slot) => {
-                let (created_time, created_sender) = {
-                    let prior = &slot.get().clone_info;
-                    (prior.created_time, prior.created_sender)
-                };
-                slot.insert(DynContainerEntry {
-                    value: value.clone(),
-                    clone_info: CloneInfo {
-                        last_operation: Operation::Update,
-                        last_update_time: now_time,
-                        last_update_sender: now_sender,
-                        created_time,
-                        created_sender,
-                    },
-                });
+                // Partial-update merge, matching dots-cpp
+                // `Container::updateWithoutKeys`: overlay only the
+                // properties the update addresses onto the existing
+                // entry, in place, leaving unmentioned properties (and
+                // the keys) intact. The mask is the header's
+                // `attributes` — the authoritative set of properties
+                // the publisher touched — falling back to the payload's
+                // own valid set for peers that omit it.
+                //
+                // Merging in place (rather than cloning the whole
+                // incoming value and replacing) reuses the existing
+                // buffer and deep-clones only the changed properties;
+                // `created_*` survive because we mutate the entry
+                // instead of rebuilding it.
+                let mask = txn.header.attributes.unwrap_or_else(|| value.valid_set());
+                let entry = slot.get_mut();
+                entry.value.merge_from(value, mask);
+                entry.clone_info.last_operation = Operation::Update;
+                entry.clone_info.last_update_time = now_time;
+                entry.clone_info.last_update_sender = now_sender;
             }
             Entry::Vacant(slot) => {
                 slot.insert(DynContainerEntry {
                     value: value.clone(),
+                    clone_info: CloneInfo {
+                        last_operation: Operation::Create,
+                        last_update_time: now_time,
+                        last_update_sender: now_sender,
+                        created_time: now_time,
+                        created_sender: now_sender,
+                    },
+                });
+            }
+        }
+    }
+
+    /// Owned-payload variant of [`apply`](Self::apply), used when the
+    /// dispatcher hands this container the only copy of an incoming
+    /// transmission (the read loop owns it and drops it afterward).
+    ///
+    /// It moves the decoded value rather than cloning it:
+    /// - **create** stores the [`AnyStruct`] directly (zero deep clone);
+    /// - **update** moves the changed properties out of the incoming
+    ///   value into the existing entry via
+    ///   [`AnyStruct::merge_take`](dots_core::AnyStruct::merge_take)
+    ///   (no deep clone of `String`/`Vec` payloads).
+    ///
+    /// Behaviour is otherwise identical to [`apply`](Self::apply); only
+    /// `Payload::Typed` reaches here (the dispatcher routes `Wire`
+    /// payloads through the borrowing path).
+    pub(crate) fn apply_owned(&self, txn: Transmission) {
+        let dots_model::Transmission { header, payload } = txn;
+        let dots_model::Payload::Typed(value) = payload else {
+            tracing::warn!(
+                type_name = header.type_name.as_deref().unwrap_or("?"),
+                "DynContainer::apply_owned dropped a non-Typed payload"
+            );
+            return;
+        };
+        if !core::ptr::eq(value.descriptor(), self.descriptor) {
+            tracing::warn!(
+                container = self.descriptor.name,
+                payload = value.descriptor().name,
+                "DynContainer received payload for unexpected type"
+            );
+            return;
+        }
+        let key = encode_key_bytes(&value);
+        let mut entries = self.entries.write();
+
+        if header.remove_obj == Some(true) {
+            entries.remove(&key);
+            return;
+        }
+
+        let now_sender = header.sender;
+        let now_time = header.sent_time;
+        match entries.entry(key) {
+            Entry::Occupied(mut slot) => {
+                let mask = header.attributes.unwrap_or_else(|| value.valid_set());
+                // Move the changed properties out of the owned incoming
+                // value; whatever isn't moved drops with `value`.
+                let mut value = value;
+                let entry = slot.get_mut();
+                entry.value.merge_take(&mut value, mask);
+                entry.clone_info.last_operation = Operation::Update;
+                entry.clone_info.last_update_time = now_time;
+                entry.clone_info.last_update_sender = now_sender;
+            }
+            Entry::Vacant(slot) => {
+                // Move the whole decoded value in — no clone.
+                slot.insert(DynContainerEntry {
+                    value,
                     clone_info: CloneInfo {
                         last_operation: Operation::Create,
                         last_update_time: now_time,
@@ -618,6 +693,27 @@ impl DispatchEntry for DynContainerDispatchEntry {
             return Ok(false);
         };
         container.apply(txn);
+        Ok(true)
+    }
+
+    /// A container stores the value long-term, so it's the natural
+    /// owner of an incoming transmission on the move-capable dispatch
+    /// path.
+    fn wants_owned(&self) -> bool {
+        true
+    }
+
+    fn dispatch_owned(&mut self, txn: Transmission) -> Result<bool, dots_core::DecodeError> {
+        let Some(container) = self.container.upgrade() else {
+            return Ok(false);
+        };
+        // `apply_owned` only handles `Typed`; route `Wire` (no owned
+        // `AnyStruct` to move) through the borrowing path.
+        if matches!(txn.payload, dots_model::Payload::Typed(_)) {
+            container.apply_owned(txn);
+        } else {
+            container.apply(&txn);
+        }
         Ok(true)
     }
 }

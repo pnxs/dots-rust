@@ -959,7 +959,11 @@ where
                             &mut txn.header,
                             self.transceiver.client_id(),
                         );
-                        Connection::<S>::dispatch_external(&dispatch, &txn);
+                        // The driver owns `txn` and drops it after
+                        // dispatch, so use the move-capable path: a
+                        // container takes ownership of the payload
+                        // instead of deep-cloning it.
+                        Connection::<S>::dispatch_external_owned(&dispatch, txn);
                     }
                     Some(Err(e)) => {
                         tracing::error!(error = %e, "transport error in guest run loop");

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use dots_core::{StructValue, Timepoint, dots, encode_to_vec};
+use dots_core::{PropertySet, StructValue, Timepoint, dots, encode_to_vec};
 #[allow(unused_imports)]
 use dots_model::*;
 use dots_model::{
@@ -163,6 +163,103 @@ async fn container_create_then_update_preserves_created_metadata() {
     // created_* preserved from the first publish.
     assert_eq!(ci.created_sender, Some(11));
     assert_eq!(ci.created_time, Some(Timepoint(100.0)));
+
+    drop(conn);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn container_update_merges_partial_preserving_unsent_fields() {
+    // The partial-update merge: a create sets all three properties, a
+    // follow-up update carries only `message` (its `attributes` mask is
+    // {id, message}). The merge must overlay `message` and *preserve*
+    // the prior `sequence` — not drop it as a wholesale replace would.
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let reg = registry();
+
+    let server_reg = reg.clone();
+    let server = tokio::spawn(async move {
+        let codec = TransmissionCodec::new(server_reg.clone());
+        let mut framed = Framed::new(server_io, codec);
+        run_no_preload_handshake(&mut framed, &server_reg).await;
+
+        let p1 = dots!(Pinger {
+            id: 1_u32,
+            message: "first",
+            sequence: 100_u64,
+        });
+        push_pinger(&mut framed, &p1, None, None, false).await;
+
+        // Partial: only `message` set → attributes = {id, message}.
+        let p2 = dots!(Pinger {
+            id: 1_u32,
+            message: "second",
+        });
+        push_pinger(&mut framed, &p2, None, None, false).await;
+    });
+
+    let mut conn = Connection::establish(client_io, "merge", reg).await.unwrap();
+    let pingers = conn.container::<Pinger>();
+
+    conn.next().await.unwrap().unwrap();
+    conn.next().await.unwrap().unwrap();
+
+    assert_eq!(pingers.len(), 1);
+    let entry = pingers.get(&dots!(Pinger { id: 1_u32 })).expect("entry exists");
+    assert_eq!(entry.message.as_deref(), Some("second")); // overlaid
+    assert_eq!(entry.sequence, Some(100)); // preserved by merge
+    drop(entry);
+
+    drop(conn);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn container_update_attributes_clears_addressed_unset_property() {
+    // An update whose `attributes` mask names a property the payload
+    // omits is an explicit clear. Here the payload carries {id,
+    // sequence} but attributes addresses {id, message, sequence}, so
+    // `message` (in the mask, absent from the payload) is cleared.
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let reg = registry();
+
+    let server_reg = reg.clone();
+    let server = tokio::spawn(async move {
+        let codec = TransmissionCodec::new(server_reg.clone());
+        let mut framed = Framed::new(server_io, codec);
+        run_no_preload_handshake(&mut framed, &server_reg).await;
+
+        let p1 = dots!(Pinger {
+            id: 1_u32,
+            message: "hi",
+            sequence: 5_u64,
+        });
+        push_pinger(&mut framed, &p1, None, None, false).await;
+
+        // Payload omits `message`, but attributes addresses it.
+        let p2 = dots!(Pinger {
+            id: 1_u32,
+            sequence: 9_u64,
+        });
+        let attrs = PropertySet::EMPTY.with_tag(1).with_tag(2).with_tag(3);
+        let header = dots!(DotsHeader {
+            type_name: "Pinger",
+            attributes: attrs,
+        });
+        let frame = encode_transmission(&header, &p2);
+        framed.get_mut().write_all(&frame).await.unwrap();
+    });
+
+    let mut conn = Connection::establish(client_io, "clear", reg).await.unwrap();
+    let pingers = conn.container::<Pinger>();
+
+    conn.next().await.unwrap().unwrap();
+    conn.next().await.unwrap().unwrap();
+
+    let entry = pingers.get(&dots!(Pinger { id: 1_u32 })).expect("entry exists");
+    assert_eq!(entry.sequence, Some(9)); // overlaid
+    assert_eq!(entry.message, None); // cleared via attributes mask
+    drop(entry);
 
     drop(conn);
     server.await.unwrap();

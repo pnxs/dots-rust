@@ -561,14 +561,15 @@ where
         (self.framed, self.dispatch)
     }
 
-    /// Crate-internal: dispatch a transmission to subscribers from
-    /// outside the connection's own `next()` (e.g. the App's read
-    /// loop after taking the framed via `into_parts`).
-    pub(crate) fn dispatch_external(
+    /// Crate-internal: owned-transmission dispatch for read loops that
+    /// own the [`Transmission`] and drop it after routing (the
+    /// [`GuestDriver`](crate::guest::GuestDriver)). Lets a container
+    /// move the payload into its cache instead of deep-cloning it.
+    pub(crate) fn dispatch_external_owned(
         dispatch: &Arc<Mutex<DispatchState>>,
-        txn: &Transmission,
+        txn: Transmission,
     ) {
-        dispatch_external(dispatch, txn);
+        dispatch_external_owned(dispatch, txn);
     }
 }
 
@@ -648,6 +649,84 @@ fn dispatch_external(dispatch: &Arc<Mutex<DispatchState>>, txn: &Transmission) {
     let added_during_dispatch = std::mem::take(slot);
     *slot = entries;
     slot.extend(added_during_dispatch);
+}
+
+/// Owned-transmission variant of [`dispatch_external`]. The caller owns
+/// the `Transmission` and won't use it after this returns, so the
+/// payload can be *moved* into a long-term consumer rather than cloned.
+///
+/// The *last* registered handler whose [`DispatchEntry::wants_owned`]
+/// is `true` (a container) is handed the owned transmission via
+/// `dispatch_owned`; it runs **after** every other handler so the
+/// earlier borrows are already released. All other handlers borrow
+/// exactly as in [`dispatch_external`]. Handler order among independent
+/// consumers carries no contract, so running the owner last is
+/// transparent.
+///
+/// Filtered (`subscription_id`) traffic, payloads with no type name,
+/// and non-`Typed` (`Wire`) payloads have nothing to move and fall back
+/// to the borrowing path.
+fn dispatch_external_owned(dispatch: &Arc<Mutex<DispatchState>>, txn: Transmission) {
+    let movable = matches!(txn.payload, dots_model::Payload::Typed(_))
+        && txn.header.subscription_id.is_none()
+        && txn.header.type_name.is_some();
+    if !movable {
+        dispatch_external(dispatch, &txn);
+        return;
+    }
+    // `unwrap` is safe: `movable` checked `type_name.is_some()`.
+    let type_name = txn.header.type_name.as_deref().unwrap().to_string();
+
+    let taken = {
+        let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+        state.entries.remove(&type_name)
+    };
+    let Some(mut entries) = taken else {
+        // No handlers for this type — the owned `txn` simply drops.
+        return;
+    };
+
+    // The owner is the last entry that wants ownership; it runs last so
+    // the borrowing handlers are done with `txn` before it's consumed.
+    match entries.iter().rposition(|(_, e)| e.wants_owned()) {
+        None => {
+            // No owner: borrow-dispatch all, in place — identical cost
+            // to the borrowed path (no allocation).
+            entries.retain_mut(|(_, e)| dispatch_keep(e.dispatch(&txn), &type_name));
+        }
+        Some(oi) => {
+            // Pull the owner out so the rest can borrow `txn` first; the
+            // owner then consumes it and is re-appended if it survives.
+            let (owner_id, mut owner) = entries.remove(oi);
+            entries.retain_mut(|(_, e)| dispatch_keep(e.dispatch(&txn), &type_name));
+            if dispatch_keep(owner.dispatch_owned(txn), &type_name) {
+                entries.push((owner_id, owner));
+            }
+        }
+    }
+
+    let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+    let slot = state.entries.entry(type_name).or_default();
+    let added_during_dispatch = std::mem::take(slot);
+    *slot = entries;
+    slot.extend(added_during_dispatch);
+}
+
+/// Retain decision for one dispatch call, with the same warn-on-decode-
+/// error behaviour as the borrowing loop (keep the entry, drop the
+/// message).
+fn dispatch_keep(r: Result<bool, dots_core::DecodeError>, type_name: &str) -> bool {
+    match r {
+        Ok(retain) => retain,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                type_name = type_name,
+                "dispatch entry failed to decode transmission; keeping entry, dropping message"
+            );
+            true
+        }
+    }
 }
 
 // ===== Pub/sub: Event, Subscription, dispatch =====
@@ -839,6 +918,26 @@ pub(crate) trait DispatchEntry: Send {
     /// entry should be removed (e.g. the subscriber's receiver was
     /// dropped); `Ok(true)` if it should be kept.
     fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError>;
+
+    /// Whether this entry can take ownership of an incoming
+    /// transmission. Entries that store the value long-term (a
+    /// container) return `true`; transient consumers (subscriptions,
+    /// which clone into their channel) return `false`. On the
+    /// move-capable dispatch path the *last* such entry is handed the
+    /// owned payload via [`dispatch_owned`](Self::dispatch_owned),
+    /// letting it move the value in instead of deep-cloning.
+    fn wants_owned(&self) -> bool {
+        false
+    }
+
+    /// Consume an owned transmission. Only invoked on the entry chosen
+    /// as owner by the move-capable dispatch path (it always runs last,
+    /// after every borrowing entry). The default borrows and drops,
+    /// which is correct for any entry that didn't opt into
+    /// [`wants_owned`](Self::wants_owned).
+    fn dispatch_owned(&mut self, txn: Transmission) -> Result<bool, dots_core::DecodeError> {
+        self.dispatch(&txn)
+    }
 }
 
 struct TypedDispatchEntry<T> {

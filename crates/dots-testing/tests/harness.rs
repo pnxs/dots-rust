@@ -30,6 +30,17 @@ mod model {
         #[dots(tag = 2)]
         pub value: Option<u64>,
     }
+
+    #[derive(DotsStruct, Default, Debug, Clone, PartialEq)]
+    #[dots(name = "HarnessProfile", cached)]
+    pub struct Profile {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub name: Option<String>,
+        #[dots(tag = 3)]
+        pub age: Option<u32>,
+    }
 }
 use model::*;
 
@@ -89,6 +100,31 @@ async fn container_mirrors_cache() {
     assert_eq!(one.value, Some(11)); // latest wins
     let two = container.get(&dots!(Counter { id: 2_u32 })).expect("key 2 present");
     assert_eq!(two.value, Some(99));
+}
+
+/// End-to-end check of the move-capable guest dispatch path: a partial
+/// update routed through the real `GuestDriver` loop (which owns the
+/// transmission and hands it to the container via `merge_take`) must
+/// preserve a field the update didn't carry.
+#[tokio::test]
+async fn container_partial_update_preserves_unsent_field_through_driver() {
+    let harness = TestHarness::new().await;
+
+    let container = harness.container::<Profile>();
+    let mut sub = harness.subscribe_stream::<Profile>();
+
+    // Create with both `name` and `age`.
+    dots::publish(&dots!(Profile { id: 1_u32, name: "alice", age: 30_u32 }));
+    harness.recv(&mut sub).await.expect("create");
+
+    // Partial update: only `name` set → published `attributes` = {id,
+    // name}; `age` (tag 3) is outside the mask.
+    dots::publish(&dots!(Profile { id: 1_u32, name: "alice v2" }));
+    harness.recv(&mut sub).await.expect("update");
+
+    let p = container.get(&dots!(Profile { id: 1_u32 })).expect("present");
+    assert_eq!(p.name.as_deref(), Some("alice v2")); // overlaid
+    assert_eq!(p.age, Some(30)); // preserved through the owned merge path
 }
 
 /// `wait_for_subscribers` observes broker-side subscription state.
