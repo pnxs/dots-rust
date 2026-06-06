@@ -1784,6 +1784,29 @@ impl HostTransceiver {
 
 // ===== Per-guest task =====
 
+/// Classify a read error from a guest socket. A peer going away —
+/// whether it half-closed cleanly (surfaced elsewhere as EOF) or its
+/// kernel sent an RST because it closed with traffic still unread (a
+/// normal outcome for a pub/sub client that exits while subscribed to
+/// its own loopback) — is **not** a broker error. We map the
+/// disconnect-class `io::ErrorKind`s to a clean `Ok(())` with a debug
+/// log, and only surface genuine transport/framing faults as errors.
+fn guest_read_error(client_id: u32, e: crate::TransportError) -> Result<(), HostError> {
+    use std::io::ErrorKind::{
+        BrokenPipe, ConnectionAborted, ConnectionReset, NotConnected, UnexpectedEof,
+    };
+    if let crate::TransportError::Io(io) = &e
+        && matches!(
+            io.kind(),
+            ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | NotConnected
+        )
+    {
+        tracing::debug!(client_id, error = %e, "guest disconnected");
+        return Ok(());
+    }
+    Err(HostError::Transport(e.to_string()))
+}
+
 async fn run_guest<R>(
     host: Arc<HostTransceiver>,
     client_id: u32,
@@ -1853,7 +1876,7 @@ where
                         break;
                     }
                 }
-                Some(Err(e)) => return Err(HostError::Transport(e.to_string())),
+                Some(Err(e)) => return guest_read_error(client_id, e),
                 None => return Ok(()),
             }
         }
@@ -1875,7 +1898,7 @@ where
                 writer.record_received(raw.frame_bytes);
                 handle_connected_message(&host, client_id, &raw);
             }
-            Some(Err(e)) => return Err(HostError::Transport(e.to_string())),
+            Some(Err(e)) => return guest_read_error(client_id, e),
             None => return Ok(()),
         }
         // Slow-consumer disconnect: if our own queue overflowed
@@ -2543,6 +2566,37 @@ impl Drop for UdsSocketGuard {
 mod tests {
     use super::*;
     use dots_core::{DynamicPropertyDescriptor, StructFlags};
+
+    /// A client going away — reset (RST), aborted, broken pipe,
+    /// unexpected EOF, not-connected — is a normal disconnect, not a
+    /// broker error, so `run_guest` returns `Ok`.
+    #[test]
+    fn disconnect_class_read_errors_are_graceful() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionReset, // ECONNRESET (os error 104) — the reported case
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::NotConnected,
+        ] {
+            let e = crate::TransportError::Io(Error::from(kind));
+            assert!(
+                guest_read_error(1, e).is_ok(),
+                "{kind:?} should be treated as a graceful disconnect"
+            );
+        }
+    }
+
+    /// Genuine faults still surface as errors.
+    #[test]
+    fn real_io_and_framing_errors_still_error() {
+        use std::io::{Error, ErrorKind};
+        let io = crate::TransportError::Io(Error::from(ErrorKind::InvalidData));
+        assert!(guest_read_error(1, io).is_err());
+        let framing = crate::TransportError::Framing(dots_model::FramingError::InvalidSizePrefix(0));
+        assert!(guest_read_error(1, framing).is_err());
+    }
 
     fn leaf(name: &str) -> Arc<DynamicStructDescriptor> {
         Arc::new(DynamicStructDescriptor {
