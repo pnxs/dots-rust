@@ -215,6 +215,100 @@ impl AnyStruct {
         out.valid = effective;
         out
     }
+
+    /// Apply a flat, masked overlay of `src` onto `self`, matching
+    /// dots-cpp's `Container::updateWithoutKeys` — the partial-update
+    /// merge the cache performs on every non-create transmission.
+    ///
+    /// For each **non-key** property whose tag is set in `mask`:
+    /// - set in `src` → deep-clone it into `self`, dropping any prior
+    ///   value (`clone_in_place`);
+    /// - unset in `src` → clear it in `self` (`set_none`).
+    ///
+    /// Properties whose tag is **outside** `mask` are left untouched —
+    /// that's what preserves values the update didn't mention. Key
+    /// properties are never modified (they define identity and the
+    /// container keys by them), so the merge can never move an entry.
+    ///
+    /// The overlay is **flat**: a sub-struct property is replaced
+    /// wholesale, not merged field-by-field — exactly as the C++
+    /// container does. (The recursive `_merge` is a separate operation
+    /// the cache doesn't use.)
+    ///
+    /// `src` must share `self`'s descriptor; mismatches are a caller
+    /// bug (asserted in debug builds) and the call is a no-op in
+    /// release.
+    pub fn merge_from(&mut self, src: &dyn StructValue, mask: PropertySet) {
+        debug_assert!(
+            core::ptr::eq(self.descriptor, src.descriptor()),
+            "merge_from requires matching descriptors"
+        );
+        if !core::ptr::eq(self.descriptor, src.descriptor()) {
+            return;
+        }
+        let src_base = src.data_ptr();
+        for prop in self.descriptor.properties {
+            if prop.is_key || !mask.has(prop.tag) {
+                continue;
+            }
+            // SAFETY: both buffers share this descriptor's layout, so
+            // `prop.offset` is in-range for each; every slot is a valid
+            // `Option<T>` (or bare-`T` key, excluded above). The thunks
+            // read `src` and drop-then-write `self` in place.
+            unsafe {
+                let dst_p = self.data.as_ptr().add(prop.offset);
+                let src_p = src_base.add(prop.offset);
+                if (prop.vtable.is_set)(src_p) {
+                    (prop.vtable.clone_in_place)(src_p, dst_p);
+                    self.valid = self.valid.with_tag(prop.tag);
+                } else {
+                    (prop.vtable.set_none)(dst_p);
+                    self.valid = self.valid.without_tag(prop.tag);
+                }
+            }
+        }
+    }
+
+    /// Like [`merge_from`](Self::merge_from), but **moves** each set
+    /// property out of `src` instead of deep-cloning it — `src`'s owned
+    /// heap allocations (`String`/`Vec` buffers, nested data) are handed
+    /// over to `self`. After the call the moved-out slots of `src` are
+    /// `None`, so `src` stays valid and drops cleanly.
+    ///
+    /// Use this on the cache's update path when the incoming value is
+    /// owned and about to be dropped: it saves a deep clone of every
+    /// changed property. Semantics (mask, flat overlay, keys untouched,
+    /// clear-when-unset-in-mask) are identical to `merge_from`.
+    pub fn merge_take(&mut self, src: &mut AnyStruct, mask: PropertySet) {
+        debug_assert!(
+            core::ptr::eq(self.descriptor, src.descriptor),
+            "merge_take requires matching descriptors"
+        );
+        if !core::ptr::eq(self.descriptor, src.descriptor) {
+            return;
+        }
+        for prop in self.descriptor.properties {
+            if prop.is_key || !mask.has(prop.tag) {
+                continue;
+            }
+            // SAFETY: both buffers share this descriptor's layout, so
+            // `prop.offset` is in-range for each; every slot is a valid
+            // `Option<T>` (keys excluded above). `take_in_place` moves
+            // `src`'s value into `self`, leaving `src`'s slot `None`.
+            unsafe {
+                let dst_p = self.data.as_ptr().add(prop.offset);
+                let src_p = src.data.as_ptr().add(prop.offset);
+                if (prop.vtable.is_set)(src_p) {
+                    (prop.vtable.take_in_place)(src_p, dst_p);
+                    self.valid = self.valid.with_tag(prop.tag);
+                    src.valid = src.valid.without_tag(prop.tag);
+                } else {
+                    (prop.vtable.set_none)(dst_p);
+                    self.valid = self.valid.without_tag(prop.tag);
+                }
+            }
+        }
+    }
 }
 
 impl core::fmt::Debug for AnyStruct {
@@ -797,6 +891,48 @@ pub unsafe fn opt_clone<T: Clone>(src: *const u8, dst: *mut u8) {
     }
 }
 
+/// Clear the `Option<T>` at `ptr`: drop any existing value and write a
+/// real `None`. Unlike zeroing, this is correct for niche-optimized
+/// layouts (e.g. `Option<bool>`, whose `None` is *not* the zero
+/// pattern, and `Option<AnyObject>`, whose niche lives in a length
+/// field).
+///
+/// # Safety
+///
+/// `ptr` must point to a valid `Option<T>`.
+pub unsafe fn opt_set_none<T>(ptr: *mut u8) {
+    let p = ptr as *mut Option<T>;
+    // SAFETY: caller-upheld; the slot is a valid `Option<T>`, so
+    // drop-then-write is sound.
+    unsafe {
+        core::ptr::drop_in_place(p);
+        core::ptr::write(p, None);
+    }
+}
+
+/// Move the `Option<T>` at `src` into `dst`: drop any existing value at
+/// `dst`, transfer `src`'s value (handing over owned heap allocations
+/// rather than deep-cloning them), and leave `src` as `None`. This is
+/// the move counterpart of [`opt_clone`]; it needs no `T: Clone` bound
+/// because nothing is copied. Works uniformly for `Option<Vec<_>>` too
+/// — moving an `Option` is type-agnostic.
+///
+/// # Safety
+///
+/// `src` and `dst` must each point to a valid `Option<T>`.
+pub unsafe fn opt_take<T>(src: *mut u8, dst: *mut u8) {
+    let s = src as *mut Option<T>;
+    let d = dst as *mut Option<T>;
+    // SAFETY: caller-upheld. `replace` reads `src`'s value out and
+    // writes `None` back; `dst`'s prior value is dropped before the
+    // moved value is written.
+    unsafe {
+        let moved = core::ptr::replace(s, None);
+        core::ptr::drop_in_place(d);
+        core::ptr::write(d, moved);
+    }
+}
+
 /// Clone the `Option<Vec<T>>` at `src` into `dst`. Same shape as
 /// [`opt_clone`] but routed via the `Vec` family so the derive macro
 /// can pick a `Vec`-specific clone without a `DotsField` bound.
@@ -1003,5 +1139,44 @@ pub unsafe fn key_clone<T: Clone>(src: *const u8, dst: *mut u8) {
     unsafe {
         core::ptr::drop_in_place(p);
         core::ptr::write(p, cloned);
+    }
+}
+
+/// "Clear" a bare-`T` key slot by restoring `T::default()`, dropping the
+/// previous value first. Key properties are never cleared by
+/// [`AnyStruct::merge_from`] (the merge mask always excludes keys), but
+/// the vtable slot must be total and sound, so this keeps the bare-`T`
+/// slot a valid, droppable `T` should it ever be invoked.
+///
+/// # Safety
+///
+/// `ptr` must point to a valid `T`.
+pub unsafe fn key_set_none<T: Default>(ptr: *mut u8) {
+    let p = ptr as *mut T;
+    // SAFETY: caller-upheld; drop-then-write keeps the slot valid.
+    unsafe {
+        core::ptr::drop_in_place(p);
+        core::ptr::write(p, T::default());
+    }
+}
+
+/// Move the bare `T` at `src` into `dst`, dropping `dst`'s prior value
+/// and restoring `src` to `T::default()` so it stays a valid, droppable
+/// `T`. Key properties are never moved by [`AnyStruct::merge_take`]
+/// (the merge mask excludes keys), but the vtable slot must be total
+/// and sound.
+///
+/// # Safety
+///
+/// `src` and `dst` must each point to a valid `T`.
+pub unsafe fn key_take<T: Default>(src: *mut u8, dst: *mut u8) {
+    let s = src as *mut T;
+    let d = dst as *mut T;
+    // SAFETY: caller-upheld; `replace` keeps `src` valid, drop-then-
+    // write keeps `dst` valid.
+    unsafe {
+        let moved = core::ptr::replace(s, T::default());
+        core::ptr::drop_in_place(d);
+        core::ptr::write(d, moved);
     }
 }

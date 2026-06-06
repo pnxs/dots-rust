@@ -142,6 +142,29 @@ pub struct PropertyVtable {
     /// which reads as `None`); any previous value is dropped before
     /// the clone is written. Used by `AnyStruct::clone`.
     pub clone_in_place: unsafe fn(src: *const u8, dst: *mut u8),
+
+    /// Clears the property at the pointer, dropping any existing value.
+    /// For `Option<T>` fields this drops the old value and writes a
+    /// real `None` (never relying on a zero bit-pattern — niche layouts
+    /// like `Option<bool>` or `Option<AnyObject>` don't put `None` at
+    /// zero). For bare-`T` key fields — which `AnyStruct::merge_from`
+    /// never clears — it restores `T::default()` so the slot stays a
+    /// valid, droppable `T`. Used by `AnyStruct::merge_from` to apply
+    /// the "property named in the update mask but absent from the
+    /// payload" (explicit-clear) case.
+    pub set_none: unsafe fn(*mut u8),
+
+    /// Moves the property at `src` into `dst`, dropping any existing
+    /// value at `dst` and leaving `src` cleared (`None` for an
+    /// `Option<T>`, `T::default()` for a bare-`T` key). Unlike
+    /// `clone_in_place`, this transfers owned heap data (`String`/`Vec`
+    /// buffers, nested allocations) without deep-cloning it — the
+    /// allocation is handed over, not copied.
+    ///
+    /// Used by `AnyStruct::merge_take` on the cache's update path when
+    /// the incoming value is owned and about to be dropped, so its
+    /// fields are moved into the stored entry instead of cloned.
+    pub take_in_place: unsafe fn(src: *mut u8, dst: *mut u8),
 }
 
 impl core::fmt::Debug for PropertyVtable {

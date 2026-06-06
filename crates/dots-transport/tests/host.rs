@@ -423,6 +423,108 @@ async fn guest_stats_count_both_directions() {
 }
 
 #[tokio::test]
+async fn host_merges_partial_update_so_late_subscriber_sees_full_state() {
+    // A guest creates a full Pinger, then sends a *partial* update
+    // (only `message`). The host must merge it into its cache —
+    // preserving `sequence` — so a late subscriber's replay carries the
+    // full accumulated object, not just the last fragment.
+    let host = HostTransceiver::new("test-host");
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    // Guest A: publisher.
+    let (host_io_a, guest_io_a) = tokio::io::duplex(8192);
+    host.accept(host_io_a);
+    let conn_a = ConnectionBuilder::new(guest_io_a, "publisher", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt_a, driver_a) = GuestTransceiver::from_connection(
+        registry.clone(),
+        conn_a,
+        [Pinger::DESCRIPTOR],
+        [Pinger::DESCRIPTOR],
+    );
+    let driver_a_handle = tokio::spawn(driver_a.run());
+
+    // Full create.
+    gt_a.publish(&dots!(Pinger {
+        id: 1_u32,
+        message: "first",
+        sequence: 42_u64,
+    }));
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.cache_size("Pinger") == 1 {
+            break;
+        }
+    }
+
+    // Partial update: only `message` is set, so the published
+    // `attributes` mask is {id, message} — `sequence` is not addressed.
+    gt_a.publish(&dots!(Pinger {
+        id: 1_u32,
+        message: "updated",
+    }));
+    // Wait until the host cache reflects the merged state.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let cached = host.cached_values::<Pinger>();
+        if cached
+            .first()
+            .is_some_and(|p| p.message.as_deref() == Some("updated"))
+        {
+            break;
+        }
+    }
+    let cached = host.cached_values::<Pinger>();
+    assert_eq!(cached.len(), 1);
+    assert_eq!(cached[0].message.as_deref(), Some("updated")); // overlaid
+    assert_eq!(
+        cached[0].sequence,
+        Some(42),
+        "host cache must preserve `sequence` across the partial update (merge, not replace)"
+    );
+
+    // Guest B: late subscriber — its replay must carry the full state.
+    let (host_io_b, guest_io_b) = tokio::io::duplex(8192);
+    host.accept(host_io_b);
+    let conn_b = ConnectionBuilder::new(guest_io_b, "subscriber", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt_b, driver_b) = GuestTransceiver::from_connection(
+        registry.clone(),
+        conn_b,
+        [Pinger::DESCRIPTOR],
+        [Pinger::DESCRIPTOR],
+    );
+    let mut sub = gt_b.subscribe_stream::<Pinger>();
+    let driver_b_handle = tokio::spawn(driver_b.run());
+
+    let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("timed out waiting for replayed Pinger")
+        .expect("subscription closed");
+    assert!(event.header.from_cache.is_some(), "replay carries from_cache");
+    assert_eq!(event.value.id, Some(1));
+    assert_eq!(event.value.message.as_deref(), Some("updated"));
+    assert_eq!(
+        event.value.sequence,
+        Some(42),
+        "late subscriber must receive the merged full object on replay"
+    );
+
+    gt_a.exit();
+    gt_b.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_a_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_b_handle).await;
+}
+
+#[tokio::test]
 async fn host_replays_cached_pingers_to_late_subscriber() {
     let host = HostTransceiver::new("test-host");
     let registry = registry();

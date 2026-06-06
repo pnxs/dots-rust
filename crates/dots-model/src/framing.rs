@@ -106,6 +106,34 @@ impl Payload {
             Self::Wire(_) => None,
         }
     }
+
+    /// Bitmask of the properties currently set on this payload.
+    pub fn valid_set(&self) -> PropertySet {
+        match self {
+            Self::Typed(a) => a.valid_set(),
+            Self::Wire(d) => d.valid,
+        }
+    }
+
+    /// Flat masked partial-update merge: overlay `incoming`'s masked
+    /// properties onto `self` in place, **moving** the values in (no
+    /// deep clone), mirroring dots-cpp `Container::updateWithoutKeys`.
+    /// See [`dots_core::AnyStruct::merge_take`] /
+    /// [`dots_core::DynamicStruct::merge_take`] for the semantics.
+    ///
+    /// When the two payloads use different representations (one
+    /// `Typed`, one `Wire`) there's no shared in-memory form to merge
+    /// into, so `self` is replaced by `incoming` wholesale — the same
+    /// outcome as before merge existed. In practice a given type is
+    /// published in one representation, so this fallback is not hit on
+    /// the hot path.
+    pub fn merge_take(&mut self, mask: PropertySet, incoming: Payload) {
+        match (self, incoming) {
+            (Self::Typed(dst), Self::Typed(mut src)) => dst.merge_take(&mut src, mask),
+            (Self::Wire(dst), Self::Wire(mut src)) => dst.merge_take(&mut src, mask),
+            (slot, other) => *slot = other,
+        }
+    }
 }
 
 impl Transmittable for Payload {

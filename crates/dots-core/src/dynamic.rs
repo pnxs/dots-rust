@@ -334,6 +334,77 @@ impl DynamicStruct {
         buf
     }
 
+    /// Flat masked overlay of `src` onto `self`, mirroring
+    /// [`AnyStruct::merge_from`](crate::AnyStruct::merge_from) — the
+    /// partial-update merge the cache performs on every non-create
+    /// transmission.
+    ///
+    /// For each **non-key** property whose tag is in `mask`: present in
+    /// `src` → its value is cloned into `self`; absent in `src` →
+    /// cleared in `self`. Properties whose tag is **outside** `mask`,
+    /// and all key properties, are left as-is. The overlay is flat — a
+    /// nested-struct property is replaced wholesale, matching dots-cpp's
+    /// `Container::updateWithoutKeys`.
+    pub fn merge_from(&mut self, src: &DynamicStruct, mask: PropertySet) {
+        self.merge_impl(mask, |tag| {
+            src.valid
+                .has(tag)
+                .then(|| src.properties.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone()))
+                .flatten()
+        });
+    }
+
+    /// Like [`merge_from`](Self::merge_from), but **moves** each set
+    /// property out of `src` instead of cloning it — `src`'s owned data
+    /// is handed over. After the call the moved-out slots of `src` are
+    /// gone and its `valid` set is updated, so `src` stays consistent.
+    /// Use this on the cache update path when the incoming value is
+    /// owned and about to be dropped.
+    pub fn merge_take(&mut self, src: &mut DynamicStruct, mask: PropertySet) {
+        self.merge_impl(mask, |tag| {
+            if src.valid.has(tag) {
+                src.valid = src.valid.without_tag(tag);
+                src.properties
+                    .iter()
+                    .position(|(t, _)| *t == tag)
+                    .map(|pos| src.properties.swap_remove(pos).1)
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Shared core of [`merge_from`]/[`merge_take`]. `take` yields the
+    /// source value for a masked tag (cloned or moved); returning
+    /// `None` for a tag in the mask means "clear it". Rebuilds
+    /// `self.properties` in descriptor order so the encode stays
+    /// deterministic.
+    fn merge_impl(&mut self, mask: PropertySet, mut take: impl FnMut(u32) -> Option<DynamicValue>) {
+        // Clone the `Arc` so iterating the descriptor doesn't borrow
+        // `self` while we mutate `self.properties`.
+        let descriptor = self.descriptor.clone();
+        let mut merged: Vec<(u32, DynamicValue)> = Vec::with_capacity(self.properties.len());
+        let mut valid = PropertySet::EMPTY;
+        for prop in &descriptor.properties {
+            let tag = prop.tag;
+            if !prop.is_key && mask.has(tag) {
+                // In the mask: take from the source, or clear (skip).
+                if let Some(v) = take(tag) {
+                    merged.push((tag, v));
+                    valid = valid.with_tag(tag);
+                }
+            } else if self.valid.has(tag) {
+                // Out of mask (or a key): keep self's current value.
+                if let Some(pos) = self.properties.iter().position(|(t, _)| *t == tag) {
+                    merged.push((tag, self.properties.swap_remove(pos).1));
+                    valid = valid.with_tag(tag);
+                }
+            }
+        }
+        self.properties = merged;
+        self.valid = valid;
+    }
+
     /// Project any `&dyn StructValue` (typed or `AnyStruct`) into a
     /// `DynamicStruct` — useful for the dynamic-subscriber path where
     /// the receiver wants the runtime-shaped view even though the

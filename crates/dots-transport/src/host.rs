@@ -1086,7 +1086,7 @@ impl HostTransceiver {
         let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_into(&header, value, &mut bytes);
-        self.cache_and_fan_out(&type_name, &header, Bytes::from(bytes), dyn_payload.as_ref(), HOST_ID);
+        self.cache_and_fan_out(&type_name, &header, Bytes::from(bytes), dyn_payload, HOST_ID);
     }
 
     /// Publish a partial update from the host. Same masking rules as
@@ -1106,7 +1106,7 @@ impl HostTransceiver {
         let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.cache_and_fan_out(&type_name, &header, Bytes::from(bytes), dyn_payload.as_ref(), HOST_ID);
+        self.cache_and_fan_out(&type_name, &header, Bytes::from(bytes), dyn_payload, HOST_ID);
     }
 
     /// Publish a removal from the host. Routes to every guest
@@ -1127,7 +1127,7 @@ impl HostTransceiver {
         let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
         encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.cache_and_fan_out(&type_name, &header, Bytes::from(bytes), dyn_payload.as_ref(), HOST_ID);
+        self.cache_and_fan_out(&type_name, &header, Bytes::from(bytes), dyn_payload, HOST_ID);
     }
 
     /// Build the cache-side representation of a typed publish.
@@ -1182,7 +1182,7 @@ impl HostTransceiver {
         type_name: &str,
         header: &DotsHeader,
         raw_frame: Bytes,
-        payload: Option<&dots_model::Payload>,
+        payload: Option<dots_model::Payload>,
         exclude_client_id: u32,
     ) {
         let mut inner = self.inner.lock().expect("host mutex poisoned");
@@ -1202,7 +1202,7 @@ impl HostTransceiver {
         // sub exists. For the all-unfiltered case the four-cases
         // branch is skipped entirely and we pay zero clone cost.
         let pre_merge_payload: Option<dots_model::Payload> = if is_cached && has_filtered_subs {
-            payload.and_then(|p| {
+            payload.as_ref().and_then(|p| {
                 let key = p.key_bytes();
                 inner.pool.get(type_name).and_then(|m| m.get(&key)).map(|e| e.payload.clone())
             })
@@ -1210,41 +1210,6 @@ impl HostTransceiver {
             None
         };
 
-        // Mutate the cache.
-        if is_cached {
-            if let Some(p) = payload {
-                let key = p.key_bytes();
-                let map = inner.pool.entry(type_name.to_string()).or_default();
-                if is_remove {
-                    map.remove(&key);
-                    if map.is_empty() {
-                        inner.pool.remove(type_name);
-                    }
-                } else {
-                    // Preserve `created_from` across updates — only
-                    // the first publish for a key sets it. Mirrors
-                    // dots-cpp `CloneInformation::createdFrom`.
-                    let created_from = map.get(&key).and_then(|e| e.created_from).or(header.sender);
-                    map.insert(
-                        key,
-                        CachedEntry {
-                            payload: p.clone(),
-                            created_from,
-                            last_update_sender: header.sender,
-                            last_update_time: header.sent_time,
-                            attributes: header.attributes.unwrap_or_default(),
-                        },
-                    );
-                }
-            }
-        }
-
-        // Filtered fan-out: build per-sub outbound bytes while
-        // holding a mutable borrow on the group (we mutate
-        // `visible`). Borrow-check splits `inner.groups` mutably
-        // from `inner.guests` immutably via separate field access
-        // — collect (client_id, bytes) pairs and enqueue after.
-        let mut filtered_outbound: Vec<(u32, Bytes)> = Vec::new();
         let key_set = descriptor
             .as_ref()
             .map(|d| {
@@ -1257,67 +1222,118 @@ impl HostTransceiver {
                 s
             })
             .unwrap_or(PropertySet::EMPTY);
-        let key_bytes_post = payload.map(|p| p.key_bytes());
+        let key_bytes_post = payload.as_ref().map(|p| p.key_bytes());
         let key_bytes_pre = pre_merge_payload.as_ref().map(|p| p.key_bytes());
-        // No group entry → no subscribers → cache already mutated
-        // above; nothing more to do.
-        let HostInner { groups, guests, .. } = &mut *inner;
-        let Some(group) = groups.get_mut(type_name) else {
-            return;
-        };
 
-        if !group.filtered_subs.is_empty() && payload.is_some() {
-            for ((cid, sub_id), sub) in &mut group.filtered_subs {
-                if *cid == exclude_client_id {
-                    continue;
-                }
-                let post = payload.expect("checked above");
-                let was_visible = key_bytes_pre
-                    .as_ref()
-                    .is_some_and(|k| sub.visible.contains(k));
-                let now_matches = !is_remove && matches_payload(&sub.compiled, post);
+        // Filtered fan-out FIRST, while we can still borrow `payload`
+        // (the cache mutation below *moves* it). Builds per-sub
+        // outbound bytes; we mutate `sub.visible` under a mutable
+        // borrow of the group.
+        let mut filtered_outbound: Vec<(u32, Bytes)> = Vec::new();
+        if has_filtered_subs && payload.is_some() {
+            let HostInner { groups, .. } = &mut *inner;
+            if let Some(group) = groups.get_mut(type_name) {
+                for ((cid, sub_id), sub) in &mut group.filtered_subs {
+                    if *cid == exclude_client_id {
+                        continue;
+                    }
+                    let post = payload.as_ref().expect("checked above");
+                    let was_visible = key_bytes_pre
+                        .as_ref()
+                        .is_some_and(|k| sub.visible.contains(k));
+                    let now_matches = !is_remove && matches_payload(&sub.compiled, post);
 
-                match (now_matches, was_visible) {
-                    (true, _) => {
-                        if !was_visible {
-                            if let Some(k) = &key_bytes_post {
-                                sub.visible.insert(k.clone());
+                    match (now_matches, was_visible) {
+                        (true, _) => {
+                            if !was_visible {
+                                if let Some(k) = &key_bytes_post {
+                                    sub.visible.insert(k.clone());
+                                }
                             }
+                            let mask_proj = sub.filter.property_mask.unwrap_or(post.valid_set());
+                            let attrs = header.attributes.unwrap_or(post.valid_set());
+                            let effective = (mask_proj | key_set) & attrs;
+                            let mut h = header.clone();
+                            h.attributes = Some(effective);
+                            h.subscription_id = Some(*sub_id);
+                            // For "enter view" we want the full
+                            // post-merge state projected; we send only
+                            // the bits in `effective`, which already
+                            // excludes anything outside `attrs`. The
+                            // payload encode below honours that mask.
+                            let mut bytes = Vec::with_capacity(64);
+                            encode_transmission_with_mask_into(&h, post, effective, &mut bytes);
+                            filtered_outbound.push((*cid, Bytes::from(bytes)));
                         }
-                        let mask_proj = sub.filter.property_mask.unwrap_or(post.valid_set());
-                        let attrs = header.attributes.unwrap_or(post.valid_set());
-                        let effective = (mask_proj | key_set) & attrs;
-                        let mut h = header.clone();
-                        h.attributes = Some(effective);
-                        h.subscription_id = Some(*sub_id);
-                        // For "enter view" we want the full
-                        // post-merge state projected; we send only
-                        // the bits in `effective`, which already
-                        // excludes anything outside `attrs`. The
-                        // payload encode below honours that mask.
-                        let mut bytes = Vec::with_capacity(64);
-                        encode_transmission_with_mask_into(&h, post, effective, &mut bytes);
-                        filtered_outbound.push((*cid, Bytes::from(bytes)));
-                    }
-                    (false, true) => {
-                        if let Some(k) = &key_bytes_post {
-                            sub.visible.remove(k);
+                        (false, true) => {
+                            if let Some(k) = &key_bytes_post {
+                                sub.visible.remove(k);
+                            }
+                            // Leave-view: synthesize a key-only remove
+                            // using the post-merge keys (which equal
+                            // pre-merge keys under the DOTS contract).
+                            // Use the post-merge payload if available;
+                            // otherwise fall back to pre-merge.
+                            let p = payload
+                                .as_ref()
+                                .or(pre_merge_payload.as_ref())
+                                .expect("checked above");
+                            let mut h = header.clone();
+                            h.attributes = Some(key_set);
+                            h.remove_obj = Some(true);
+                            h.subscription_id = Some(*sub_id);
+                            let mut bytes = Vec::with_capacity(64);
+                            encode_transmission_with_mask_into(&h, p, key_set, &mut bytes);
+                            filtered_outbound.push((*cid, Bytes::from(bytes)));
                         }
-                        // Leave-view: synthesize a key-only remove
-                        // using the post-merge keys (which equal
-                        // pre-merge keys under the DOTS contract).
-                        // Use the post-merge payload if available;
-                        // otherwise fall back to pre-merge.
-                        let p = payload.or(pre_merge_payload.as_ref()).expect("checked above");
-                        let mut h = header.clone();
-                        h.attributes = Some(key_set);
-                        h.remove_obj = Some(true);
-                        h.subscription_id = Some(*sub_id);
-                        let mut bytes = Vec::with_capacity(64);
-                        encode_transmission_with_mask_into(&h, p, key_set, &mut bytes);
-                        filtered_outbound.push((*cid, Bytes::from(bytes)));
+                        (false, false) => {}
                     }
-                    (false, false) => {}
+                }
+            }
+        }
+
+        // Mutate the cache. On update we *merge* the incoming payload
+        // into the existing entry (flat per-property overlay honouring
+        // `header.attributes`), matching dots-cpp
+        // `Container::updateWithoutKeys` — so a partial update keeps the
+        // properties it didn't carry, and a late subscriber's replay
+        // sees the full accumulated state rather than the last fragment.
+        // The merge *moves* the incoming value's fields in (no deep
+        // clone); on create the whole decoded payload is moved in.
+        if is_cached {
+            if let Some(p) = payload {
+                let key = key_bytes_post.expect("cached payload always has key bytes");
+                let map = inner.pool.entry(type_name.to_string()).or_default();
+                if is_remove {
+                    map.remove(&key);
+                    if map.is_empty() {
+                        inner.pool.remove(type_name);
+                    }
+                } else {
+                    let mask = header.attributes.unwrap_or_else(|| p.valid_set());
+                    match map.entry(key) {
+                        std::collections::btree_map::Entry::Occupied(mut slot) => {
+                            let e = slot.get_mut();
+                            e.payload.merge_take(mask, p);
+                            // `created_from` is set once, on the first
+                            // publish (dots-cpp `createdFrom`).
+                            e.last_update_sender = header.sender;
+                            e.last_update_time = header.sent_time;
+                            // Replay must advertise the *accumulated*
+                            // property set, not just this update's mask.
+                            e.attributes = e.payload.valid_set();
+                        }
+                        std::collections::btree_map::Entry::Vacant(slot) => {
+                            let attributes = p.valid_set();
+                            slot.insert(CachedEntry {
+                                payload: p,
+                                created_from: header.sender,
+                                last_update_sender: header.sender,
+                                last_update_time: header.sent_time,
+                                attributes,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1326,12 +1342,15 @@ impl HostTransceiver {
         // the same refcounted `Bytes`: `clone()` is an Arc bump, no
         // memcpy, so one published frame is one allocation regardless
         // of subscriber count.
-        for &id in &group.unfiltered_subs {
-            if id == exclude_client_id {
-                continue;
-            }
-            if let Some(record) = guests.get(&id) {
-                record.write_half.enqueue(raw_frame.clone());
+        let HostInner { groups, guests, .. } = &mut *inner;
+        if let Some(group) = groups.get(type_name) {
+            for &id in &group.unfiltered_subs {
+                if id == exclude_client_id {
+                    continue;
+                }
+                if let Some(record) = guests.get(&id) {
+                    record.write_half.enqueue(raw_frame.clone());
+                }
             }
         }
 
@@ -1733,7 +1752,8 @@ impl HostTransceiver {
     fn route_synthetic_removal(&self, type_name: &str, txn: Transmission) {
         let mut buf = Vec::with_capacity(64);
         txn.encode_into(&mut buf);
-        self.cache_and_fan_out(type_name, &txn.header, Bytes::from(buf), Some(&txn.payload), HOST_ID);
+        let Transmission { header, payload } = txn;
+        self.cache_and_fan_out(type_name, &header, Bytes::from(buf), Some(payload), HOST_ID);
     }
 
     /// Snapshot the per-guest writer for `client_id`. Returns `None`
@@ -2030,7 +2050,7 @@ fn handle_connected_message(
     let mut buf = Vec::with_capacity(FRAME_OVERHEAD_HINT + raw.payload.len());
     encode_frame_with_header(&header, &raw.payload, &mut buf);
 
-    host.cache_and_fan_out(type_name, &header, Bytes::from(buf), dyn_payload.as_ref(), 0);
+    host.cache_and_fan_out(type_name, &header, Bytes::from(buf), dyn_payload, 0);
 }
 
 /// Capacity hint for the per-frame overhead (4-byte size prefix +

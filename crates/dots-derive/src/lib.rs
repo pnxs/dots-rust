@@ -682,6 +682,8 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
                 decode_value: ::dots_core::layout::key_decode::<#inner_ty>,
                 drop_in_place: ::dots_core::layout::key_drop::<#inner_ty>,
                 clone_in_place: ::dots_core::layout::key_clone::<#inner_ty>,
+                set_none: ::dots_core::layout::key_set_none::<#inner_ty>,
+                take_in_place: ::dots_core::layout::key_take::<#inner_ty>,
             };
         };
     }
@@ -697,6 +699,8 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
                 decode_value: ::dots_core::layout::opt_decode_vec::<#elem_ty>,
                 drop_in_place: ::dots_core::layout::opt_drop::<#inner_ty>,
                 clone_in_place: ::dots_core::layout::opt_clone_vec::<#elem_ty>,
+                set_none: ::dots_core::layout::opt_set_none::<#inner_ty>,
+                take_in_place: ::dots_core::layout::opt_take::<#inner_ty>,
             };
         };
     }
@@ -710,6 +714,8 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>) -> TokenStream2 {
             decode_value: ::dots_core::layout::opt_decode::<#inner_ty>,
             drop_in_place: ::dots_core::layout::opt_drop::<#inner_ty>,
             clone_in_place: ::dots_core::layout::opt_clone::<#inner_ty>,
+            set_none: ::dots_core::layout::opt_set_none::<#inner_ty>,
+            take_in_place: ::dots_core::layout::opt_take::<#inner_ty>,
         };
     }
 }
