@@ -200,6 +200,34 @@ mod tests {
         assert_eq!(decoded.payload(), &[0xA1, 0x01, 0x18, 0x2A]);
     }
 
+    /// Mirrors dots-cpp `TestAnyObject.valueSemantics_EqualityAndOrdering`.
+    /// `AnyObject` is a plain `(type_name, payload)` value: two are equal
+    /// iff both components match, and the derived `Ord` is lexicographic
+    /// on `(type_name, payload)` — type name first, then payload bytes.
+    #[test]
+    fn value_semantics_equality_and_ordering() {
+        let a = AnyObject::new("Ping", vec![0x01, 0x02]);
+        let a_again = AnyObject::new("Ping", vec![0x01, 0x02]);
+        let diff_payload = AnyObject::new("Ping", vec![0x01, 0x03]);
+        let diff_type = AnyObject::new("Pong", vec![0x01, 0x02]);
+
+        // Equality: equal iff both type name and payload match.
+        assert_eq!(a, a_again);
+        assert_ne!(a, diff_payload);
+        assert_ne!(a, diff_type);
+
+        // Ordering is by type name first ("Ping" < "Pong")...
+        assert!(a < diff_type);
+        // ...then by payload when the type name is equal ([..0x02] < [..0x03]).
+        assert!(a < diff_payload);
+        assert_eq!(a.cmp(&a_again), core::cmp::Ordering::Equal);
+
+        // Type name dominates payload in the ordering: a "Pong" with a
+        // smaller payload still sorts after any "Ping".
+        let pong_small = AnyObject::new("Pong", vec![0x00]);
+        assert!(a < pong_small);
+    }
+
     #[test]
     fn wrong_array_size_is_rejected() {
         // A 3-element array is not a valid envelope.

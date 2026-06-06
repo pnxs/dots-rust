@@ -72,6 +72,38 @@ fn enum_descriptor_lists_variants() {
     assert_eq!(d.elements[2].value, 3);
 }
 
+/// Mirrors dots-cpp `TestEnumDescriptor.enumeratorFromTag`: a known tag
+/// resolves to its enumerator; an unknown tag yields `None` rather than
+/// panicking.
+#[test]
+fn element_by_tag_resolves_known_and_rejects_unknown() {
+    let d = Status::DESCRIPTOR;
+    assert_eq!(d.element_by_tag(1).unwrap().name, "Idle");
+    assert_eq!(d.element_by_tag(2).unwrap().name, "Running");
+    assert_eq!(d.element_by_tag(3).unwrap().value, 3);
+    assert!(d.element_by_tag(0).is_none());
+    assert!(d.element_by_tag(99).is_none());
+}
+
+/// Mirrors dots-cpp `TestEnumDescriptor.enumeratorFromValue`: lookup by
+/// the on-the-wire integer value. Exercises the negative-value enum
+/// (`Errno`) so the `i32` value path — not the tag — is what matches.
+#[test]
+fn element_by_value_resolves_known_and_rejects_unknown() {
+    let d = Status::DESCRIPTOR;
+    assert_eq!(d.element_by_value(1).unwrap().name, "Idle");
+    assert_eq!(d.element_by_value(3).unwrap().tag, 3);
+    assert!(d.element_by_value(0).is_none());
+    assert!(d.element_by_value(99).is_none());
+
+    let e = Errno::DESCRIPTOR;
+    assert_eq!(e.element_by_value(0).unwrap().name, "Ok");
+    assert_eq!(e.element_by_value(-1).unwrap().name, "Refused");
+    assert_eq!(e.element_by_value(-42).unwrap().name, "BadMessage");
+    // The tags (1,2,3) are not the wire values here, so value 1 misses.
+    assert!(e.element_by_value(1).is_none());
+}
+
 #[test]
 fn explicit_value_overrides_tag_default() {
     let d = Errno::DESCRIPTOR;

@@ -201,6 +201,33 @@ mod tests {
         assert_eq!((a - b).iter().collect::<Vec<_>>(), [1]);
     }
 
+    /// Analogue of dots-cpp `TestPropertySet.toString`: the textual
+    /// rendering lists the set tags in ascending order. (C++ renders a
+    /// raw bit string; the Rust `Debug` renders the tag set, which is
+    /// the equivalent human-readable form.)
+    #[test]
+    fn debug_lists_tags_in_ascending_order() {
+        use alloc::format;
+        assert_eq!(format!("{:?}", PropertySet::EMPTY), "PropertySet{}");
+        let s = PropertySet::EMPTY.with_tag(3).with_tag(1).with_tag(7);
+        assert_eq!(format!("{s:?}"), "PropertySet{1,3,7}");
+    }
+
+    /// Analogue of dots-cpp `TestPropertySet.operator_subset` /
+    /// `operator_superset`. Rust exposes no dedicated subset operator,
+    /// but the relation is `(a & b) == a` (every tag of `a` is in `b`).
+    #[test]
+    fn subset_relation_via_intersection() {
+        let small = PropertySet::EMPTY.with_tag(1).with_tag(2);
+        let big = PropertySet::EMPTY.with_tag(1).with_tag(2).with_tag(3);
+        // small ⊆ big
+        assert_eq!(small & big, small);
+        // big ⊄ small
+        assert_ne!(big & small, big);
+        // A set is a subset of itself.
+        assert_eq!(big & big, big);
+    }
+
     /// Wire-format spot-check: tag→bit mapping matches C++
     /// `PropertySet::FromIndex(tag)` which is `1 << tag`.
     #[test]

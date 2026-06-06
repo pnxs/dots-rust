@@ -86,6 +86,35 @@ fn missing_key_decode_error_drops_already_decoded_owned_fields() {
     assert!(decode_typed_from_slice::<Sample>(&buf).is_err());
 }
 
+/// Port of dots-cpp `TestCborSerializer.serializerException`: feeding
+/// the decoder malformed or type-mismatched CBOR must surface a
+/// `DecodeError`, never panic or read out of bounds.
+#[test]
+fn malformed_cbor_yields_error_not_panic() {
+    // (a) Truncated: a map header promising one pair, then nothing.
+    assert!(decode_typed_from_slice::<Sample>(&[0xa1]).is_err());
+
+    // (b) Truncated mid-value: key tag 1 present, but its u32 value is
+    // cut off (0x1a announces a 4-byte int with no bytes following).
+    assert!(decode_typed_from_slice::<Sample>(&[0xa1, 0x01, 0x1a]).is_err());
+
+    // (c) Type mismatch: tag 1 (`id: u32`) carries a text string instead
+    // of an integer.
+    let mut buf = Vec::new();
+    let mut e = dots_core::minicbor::Encoder::new(&mut buf);
+    e.map(1).unwrap();
+    e.u32(1).unwrap();
+    e.str("not-an-int").unwrap();
+    assert!(decode_typed_from_slice::<Sample>(&buf).is_err());
+
+    // (d) Wrong top-level shape: a bare integer where a struct map is
+    // expected.
+    assert!(decode_typed_from_slice::<Sample>(&[0x01]).is_err());
+
+    // (e) Empty input.
+    assert!(decode_typed_from_slice::<Sample>(&[]).is_err());
+}
+
 #[test]
 fn wire_format_is_sparse_map_keyed_by_tag() {
     let s = dots!(Sample {
