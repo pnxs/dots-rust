@@ -71,7 +71,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dots_core::{GlobalRegistration, Publishable, StructValue};
+use dots_core::{
+    DynamicStruct, DynamicStructDescriptor, GlobalRegistration, Publishable, StructValue, to_any,
+};
 use dots_transport::{
     AppError, Client, Container, Event, GuestError, GuestTransceiver, HostTransceiver,
     Subscription, connect_over_stream, global,
@@ -265,6 +267,107 @@ impl TestHarness {
         T: StructValue + Send + 'static + GlobalRegistration,
     {
         self.primary.container::<T>()
+    }
+
+    // --- expectation helpers, the dots-cpp `EXPECT_DOTS_PUBLISH_*` analogs ---
+
+    /// Publish `obj` from `publisher` (typically a spoof guest standing in
+    /// for another client) and block until the *primary* guest observes it,
+    /// so a following read on the primary sees the new value. Use this to
+    /// seed desired state before driving the code under test — it is the
+    /// readable counterpart of "publish, then wait for it to land".
+    ///
+    /// Subscribes the primary, publishes, and awaits the round-trip. Panics
+    /// (failing the test) if the publish is not observed within the default
+    /// [`recv`](Self::recv) timeout.
+    pub async fn sync_publish<T>(&self, publisher: &Client, obj: &T)
+    where
+        T: StructValue + Publishable + Clone + Send + 'static + GlobalRegistration,
+    {
+        let mut sub = self.subscribe_stream::<T>();
+        publisher.publish(obj);
+        self.recv(&mut sub)
+            .await
+            .expect("primary observes published object");
+    }
+
+    /// Receive the next event on `sub` and assert it is a *publish* whose
+    /// payload matches `expected` on every field `expected` sets (see
+    /// [`assert_fields_match`]). Returns the event so a test can make extra
+    /// assertions — e.g. on a field whose exact value it doesn't want to pin,
+    /// or that must merely be present.
+    ///
+    /// The Rust analog of dots-cpp's
+    /// `EXPECT_DOTS_PUBLISH_AT_SUBSCRIBER(sub, Obj{ … })`.
+    pub async fn expect_publish<T>(
+        &self,
+        sub: &mut Subscription<T>,
+        expected: &T,
+    ) -> Event<T>
+    where
+        T: StructValue + Clone + Send + 'static,
+    {
+        let event = self.recv(sub).await.expect("expected a published event");
+        assert_ne!(
+            event.header.remove_obj,
+            Some(true),
+            "expected a publish, got a remove"
+        );
+        assert_fields_match(&event.value, expected);
+        event
+    }
+
+    /// Like [`expect_publish`](Self::expect_publish) but asserts the event is
+    /// a *removal*. A remove transmits only the type's key fields, so
+    /// `expected` need only set those.
+    ///
+    /// The Rust analog of dots-cpp's
+    /// `EXPECT_DOTS_REMOVE_AT_SUBSCRIBER(sub, Obj{ … })`.
+    pub async fn expect_remove<T>(
+        &self,
+        sub: &mut Subscription<T>,
+        expected: &T,
+    ) -> Event<T>
+    where
+        T: StructValue + Clone + Send + 'static,
+    {
+        let event = self.recv(sub).await.expect("expected a removal event");
+        assert_eq!(
+            event.header.remove_obj,
+            Some(true),
+            "expected a remove, got a publish"
+        );
+        assert_fields_match(&event.value, expected);
+        event
+    }
+}
+
+/// Assert `actual` matches `expected` on every property `expected` actually
+/// sets. DOTS serializes only set fields, so an `expected` built with
+/// `dots!{ … }` that names a subset of fields compares just that subset —
+/// fields left unset (`None`) are ignored, so a test states only what it
+/// cares about. The comparison is over the dynamic encoding, so it works for
+/// any DOTS type without per-type field lists.
+///
+/// Pairs with [`TestHarness::expect_publish`] /
+/// [`TestHarness::expect_remove`], which call this on the received event, but
+/// is also usable standalone on any two values of the same DOTS type.
+pub fn assert_fields_match<T: StructValue>(actual: &T, expected: &T) {
+    let desc = T::type_descriptor();
+    let decode = |v: &T| {
+        let d = Arc::new(DynamicStructDescriptor::from_static(desc));
+        DynamicStruct::decode(d, to_any(v).payload()).expect("dynamic decode")
+    };
+    let exp = decode(expected);
+    let act = decode(actual);
+    for (tag, want) in &exp.properties {
+        let got = act.properties.iter().find(|(t, _)| t == tag).map(|(_, v)| v);
+        assert_eq!(
+            got,
+            Some(want),
+            "{}: field with tag {tag} differs (expected {want:?}, got {got:?})",
+            desc.name,
+        );
     }
 }
 

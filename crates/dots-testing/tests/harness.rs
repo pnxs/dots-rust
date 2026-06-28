@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use dots_core::dots;
-use dots_testing::TestHarness;
+use dots_testing::{TestHarness, assert_fields_match};
 use dots_transport::global as dots;
 
 mod model {
@@ -139,6 +139,79 @@ async fn wait_for_subscribers_sees_the_join() {
         .wait_for_subscribers::<Greeting>(1, Duration::from_secs(2))
         .await;
     assert!(joined, "broker should report at least one Greeting subscriber");
+}
+
+/// `expect_publish` asserts only the fields the `expected` object sets,
+/// so a test states just what it cares about and ignores the rest — the
+/// readable analog of dots-cpp's `EXPECT_DOTS_PUBLISH_AT_SUBSCRIBER`.
+/// The returned event is available for extra assertions on fields the
+/// `expected` didn't pin.
+#[tokio::test]
+async fn expect_publish_matches_only_set_fields() {
+    let harness = TestHarness::new().await;
+    let mut sub = harness.subscribe_stream::<Profile>();
+
+    dots::publish(&dots!(Profile { id: 1_u32, name: "alice", age: 30_u32 }));
+
+    // Pin only `name`; `age` is left unset in `expected`, so it isn't
+    // compared — yet it's still present on the returned event.
+    let event = harness
+        .expect_publish(&mut sub, &dots!(Profile { id: 1_u32, name: "alice" }))
+        .await;
+    assert_eq!(event.value.age, Some(30));
+}
+
+/// `expect_remove` consumes the create, then asserts the next event is a
+/// removal carrying just the key fields — the dots-cpp
+/// `EXPECT_DOTS_REMOVE_AT_SUBSCRIBER` analog.
+#[tokio::test]
+async fn expect_remove_after_create() {
+    let harness = TestHarness::new().await;
+    let mut sub = harness.subscribe_stream::<Greeting>();
+
+    harness.publish(&dots!(Greeting { id: 1_u32, text: "hi" }));
+    harness
+        .expect_publish(&mut sub, &dots!(Greeting { id: 1_u32, text: "hi" }))
+        .await;
+
+    harness.guest().remove(&dots!(Greeting { id: 1_u32 }));
+    harness
+        .expect_remove(&mut sub, &dots!(Greeting { id: 1_u32 }))
+        .await;
+}
+
+/// `sync_publish` publishes from a spoof guest and blocks until the
+/// primary observes it, so the value is readable from the primary's
+/// cache afterward without a manual `recv`.
+#[tokio::test]
+async fn sync_publish_seeds_state_from_spoof() {
+    let harness = TestHarness::new().await;
+    let container = harness.container::<Counter>();
+    let spoof = harness.add_spoof_guest().await.expect("spoof connects");
+
+    harness
+        .sync_publish(&spoof, &dots!(Counter { id: 5_u32, value: 42_u64 }))
+        .await;
+
+    let seen = container.get(&dots!(Counter { id: 5_u32 })).expect("seeded");
+    assert_eq!(seen.value, Some(42));
+}
+
+/// `assert_fields_match` is also usable standalone on any two values of
+/// the same DOTS type — handy for asserting on a value pulled from a
+/// container rather than off an event.
+#[tokio::test]
+async fn assert_fields_match_standalone() {
+    let harness = TestHarness::new().await;
+    let container = harness.container::<Profile>();
+    let mut sub = harness.subscribe_stream::<Profile>();
+
+    dots::publish(&dots!(Profile { id: 2_u32, name: "bob", age: 51_u32 }));
+    harness.recv(&mut sub).await.expect("create");
+
+    let p = container.get(&dots!(Profile { id: 2_u32 })).expect("present");
+    // Compares only `name`; `age` and `id` differences would be ignored.
+    assert_fields_match(&*p, &dots!(Profile { name: "bob" }));
 }
 
 /// Dropping a harness releases the global slot and the process-wide
