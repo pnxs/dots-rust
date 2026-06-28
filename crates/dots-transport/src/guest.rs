@@ -599,7 +599,7 @@ impl GuestTransceiver {
         if let Some(d) = value.static_descriptor() {
             self.register_struct_descriptor(d);
         }
-        let mask = (included | value.key_set()) & value.valid_set();
+        let mask = included | value.key_set();
         let header = dots!(DotsHeader {
             type_name: value.type_name(),
             attributes: mask,
