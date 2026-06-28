@@ -321,14 +321,14 @@ impl App {
         handler: impl FnMut(&Event<T>) + Send + 'static,
     ) -> SubscriptionHandle
     where
-        T: StructValue + Send + 'static + dots_core::GlobalRegistration,
+        T: StructValue + Send + Sync + Clone + 'static + dots_core::GlobalRegistration,
     {
         self.transceiver.subscribe(handler)
     }
 
     pub fn subscribe_stream<T>(&self) -> crate::Subscription<T>
     where
-        T: StructValue + Send + 'static + dots_core::GlobalRegistration,
+        T: StructValue + Send + Sync + Clone + 'static + dots_core::GlobalRegistration,
     {
         self.transceiver.subscribe_stream::<T>()
     }
@@ -363,7 +363,7 @@ impl App {
 
     pub fn container<T>(&self) -> Container<T>
     where
-        T: StructValue + Send + 'static + dots_core::GlobalRegistration,
+        T: StructValue + Send + Sync + 'static + dots_core::GlobalRegistration,
     {
         self.transceiver.container::<T>()
     }
@@ -378,7 +378,7 @@ impl App {
         filter: dots_model::filter::DotsFilter,
     ) -> Result<crate::View<T>, crate::ViewError>
     where
-        T: StructValue + Send + Clone + 'static + dots_core::GlobalRegistration,
+        T: StructValue + Send + Sync + Clone + 'static + dots_core::GlobalRegistration,
     {
         self.transceiver.view::<T>(filter)
     }

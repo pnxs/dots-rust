@@ -337,7 +337,7 @@ async fn client_publish_from_handler_reaches_server() {
     let client = app.client();
     let client_in_handler = client.clone();
     app.subscribe::<Pinger>(move |event| {
-        if event.value.id == Some(1) {
+        if event.updated().id == Some(1) {
             let _ = client_in_handler.publish(&dots!(Pinger {
                 id: 2_u32,
                 message: "reply",

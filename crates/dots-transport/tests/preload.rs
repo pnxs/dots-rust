@@ -245,11 +245,11 @@ async fn builder_with_preload_lands_in_early_subscribe_then_finishes() {
     // Phase 2 (finish_preload + cache dispatch), then enters the main
     // loop. Cache events for Pinger flow into `sub`.
     let first = sub.recv().await.expect("cache event 1");
-    assert_eq!(first.value, cached[0]);
+    assert_eq!(first.updated(), &cached[0]);
     assert_eq!(first.header.from_cache, Some(1));
 
     let second = sub.recv().await.expect("cache event 2");
-    assert_eq!(second.value, cached[1]);
+    assert_eq!(second.updated(), &cached[1]);
     assert_eq!(second.header.from_cache, Some(0));
 
     gt.exit();

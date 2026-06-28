@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Synchronous callback handler — fires from App::run's read loop.
     app.subscribe::<Pinger>(move |event| {
         let from_me = event.header.is_from_myself == Some(true);
-        let obj = &event.value;
+        let obj = &event.updated();
         println!(
             "✦ Pinger:  id={:?}  message={:?}  seq={:?}  from={:?}  cache_len={}{}",
             obj.id,
@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Per-type cache-end notifications from dotsd. Sent after the
     // broker streams the cached objects following a DotsMember(join).
     app.subscribe::<DotsCacheInfo>(|event| {
-        let cache_info = &event.value;
+        let cache_info = &event.updated();
         if cache_info.end_transmission == Some(true) {
             if let Some(name) = cache_info.type_name.as_deref() {
                 eprintln!("⌛ cache transmission complete for `{name}`");

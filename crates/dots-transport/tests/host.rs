@@ -128,9 +128,9 @@ async fn host_routes_pinger_between_two_guests() {
         .await
         .expect("timed out waiting for routed Pinger")
         .expect("subscription closed");
-    assert_eq!(event.value.id, Some(7));
-    assert_eq!(event.value.message.as_deref(), Some("hi from B"));
-    assert_eq!(event.value.sequence, Some(1));
+    assert_eq!(event.updated().id, Some(7));
+    assert_eq!(event.updated().message.as_deref(), Some("hi from B"));
+    assert_eq!(event.updated().sequence, Some(1));
 
     gt_a.exit();
     gt_b.exit();
@@ -179,7 +179,7 @@ async fn host_publish_reaches_subscribed_guest() {
         .await
         .expect("timed out")
         .expect("sub closed");
-    assert_eq!(event.value.id, Some(99));
+    assert_eq!(event.updated().id, Some(99));
     assert_eq!(event.header.sender, Some(dots_transport::HOST_ID));
 
     gt.exit();
@@ -239,12 +239,12 @@ async fn host_publishes_distinct_dots_client_statistics_records() {
             .await
             .expect("timed out waiting for DotsClientStatistics")
             .expect("subscription closed");
-        received.push(event.value.client_id.expect("client_id missing"));
+        received.push(event.updated().client_id.expect("client_id missing"));
         // Sanity: the nested DotsStatistics decoded — packages == id.
-        let sent = event.value.sent.as_ref().expect("sent sub-struct missing");
+        let sent = event.updated().sent.as_ref().expect("sent sub-struct missing");
         assert_eq!(
             sent.packages,
-            Some(event.value.client_id.unwrap() as u64),
+            Some(event.updated().client_id.unwrap() as u64),
             "nested DotsStatistics packages should match the client_id"
         );
     }
@@ -290,7 +290,7 @@ async fn host_publishes_distinct_dots_client_statistics_records() {
             event.header.from_cache.is_some(),
             "replayed entries must carry from_cache"
         );
-        replayed.push(event.value.client_id.unwrap());
+        replayed.push(event.updated().client_id.unwrap());
     }
     replayed.sort();
     assert_eq!(
@@ -510,10 +510,10 @@ async fn host_merges_partial_update_so_late_subscriber_sees_full_state() {
         .expect("timed out waiting for replayed Pinger")
         .expect("subscription closed");
     assert!(event.header.from_cache.is_some(), "replay carries from_cache");
-    assert_eq!(event.value.id, Some(1));
-    assert_eq!(event.value.message.as_deref(), Some("updated"));
+    assert_eq!(event.updated().id, Some(1));
+    assert_eq!(event.updated().message.as_deref(), Some("updated"));
     assert_eq!(
-        event.value.sequence,
+        event.updated().sequence,
         Some(42),
         "late subscriber must receive the merged full object on replay"
     );
@@ -597,7 +597,7 @@ async fn host_replays_cached_pingers_to_late_subscriber() {
             .await
             .expect("timed out waiting for replayed Pinger")
             .expect("subscription closed");
-        got.push(event.value.id.unwrap());
+        got.push(event.updated().id.unwrap());
         // Expect from_cache to be set on replayed entries.
         assert!(
             event.header.from_cache.is_some(),
@@ -830,10 +830,10 @@ async fn host_replies_to_dots_echo_request() {
         .await
         .expect("timed out waiting for echo reply")
         .expect("subscription closed");
-    assert_eq!(event.value.request, Some(false));
-    assert_eq!(event.value.identifier, Some(7));
-    assert_eq!(event.value.sequence_number, Some(42));
-    assert_eq!(event.value.data.as_deref(), Some("ping"));
+    assert_eq!(event.updated().request, Some(false));
+    assert_eq!(event.updated().identifier, Some(7));
+    assert_eq!(event.updated().sequence_number, Some(42));
+    assert_eq!(event.updated().data.as_deref(), Some("ping"));
     assert_eq!(event.header.sender, Some(dots_transport::HOST_ID));
 
     gt.exit();
@@ -880,7 +880,7 @@ async fn transition_handler_publishes_dots_client_on_connect_and_disconnect() {
     while let Ok(Some(event)) =
         tokio::time::timeout(Duration::from_millis(200), sub.recv()).await
     {
-        observed.push(event.value);
+        observed.push(event.updated().clone());
     }
     // Observer's own DotsClient should be in the drained set.
     assert!(observed.iter().any(|c| c.name.as_deref() == Some("observer")
@@ -904,8 +904,8 @@ async fn transition_handler_publishes_dots_client_on_connect_and_disconnect() {
         if let Ok(Some(event)) =
             tokio::time::timeout(Duration::from_millis(100), sub.recv()).await
         {
-            if event.value.name.as_deref() == Some("alice")
-                && event.value.connection_state == Some(DotsConnectionState::Connected)
+            if event.updated().name.as_deref() == Some("alice")
+                && event.updated().connection_state == Some(DotsConnectionState::Connected)
             {
                 alice_connected = true;
                 break;
@@ -923,9 +923,9 @@ async fn transition_handler_publishes_dots_client_on_connect_and_disconnect() {
         if let Ok(Some(event)) =
             tokio::time::timeout(Duration::from_millis(100), sub.recv()).await
         {
-            if event.value.name.as_deref() == Some("alice")
-                && event.value.connection_state == Some(DotsConnectionState::Closed)
-                && event.value.running == Some(false)
+            if event.updated().name.as_deref() == Some("alice")
+                && event.updated().connection_state == Some(DotsConnectionState::Closed)
+                && event.updated().running == Some(false)
             {
                 alice_closed = true;
                 break;
@@ -1176,9 +1176,9 @@ async fn host_serve_unix_routes_pinger_round_trip() {
         .await
         .expect("timed out")
         .expect("sub closed");
-    assert_eq!(event.value.id, Some(1));
-    assert_eq!(event.value.message.as_deref(), Some("hi over uds"));
-    assert_eq!(event.value.sequence, Some(7));
+    assert_eq!(event.updated().id, Some(1));
+    assert_eq!(event.updated().message.as_deref(), Some("hi over uds"));
+    assert_eq!(event.updated().sequence, Some(7));
 
     // Cleanup.
     gt.exit();
@@ -1318,7 +1318,7 @@ async fn cleanup_flag_drops_publisher_entries_on_disconnect() {
         .await
         .expect("timed out for create")
         .expect("sub closed");
-    assert_eq!(event.value.id, Some(7));
+    assert_eq!(event.updated().id, Some(7));
     assert_ne!(event.header.remove_obj, Some(true), "create should not be a remove");
 
     // Wait for the entry to land in the host pool.
@@ -1342,7 +1342,7 @@ async fn cleanup_flag_drops_publisher_entries_on_disconnect() {
         if let Ok(Some(event)) =
             tokio::time::timeout(Duration::from_millis(100), sub.recv()).await
         {
-            if event.header.remove_obj == Some(true) && event.value.id == Some(7) {
+            if event.header.remove_obj == Some(true) && event.updated().id == Some(7) {
                 got_removal = true;
                 break;
             }
@@ -1433,7 +1433,7 @@ async fn host_replies_to_descriptor_request_with_known_structs() {
         if let Ok(Some(event)) =
             tokio::time::timeout(Duration::from_millis(100), sub_descriptors.recv()).await
         {
-            if event.value.name.as_deref() == Some("Pinger") {
+            if event.updated().name.as_deref() == Some("Pinger") {
                 got_pinger_descriptor = true;
                 break;
             }
@@ -1446,7 +1446,7 @@ async fn host_replies_to_descriptor_request_with_known_structs() {
         if let Ok(Some(event)) =
             tokio::time::timeout(Duration::from_millis(100), sub_cache_info.recv()).await
         {
-            if event.value.end_descriptor_request == Some(true) {
+            if event.updated().end_descriptor_request == Some(true) {
                 got_end = true;
                 break;
             }
@@ -1585,7 +1585,7 @@ async fn dynamic_subscribe_receives_event_with_runtime_descriptor() {
         captured_clone
             .lock()
             .unwrap()
-            .extend(event.value.properties.iter().cloned());
+            .extend(event.updated().properties.iter().cloned());
     });
 
     // Wait for the join to land.
@@ -1690,9 +1690,9 @@ async fn dynamic_publish_routes_through_broker_to_typed_subscriber() {
         .await
         .expect("timed out waiting for typed subscriber")
         .expect("subscription closed");
-    assert_eq!(event.value.id, Some(11));
-    assert_eq!(event.value.message.as_deref(), Some("from-dyn"));
-    assert_eq!(event.value.sequence, Some(77));
+    assert_eq!(event.updated().id, Some(11));
+    assert_eq!(event.updated().message.as_deref(), Some("from-dyn"));
+    assert_eq!(event.updated().sequence, Some(77));
 
     gt_sub.exit();
     gt_pub.exit();
@@ -1833,7 +1833,7 @@ async fn subscribe_all_types_funnels_events_for_distinct_types() {
     let captured: Arc<Mutex<Vec<(String, Option<u32>)>>> = Arc::new(Mutex::new(Vec::new()));
     let captured_clone = captured.clone();
     let _all = gt.subscribe_all_types(move |event| {
-        let type_name = event.value.descriptor.name.clone();
+        let type_name = event.updated().descriptor.name.clone();
         captured_clone
             .lock()
             .unwrap()

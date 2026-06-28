@@ -23,7 +23,12 @@ use std::task::{Context, Poll};
 
 use bytes::BufMut;
 use dots_core::{
-    PropertySet, Publishable, StructValue, Transmittable, decode_typed_from_slice, dots,
+    PropertySet, Publishable, StructDescriptor, StructValue, Transmittable, decode_typed_from_slice,
+    dots,
+};
+
+use crate::container::{
+    CloneInfo, DispatchShared, DynContainer, EventClassification, Operation, classify_event,
 };
 use dots_model::{DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello, DotsServerCapabilities, Registry, Transmission, encode_transmission_into, encode_transmission_with_mask_into, DotsCacheInfo};
 // `dots!` companion macros (see guest.rs note).
@@ -470,11 +475,15 @@ where
     /// `next`/`publish`.
     pub fn subscribe<T>(&self) -> Subscription<T>
     where
-        T: StructValue + Send + Clone + 'static,
+        T: StructValue + Send + Sync + Clone + 'static,
     {
         let (tx, rx) = mpsc::unbounded_channel();
+        // Connection-level subscriptions have no container, so events
+        // are classified as create (uncached semantics). Use
+        // `GuestTransceiver::subscribe*` for container-backed events.
         let entry: TypedDispatchEntry<T> = TypedDispatchEntry {
             sender: tx,
+            container: None,
             _phantom: PhantomData,
         };
         let type_name = T::type_descriptor().name.to_string();
@@ -502,7 +511,7 @@ where
     /// be called from within `select!` arms holding `&mut self`.
     pub fn container<T>(&self) -> crate::Container<T>
     where
-        T: StructValue + Send + 'static,
+        T: StructValue + Send + Sync + 'static,
     {
         crate::container::make_container(&self.dispatch, None)
     }
@@ -632,23 +641,48 @@ fn dispatch_external(dispatch: &Arc<Mutex<DispatchState>>, txn: &Transmission) {
         return;
     };
 
-    entries.retain_mut(|(_, entry)| match entry.dispatch(txn) {
-        Ok(retain) => retain,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                type_name = type_name,
-                "dispatch entry failed to decode transmission; keeping entry, dropping message"
-            );
-            true
-        }
-    });
+    dispatch_entries_borrowed(&mut entries, txn, type_name);
 
     let mut state = dispatch.lock().expect("dispatch mutex poisoned");
     let slot = state.entries.entry(type_name.to_string()).or_default();
     let added_during_dispatch = std::mem::take(slot);
     *slot = entries;
     slot.extend(added_during_dispatch);
+}
+
+/// Dispatch `txn` (borrowed) to a type's entries with the container(s)
+/// running **first** — so subscribers observe the post-update cache and
+/// receive the instance read back from it, matching dots-cpp's
+/// `Dispatcher::dispatchEvent` (update the container, *then* emit events).
+///
+/// The container publishes the instance to dispatch into a shared slot
+/// that the subscribers then read, so the partial-update merge and
+/// create/update/remove classification happen exactly once per
+/// transmission instead of once per subscriber.
+fn dispatch_entries_borrowed(entries: &mut DispatchEntries, txn: &Transmission, type_name: &str) {
+    let has_subscribers = entries.iter().any(|(_, e)| !e.wants_owned());
+    let mut shared = DispatchShared::Uncached;
+    let mut keep = vec![true; entries.len()];
+
+    // Pass 1 — containers: apply the update and publish the outcome.
+    for (i, (_, entry)) in entries.iter_mut().enumerate() {
+        if entry.wants_owned() {
+            keep[i] = dispatch_keep(entry.dispatch(txn, has_subscribers, &mut shared), type_name);
+        }
+    }
+    // Pass 2 — subscribers: build events from the post-update outcome.
+    for (i, (_, entry)) in entries.iter_mut().enumerate() {
+        if !entry.wants_owned() {
+            keep[i] = dispatch_keep(entry.dispatch(txn, has_subscribers, &mut shared), type_name);
+        }
+    }
+
+    let mut idx = 0;
+    entries.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
 }
 
 /// Owned-transmission variant of [`dispatch_external`]. The caller owns
@@ -686,21 +720,35 @@ fn dispatch_external_owned(dispatch: &Arc<Mutex<DispatchState>>, txn: Transmissi
         return;
     };
 
-    // The owner is the last entry that wants ownership; it runs last so
-    // the borrowing handlers are done with `txn` before it's consumed.
-    match entries.iter().rposition(|(_, e)| e.wants_owned()) {
-        None => {
-            // No owner: borrow-dispatch all, in place — identical cost
-            // to the borrowed path (no allocation).
-            entries.retain_mut(|(_, e)| dispatch_keep(e.dispatch(&txn), &type_name));
-        }
-        Some(oi) => {
-            // Pull the owner out so the rest can borrow `txn` first; the
-            // owner then consumes it and is re-appended if it survives.
-            let (owner_id, mut owner) = entries.remove(oi);
-            entries.retain_mut(|(_, e)| dispatch_keep(e.dispatch(&txn), &type_name));
-            if dispatch_keep(owner.dispatch_owned(txn), &type_name) {
-                entries.push((owner_id, owner));
+    let has_subscribers = entries.iter().any(|(_, e)| !e.wants_owned());
+    if has_subscribers {
+        // Subscribers need the transmission alive for `transmitted` (and
+        // run after the container), so the payload can't be moved in —
+        // fall back to the borrowing, container-first path.
+        dispatch_entries_borrowed(&mut entries, &txn, &type_name);
+    } else {
+        // No subscribers: the container is the sole consumer, so hand the
+        // last owner the moved payload (the zero-clone fan-in).
+        match entries.iter().rposition(|(_, e)| e.wants_owned()) {
+            None => {
+                // No owner and no subscribers — nothing to do.
+                let mut shared = DispatchShared::Uncached;
+                entries.retain_mut(|(_, e)| {
+                    dispatch_keep(e.dispatch(&txn, false, &mut shared), &type_name)
+                });
+            }
+            Some(oi) => {
+                // Pull the owner out so any other containers borrow `txn`
+                // first; the owner then consumes it and is re-appended if
+                // it survives.
+                let (owner_id, mut owner) = entries.remove(oi);
+                let mut shared = DispatchShared::Uncached;
+                entries.retain_mut(|(_, e)| {
+                    dispatch_keep(e.dispatch(&txn, false, &mut shared), &type_name)
+                });
+                if dispatch_keep(owner.dispatch_owned(txn, false, &mut shared), &type_name) {
+                    entries.push((owner_id, owner));
+                }
             }
         }
     }
@@ -731,12 +779,217 @@ fn dispatch_keep(r: Result<bool, dots_core::DecodeError>, type_name: &str) -> bo
 
 // ===== Pub/sub: Event, Subscription, dispatch =====
 
-/// One typed observation: the original [`DotsHeader`] plus the decoded
-/// payload value.
+/// One typed observation delivered to a subscriber.
+///
+/// Mirrors the capabilities of dots-cpp's `Event<T>`: it carries the
+/// transmission [`header`](Self::header), the [`transmitted`](Self::transmitted)
+/// instance exactly as it arrived on the wire, the post-merge
+/// [`updated`](Self::updated) instance (the "local clone" for cached
+/// types), the effective [`Operation`] and its [`CloneInfo`].
+///
+/// For **cached** types `updated` reflects the local container after the
+/// transmission's properties were merged in, and `operation` is
+/// create / update / remove depending on prior container contents. For
+/// **uncached** types there is no container, so `updated == *value` and
+/// `operation` is always [`Operation::Create`] — matching dots-cpp.
+///
+/// The public `header` / `value` fields are kept for ergonomic access
+/// (`value` is the transmitted instance); the accessor methods mirror
+/// the dots-cpp names.
 #[derive(Debug, Clone)]
 pub struct Event<T> {
+    /// The header of the transmission that triggered this event.
     pub header: DotsHeader,
-    pub value: T,
+    /// The transmitted instance, exactly as it arrived on the wire.
+    /// Equivalent to [`transmitted`](Self::transmitted).
+    pub transmitted: T,
+    /// The updated ("local clone") instance. For cached types this is
+    /// the local container entry after the transmission was merged in;
+    /// for uncached types it equals `value`.
+    ///
+    /// Held behind an [`Arc`] so that all subscribers of one transmission
+    /// share a single materialised instance instead of each deep-cloning
+    /// it; accessed through [`updated`](Self::updated), which hands back a
+    /// plain `&T`.
+    updated: Arc<T>,
+    /// The effective operation (create / update / remove).
+    pub operation: Operation,
+    /// Clone information for the updated instance (timestamps, senders,
+    /// last operation).
+    pub clone_info: CloneInfo,
+}
+
+impl<T> Event<T> {
+    /// Assemble an event from already-classified parts. Used by the
+    /// dynamic (type-erased) subscriber path, whose `DynamicStruct` is not
+    /// a [`StructValue`] and so can't go through [`new`](Self::new).
+    pub(crate) fn from_parts(
+        header: DotsHeader,
+        transmitted: T,
+        updated: Arc<T>,
+        operation: Operation,
+        clone_info: CloneInfo,
+    ) -> Self {
+        Self {
+            header,
+            transmitted,
+            updated,
+            operation,
+            clone_info,
+        }
+    }
+
+    /// The header of the transmission that triggered this event.
+    pub fn header(&self) -> &DotsHeader {
+        &self.header
+    }
+
+    /// The transmitted instance, unaltered, as it arrived on the wire.
+    ///
+    /// For a partial update this carries only the properties the
+    /// publisher actually sent; use [`updated`](Self::updated) for the
+    /// merged local state.
+    pub fn transmitted(&self) -> &T {
+        &self.transmitted
+    }
+
+    /// The updated ("local clone") instance.
+    ///
+    /// For cached types this is the local container entry after the
+    /// transmission was applied; for uncached types it is the same as
+    /// [`transmitted`](Self::transmitted).
+    pub fn updated(&self) -> &T {
+        &self.updated
+    }
+
+    /// The updated instance as a shared [`Arc`]. Cheap to clone (a
+    /// refcount bump); useful when a handler wants to retain the value
+    /// past the event without deep-copying it.
+    pub fn updated_arc(&self) -> &Arc<T> {
+        &self.updated
+    }
+
+    /// Clone information for the updated instance.
+    pub fn clone_info(&self) -> &CloneInfo {
+        &self.clone_info
+    }
+
+    /// The effective operation of this event. Alias: [`mt`](Self::mt).
+    pub fn operation(&self) -> Operation {
+        self.operation
+    }
+
+    /// The effective operation of this event. Named after dots-cpp's
+    /// `Event<>::mt()` ("message type").
+    pub fn mt(&self) -> Operation {
+        self.operation
+    }
+
+    /// `true` if this is a create event. Always `true` for uncached
+    /// types.
+    pub fn is_create(&self) -> bool {
+        self.operation == Operation::Create
+    }
+
+    /// `true` if this is an update event. Always `false` for uncached
+    /// types.
+    pub fn is_update(&self) -> bool {
+        self.operation == Operation::Update
+    }
+
+    /// `true` if this is a remove event. Always `false` for uncached
+    /// types.
+    pub fn is_remove(&self) -> bool {
+        self.operation == Operation::Remove
+    }
+
+    /// Whether the transmission that triggered this event was originally
+    /// published by this transceiver (a loopback of one's own publish).
+    pub fn is_from_myself(&self) -> bool {
+        self.header.is_from_myself == Some(true)
+    }
+}
+
+impl<T> Event<T>
+where
+    T: StructValue + Clone + Send + Sync + 'static,
+{
+    /// Build an **uncached** event from a transmission header and the
+    /// decoded transmitted value: `updated == transmitted` and the
+    /// operation is create (or remove when the header flags a deletion).
+    /// Used for container-less subscriptions; cached subscribers go
+    /// through [`from_shared`](Self::from_shared) instead.
+    pub(crate) fn new(header: DotsHeader, transmitted: T) -> Self {
+        let EventClassification {
+            operation,
+            updated,
+            clone_info,
+        } = classify_event(&header, &transmitted);
+        Self {
+            header,
+            transmitted,
+            updated: Arc::new(updated),
+            operation,
+            clone_info,
+        }
+    }
+
+    /// Build the event to deliver to a subscriber from the per-transmission
+    /// outcome the type's container produced (see [`DispatchShared`]).
+    ///
+    /// - `has_container` is whether *this* subscriber is backed by a local
+    ///   cache. Container-less subscribers always use uncached semantics,
+    ///   even if some other container produced an outcome for the type.
+    /// - Returns `None` when the dispatch is suppressed — a remove of a key
+    ///   that wasn't present, which dots-cpp drops without an event.
+    pub(crate) fn from_shared(
+        header: DotsHeader,
+        transmitted: T,
+        has_container: bool,
+        shared: &mut DispatchShared,
+    ) -> Option<Self> {
+        match shared {
+            DispatchShared::Cached(outcome) if has_container => {
+                // The first subscriber materialises the typed instance and
+                // caches it in the outcome; the rest share it by Arc clone.
+                let updated = outcome.shared_updated::<T>(&transmitted);
+                Some(Self {
+                    header,
+                    transmitted,
+                    updated,
+                    operation: outcome.operation,
+                    clone_info: outcome.clone_info.clone(),
+                })
+            }
+            DispatchShared::Suppressed if has_container => None,
+            // No container outcome (uncached subscriber), or no cache ran:
+            // uncached semantics.
+            _ => Some(Self::new(header, transmitted)),
+        }
+    }
+}
+
+impl<T: StructValue> Event<T> {
+    /// The descriptor of the event's DOTS struct type.
+    pub fn descriptor(&self) -> &'static StructDescriptor {
+        self.transmitted.descriptor()
+    }
+
+    /// The properties carried in the transmission (the publisher's
+    /// `header.attributes`), falling back to the transmitted instance's
+    /// valid set when the header omits them. Mirrors dots-cpp's
+    /// `Event<>::newProperties()`.
+    pub fn new_properties(&self) -> PropertySet {
+        self.header.attributes.unwrap_or_else(|| self.transmitted.valid_set())
+    }
+
+    /// The properties of [`updated`](Self::updated) that this
+    /// transmission actually affected — `new_properties()` intersected
+    /// with the updated instance's valid set (invalidated properties are
+    /// excluded). Mirrors dots-cpp's `Event<>::updatedProperties()`.
+    pub fn updated_properties(&self) -> PropertySet {
+        self.new_properties() & self.updated.valid_set()
+    }
 }
 
 /// RAII guard run when a subscription handle is dropped, used by the
@@ -917,7 +1170,17 @@ pub(crate) trait DispatchEntry: Send {
     /// Decode and forward the transmission. Returns `Ok(false)` if the
     /// entry should be removed (e.g. the subscriber's receiver was
     /// dropped); `Ok(true)` if it should be kept.
-    fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError>;
+    ///
+    /// Containers ([`wants_owned`](Self::wants_owned)) run first and write
+    /// the dispatch outcome into `shared`; subscribers run after and read
+    /// it. `has_subscribers` lets a container skip producing an outcome
+    /// when nothing will consume it (the pure-cache fast path).
+    fn dispatch(
+        &mut self,
+        txn: &Transmission,
+        has_subscribers: bool,
+        shared: &mut DispatchShared,
+    ) -> Result<bool, dots_core::DecodeError>;
 
     /// Whether this entry can take ownership of an incoming
     /// transmission. Entries that store the value long-term (a
@@ -935,21 +1198,35 @@ pub(crate) trait DispatchEntry: Send {
     /// after every borrowing entry). The default borrows and drops,
     /// which is correct for any entry that didn't opt into
     /// [`wants_owned`](Self::wants_owned).
-    fn dispatch_owned(&mut self, txn: Transmission) -> Result<bool, dots_core::DecodeError> {
-        self.dispatch(&txn)
+    fn dispatch_owned(
+        &mut self,
+        txn: Transmission,
+        has_subscribers: bool,
+        shared: &mut DispatchShared,
+    ) -> Result<bool, dots_core::DecodeError> {
+        self.dispatch(&txn, has_subscribers, shared)
     }
 }
 
 struct TypedDispatchEntry<T> {
     sender: mpsc::UnboundedSender<Event<T>>,
+    /// The type's local container, consulted to classify the event
+    /// (create / update / remove) and compute the `updated` instance.
+    /// `None` for container-less subscriptions (always create events).
+    container: Option<Arc<DynContainer>>,
     _phantom: PhantomData<fn() -> T>,
 }
 
 impl<T> DispatchEntry for TypedDispatchEntry<T>
 where
-    T: StructValue + Send + Clone + 'static,
+    T: StructValue + Send + Sync + Clone + 'static,
 {
-    fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError> {
+    fn dispatch(
+        &mut self,
+        txn: &Transmission,
+        _has_subscribers: bool,
+        shared: &mut DispatchShared,
+    ) -> Result<bool, dots_core::DecodeError> {
         if self.sender.is_closed() {
             return Ok(false);
         }
@@ -968,9 +1245,12 @@ where
                 decode_typed_from_slice(&bytes)?
             }
         };
-        let event = Event {
-            header: txn.header.clone(),
-            value,
+        let Some(event) =
+            Event::from_shared(txn.header.clone(), value, self.container.is_some(), shared)
+        else {
+            // Suppressed (remove of an absent key): keep the entry, send
+            // nothing.
+            return Ok(true);
         };
         // Send failure means the receiver was dropped between the
         // is_closed check and the send — same outcome, drop the entry.

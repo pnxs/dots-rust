@@ -35,7 +35,7 @@ impl Basement {
         let pending: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
         let sub = app.subscribe::<Switch>(move |event| {
-            let switch = &event.value;
+            let switch = event.updated();
             // `id` is now a bare-`String` key: use the infallible getter.
             if switch.id != BASEMENT_MOTION_SWITCH {
                 return;

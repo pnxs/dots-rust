@@ -56,8 +56,8 @@ async fn global_api_pubsub_roundtrip() {
     dots::publish(&dots!(Greeting { id: 1_u32, text: "hello" }));
 
     let event = harness.recv(&mut sub).await.expect("should receive Greeting");
-    assert_eq!(event.value.id, Some(1));
-    assert_eq!(event.value.text.as_deref(), Some("hello"));
+    assert_eq!(event.updated().id, Some(1));
+    assert_eq!(event.updated().text.as_deref(), Some("hello"));
     assert_eq!(event.header.is_from_myself, Some(true));
 }
 
@@ -75,7 +75,7 @@ async fn spoof_guest_routes_to_primary() {
     spoof.publish(&dots!(Greeting { id: 7_u32, text: "from spoof" }));
 
     let event = harness.recv(&mut sub).await.expect("primary receives spoof publish");
-    assert_eq!(event.value.id, Some(7));
+    assert_eq!(event.updated().id, Some(7));
     assert_eq!(event.header.is_from_myself, Some(false));
 }
 
@@ -100,6 +100,53 @@ async fn container_mirrors_cache() {
     assert_eq!(one.value, Some(11)); // latest wins
     let two = container.get(&dots!(Counter { id: 2_u32 })).expect("key 2 present");
     assert_eq!(two.value, Some(99));
+}
+
+/// The enriched `Event<T>` mirrors dots-cpp: subscribers see the
+/// classified operation (create / update / remove), the transmitted vs.
+/// the merged `updated` instance, and the affected property sets.
+#[tokio::test]
+async fn event_exposes_cpp_style_create_update_remove() {
+    use dots_transport::Operation;
+
+    let harness = TestHarness::new().await;
+    let mut sub = harness.subscribe_stream::<Profile>();
+
+    // --- create (full instance) ---
+    dots::publish(&dots!(Profile { id: 1_u32, name: "alice", age: 30_u32 }));
+    let ev = harness.recv(&mut sub).await.expect("create event");
+    assert!(ev.is_create());
+    assert_eq!(ev.operation(), Operation::Create);
+    assert!(ev.is_from_myself());
+    assert_eq!(ev.transmitted().name.as_deref(), Some("alice"));
+    assert_eq!(ev.updated().name.as_deref(), Some("alice"));
+    assert_eq!(ev.updated().age, Some(30));
+    assert_eq!(ev.clone_info().last_operation, Operation::Create);
+
+    // --- partial update (only `name`) ---
+    dots::publish(&dots!(Profile { id: 1_u32, name: "alice2" }));
+    let ev = harness.recv(&mut sub).await.expect("update event");
+    assert!(ev.is_update());
+    // The transmitted instance carried only the changed property...
+    assert_eq!(ev.transmitted().name.as_deref(), Some("alice2"));
+    assert_eq!(ev.transmitted().age, None);
+    // ...while `updated` is the merged local clone: `age` survives.
+    assert_eq!(ev.updated().name.as_deref(), Some("alice2"));
+    assert_eq!(ev.updated().age, Some(30));
+    // `name` (tag 2) was touched; `age` (tag 3) was not.
+    assert!(ev.new_properties().has(2));
+    assert!(!ev.new_properties().has(3));
+    assert!(ev.updated_properties().has(2));
+    assert!(!ev.updated_properties().has(3));
+
+    // --- remove ---
+    dots::remove(&dots!(Profile { id: 1_u32 }));
+    let ev = harness.recv(&mut sub).await.expect("remove event");
+    assert!(ev.is_remove());
+    assert_eq!(ev.operation(), Operation::Remove);
+    // `updated` carries the last-known merged state of what disappeared.
+    assert_eq!(ev.updated().name.as_deref(), Some("alice2"));
+    assert_eq!(ev.updated().age, Some(30));
 }
 
 /// End-to-end check of the move-capable guest dispatch path: a partial
@@ -158,7 +205,7 @@ async fn expect_publish_matches_only_set_fields() {
     let event = harness
         .expect_publish(&mut sub, &dots!(Profile { id: 1_u32, name: "alice" }))
         .await;
-    assert_eq!(event.value.age, Some(30));
+    assert_eq!(event.updated().age, Some(30));
 }
 
 /// `expect_remove` consumes the create, then asserts the next event is a
@@ -229,5 +276,5 @@ async fn harness_teardown_allows_reconstruction() {
     let mut sub = h2.subscribe_stream::<Greeting>();
     h2.publish(&dots!(Greeting { id: 2_u32, text: "second" }));
     let event = h2.recv(&mut sub).await.expect("second harness works");
-    assert_eq!(event.value.id, Some(2));
+    assert_eq!(event.updated().id, Some(2));
 }

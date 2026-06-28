@@ -31,6 +31,7 @@
 //! (pool-managed) or [`Connection::container`](crate::Connection::container)
 //! (raw, no transceiver).
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -38,8 +39,10 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, Weak};
 
-use dots_core::{AnyStruct, StructDescriptor, StructValue, Timepoint, encode_key_bytes, encode_key_into};
-use dots_model::Transmission;
+use dots_core::{
+    AnyStruct, StructDescriptor, StructValue, Timepoint, encode_key_bytes, encode_key_into,
+};
+use dots_model::{DotsHeader, Transmission};
 use parking_lot::{RwLock, RwLockReadGuard};
 
 use crate::connection::{DispatchEntry, DispatchState, GroupLeaver};
@@ -86,9 +89,52 @@ pub enum Operation {
     Create,
     /// Entry already existed; this is a subsequent update.
     Update,
-    /// Entry was removed. Stored entries never carry this value;
-    /// it's reserved for future events-stream usage.
+    /// Entry was removed. Stored entries never carry this value, but
+    /// it is the operation reported on the [`crate::Event`] delivered to
+    /// subscribers for a `remove_obj` transmission.
     Remove,
+}
+
+/// The classified outcome of an incoming transmission, as seen by a
+/// subscriber. Mirrors what dots-cpp's `Dispatcher::dispatchEvent`
+/// hands to an `Event<T>`: the effective [`Operation`], the post-merge
+/// `updated` value (the "local clone"), and its [`CloneInfo`].
+pub(crate) struct EventClassification<T> {
+    pub operation: Operation,
+    pub updated: T,
+    pub clone_info: CloneInfo,
+}
+
+/// Classify an incoming transmission for an **uncached** subscriber —
+/// one with no local container, matching dots-cpp's handling of types
+/// that have no cache: the transmitted instance is also the `updated`
+/// instance, and the operation is create (or remove when the header
+/// flags a deletion).
+///
+/// Cached types are classified by the container instead, in
+/// [`DynContainer::apply_and_classify`], which updates the cache first
+/// and reads the dispatched instance back from it (the faithful port of
+/// dots-cpp's `Dispatcher::dispatchEvent`).
+pub(crate) fn classify_event<T>(header: &DotsHeader, value: &T) -> EventClassification<T>
+where
+    T: StructValue + Clone + Send + 'static,
+{
+    let operation = if header.remove_obj == Some(true) {
+        Operation::Remove
+    } else {
+        Operation::Create
+    };
+    EventClassification {
+        operation,
+        updated: value.clone(),
+        clone_info: CloneInfo {
+            last_operation: operation,
+            last_update_time: header.sent_time,
+            last_update_sender: header.sender,
+            created_time: header.sent_time,
+            created_sender: header.sender,
+        },
+    }
 }
 
 /// Type-erased entry as held in [`DynContainer`]'s storage.
@@ -121,6 +167,70 @@ impl core::fmt::Debug for DynContainerEntry {
 pub struct ContainerEntry<T> {
     pub value: T,
     pub clone_info: CloneInfo,
+}
+
+/// The instance a cached container produced for an incoming
+/// transmission, to be delivered to event subscribers. Mirrors what
+/// dots-cpp's `Container::insert` / `Container::remove` hand back to
+/// `Dispatcher::dispatchEvent`: the container is updated *first*, then
+/// the stored (create / update) or extracted (remove) instance is what
+/// the event carries.
+pub(crate) struct DispatchOutcome {
+    pub operation: Operation,
+    /// The post-update container instance (create / update) or the
+    /// just-removed instance (remove), type-erased.
+    pub updated: AnyStruct,
+    pub clone_info: CloneInfo,
+    /// Lazily-materialised typed `Arc<T>` of [`updated`](Self::updated),
+    /// shared by every subscriber of this transmission. Type-erased so the
+    /// (type-erased) container can build the outcome; the first subscriber
+    /// fills it, the rest clone the `Arc`. `None` until first use.
+    shared_typed: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl DispatchOutcome {
+    /// The typed `updated` instance, shared across subscribers: the first
+    /// caller deep-clones it out of the type-erased [`updated`](Self::updated)
+    /// and caches it; subsequent callers get a cheap `Arc` clone.
+    ///
+    /// `fallback` covers the impossible case of a descriptor-identity
+    /// mismatch (the transmission was routed here by type name, so the
+    /// stored value is a `T`); it is never expected to run.
+    pub(crate) fn shared_updated<T>(&mut self, fallback: &T) -> Arc<T>
+    where
+        T: StructValue + Clone + Send + Sync + 'static,
+    {
+        if let Some(existing) = &self.shared_typed {
+            if let Ok(typed) = Arc::clone(existing).downcast::<T>() {
+                return typed;
+            }
+        }
+        let typed = Arc::new(
+            self.updated
+                .as_typed::<T>()
+                .cloned()
+                .unwrap_or_else(|| fallback.clone()),
+        );
+        self.shared_typed = Some(Arc::clone(&typed) as Arc<dyn Any + Send + Sync>);
+        typed
+    }
+}
+
+/// Per-transmission hand-off from a cached container (which runs first)
+/// to the event subscribers (which run after). Lets the partial-update
+/// merge and create/update/remove classification happen exactly once per
+/// transmission instead of once per subscriber.
+pub(crate) enum DispatchShared {
+    /// No cached container ran for this transmission; subscribers fall
+    /// back to uncached semantics (`updated == transmitted`, create).
+    Uncached,
+    /// A cached container applied the update and produced the instance to
+    /// dispatch.
+    Cached(DispatchOutcome),
+    /// A cached container applied the update but nothing should be
+    /// dispatched — e.g. a remove of a key that wasn't present, which
+    /// dots-cpp drops without emitting an event.
+    Suppressed,
 }
 
 type Entries = BTreeMap<Vec<u8>, DynContainerEntry>;
@@ -335,6 +445,83 @@ impl DynContainer {
             }
         }
     }
+
+    /// Apply `txn` to the container and return the instance to dispatch to
+    /// event subscribers — the faithful port of dots-cpp's
+    /// `Container::insert` / `Container::remove` feeding
+    /// `Dispatcher::dispatchEvent`: the container is updated *first*, then
+    /// the stored (create / update) or just-extracted (remove) instance is
+    /// what the event carries, with the operation taken from the entry's
+    /// refreshed [`CloneInfo`].
+    ///
+    /// Returns `None` when nothing should be dispatched: a remove of a key
+    /// that isn't present (dots-cpp emits no event in that case) or a
+    /// payload that doesn't belong to this container.
+    pub(crate) fn apply_and_classify(&self, txn: &Transmission) -> Option<DispatchOutcome> {
+        let dots_model::Payload::Typed(value) = &txn.payload else {
+            return None;
+        };
+        if !core::ptr::eq(value.descriptor(), self.descriptor) {
+            return None;
+        }
+        let key = encode_key_bytes(value);
+        let now_sender = txn.header.sender;
+        let now_time = txn.header.sent_time;
+        let mut entries = self.entries.write();
+
+        if txn.header.remove_obj == Some(true) {
+            // Extract the entry so the dispatched instance is the
+            // last-known value merged with the (key-only) remove payload;
+            // an absent key emits no event, matching dots-cpp.
+            let mut removed = entries.remove(&key)?;
+            let mask = txn.header.attributes.unwrap_or_else(|| value.valid_set());
+            removed.value.merge_from(value, mask);
+            removed.clone_info.last_operation = Operation::Remove;
+            removed.clone_info.last_update_time = now_time;
+            removed.clone_info.last_update_sender = now_sender;
+            return Some(DispatchOutcome {
+                operation: Operation::Remove,
+                updated: removed.value,
+                clone_info: removed.clone_info,
+                shared_typed: None,
+            });
+        }
+
+        match entries.entry(key) {
+            Entry::Occupied(mut slot) => {
+                let mask = txn.header.attributes.unwrap_or_else(|| value.valid_set());
+                let entry = slot.get_mut();
+                entry.value.merge_from(value, mask);
+                entry.clone_info.last_operation = Operation::Update;
+                entry.clone_info.last_update_time = now_time;
+                entry.clone_info.last_update_sender = now_sender;
+                Some(DispatchOutcome {
+                    operation: Operation::Update,
+                    updated: entry.value.clone(),
+                    clone_info: entry.clone_info.clone(),
+                    shared_typed: None,
+                })
+            }
+            Entry::Vacant(slot) => {
+                let stored = slot.insert(DynContainerEntry {
+                    value: value.clone(),
+                    clone_info: CloneInfo {
+                        last_operation: Operation::Create,
+                        last_update_time: now_time,
+                        last_update_sender: now_sender,
+                        created_time: now_time,
+                        created_sender: now_sender,
+                    },
+                });
+                Some(DispatchOutcome {
+                    operation: Operation::Create,
+                    updated: stored.value.clone(),
+                    clone_info: stored.clone_info.clone(),
+                    shared_typed: None,
+                })
+            }
+        }
+    }
 }
 
 /// Typed view over a [`DynContainer`].
@@ -390,7 +577,7 @@ impl<T> Container<T> {
 
 impl<T> Container<T>
 where
-    T: StructValue + Send + Clone + 'static,
+    T: StructValue + Send + Sync + Clone + 'static,
 {
     /// Lock the container for batched read access. Returns a
     /// [`ContainerReadGuard`] whose drop releases the lock — iterate
@@ -662,7 +849,7 @@ pub(crate) fn make_container<T>(
     leaver: Option<GroupLeaver>,
 ) -> Container<T>
 where
-    T: StructValue + Send + 'static,
+    T: StructValue + Send + Sync + 'static,
 {
     let inner = make_dyn_container(T::type_descriptor(), dispatch, leaver);
     Container::from_dyn(inner)
@@ -674,7 +861,7 @@ where
 /// than by type name.
 pub(crate) fn view_dispatch_update<T>(container: &Container<T>, txn: &Transmission)
 where
-    T: StructValue + Send + 'static,
+    T: StructValue + Send + Sync + 'static,
 {
     container.inner.apply(txn);
 }
@@ -688,11 +875,27 @@ struct DynContainerDispatchEntry {
 }
 
 impl DispatchEntry for DynContainerDispatchEntry {
-    fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError> {
+    fn dispatch(
+        &mut self,
+        txn: &Transmission,
+        has_subscribers: bool,
+        shared: &mut DispatchShared,
+    ) -> Result<bool, dots_core::DecodeError> {
         let Some(container) = self.container.upgrade() else {
             return Ok(false);
         };
-        container.apply(txn);
+        if has_subscribers {
+            // Update the cache, then publish the instance to dispatch so
+            // the subscribers (which run after) emit it — dots-cpp's
+            // update-then-dispatch order.
+            *shared = match container.apply_and_classify(txn) {
+                Some(outcome) => DispatchShared::Cached(outcome),
+                None => DispatchShared::Suppressed,
+            };
+        } else {
+            // Pure cache mirror, no event subscribers: just apply.
+            container.apply(txn);
+        }
         Ok(true)
     }
 
@@ -703,17 +906,243 @@ impl DispatchEntry for DynContainerDispatchEntry {
         true
     }
 
-    fn dispatch_owned(&mut self, txn: Transmission) -> Result<bool, dots_core::DecodeError> {
+    fn dispatch_owned(
+        &mut self,
+        txn: Transmission,
+        has_subscribers: bool,
+        shared: &mut DispatchShared,
+    ) -> Result<bool, dots_core::DecodeError> {
         let Some(container) = self.container.upgrade() else {
             return Ok(false);
         };
-        // `apply_owned` only handles `Typed`; route `Wire` (no owned
-        // `AnyStruct` to move) through the borrowing path.
-        if matches!(txn.payload, dots_model::Payload::Typed(_)) {
+        if has_subscribers {
+            // Subscribers need the transmission for `transmitted`, so the
+            // payload can't be moved into the container here — classify by
+            // borrow. (The owned-move fast path below only runs when the
+            // container is the sole consumer.)
+            *shared = match container.apply_and_classify(&txn) {
+                Some(outcome) => DispatchShared::Cached(outcome),
+                None => DispatchShared::Suppressed,
+            };
+        } else if matches!(txn.payload, dots_model::Payload::Typed(_)) {
+            // `apply_owned` only handles `Typed`; route `Wire` (no owned
+            // `AnyStruct` to move) through the borrowing path.
             container.apply_owned(txn);
         } else {
             container.apply(&txn);
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+    use crate::connection::Event;
+    use dots_core::{AnyStruct, Timepoint};
+    use dots_derive::DotsStruct;
+    use dots_model::Payload;
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "ClassifyPinger", cached)]
+    struct Pinger {
+        #[dots(tag = 1, key)]
+        id: Option<u32>,
+        #[dots(tag = 2)]
+        message: Option<String>,
+        #[dots(tag = 3)]
+        sequence: Option<u64>,
+    }
+
+    fn header(value: &Pinger, remove: bool) -> DotsHeader {
+        DotsHeader {
+            attributes: Some(value.valid_set()),
+            remove_obj: if remove { Some(true) } else { None },
+            sender: Some(7),
+            sent_time: Some(Timepoint(1.0)),
+            ..Default::default()
+        }
+    }
+
+    fn txn(value: &Pinger, h: &DotsHeader) -> Transmission {
+        Transmission {
+            header: h.clone(),
+            payload: Payload::Typed(AnyStruct::from_struct_value(value)),
+        }
+    }
+
+    /// `apply_and_classify` updates the container *and* hands back the
+    /// instance to dispatch, taken from the (post-update) container —
+    /// dots-cpp's `Container::insert` / `remove` + `dispatchEvent`.
+    fn classify(c: &Arc<DynContainer>, value: &Pinger, h: &DotsHeader) -> Option<DispatchOutcome> {
+        c.apply_and_classify(&txn(value, h))
+    }
+
+    fn updated(o: &DispatchOutcome) -> Pinger {
+        o.updated.as_typed::<Pinger>().cloned().expect("outcome is a Pinger")
+    }
+
+    #[test]
+    fn classifies_create_update_remove_against_container() {
+        let c = Arc::new(DynContainer::new(Pinger::DESCRIPTOR, None));
+
+        // Create: empty container, full value.
+        let v1 = Pinger {
+            id: Some(1),
+            message: Some("hi".into()),
+            sequence: Some(10),
+        };
+        let r = classify(&c, &v1, &header(&v1, false)).expect("create emits an event");
+        assert_eq!(r.operation, Operation::Create);
+        assert_eq!(updated(&r), v1);
+        assert_eq!(r.clone_info.last_operation, Operation::Create);
+        assert_eq!(r.clone_info.created_sender, Some(7));
+
+        // Update: partial transmission (only `message`). The `updated`
+        // value must reflect the merge — `sequence` survives from the
+        // prior create.
+        let v2 = Pinger {
+            id: Some(1),
+            message: Some("yo".into()),
+            sequence: None,
+        };
+        let r = classify(&c, &v2, &header(&v2, false)).expect("update emits an event");
+        assert_eq!(r.operation, Operation::Update);
+        let u = updated(&r);
+        assert_eq!(u.id, Some(1));
+        assert_eq!(u.message.as_deref(), Some("yo"));
+        assert_eq!(u.sequence, Some(10), "unmentioned property survives the merge");
+        assert_eq!(r.clone_info.last_operation, Operation::Update);
+
+        // Remove: key-only transmission. `updated` is the last-known
+        // merged state so a handler can inspect what disappeared.
+        let v3 = Pinger {
+            id: Some(1),
+            ..Default::default()
+        };
+        let r = classify(&c, &v3, &header(&v3, true)).expect("removing a present key emits an event");
+        assert_eq!(r.operation, Operation::Remove);
+        let u = updated(&r);
+        assert_eq!(u.message.as_deref(), Some("yo"));
+        assert_eq!(u.sequence, Some(10));
+        assert_eq!(r.clone_info.last_operation, Operation::Remove);
+        assert!(c.is_empty(), "the entry is gone after remove");
+    }
+
+    /// Removing a key that was never present emits no event, matching
+    /// dots-cpp's `dispatchEvent` (which skips on an empty extracted node).
+    #[test]
+    fn remove_of_absent_key_emits_no_event() {
+        let c = Arc::new(DynContainer::new(Pinger::DESCRIPTOR, None));
+        let v = Pinger {
+            id: Some(99),
+            ..Default::default()
+        };
+        assert!(classify(&c, &v, &header(&v, true)).is_none());
+    }
+
+    #[test]
+    fn no_container_is_always_create() {
+        let v = Pinger {
+            id: Some(1),
+            message: Some("hi".into()),
+            sequence: Some(10),
+        };
+        let h = header(&v, false);
+        let r = classify_event::<Pinger>(&h, &v);
+        assert_eq!(r.operation, Operation::Create);
+        assert_eq!(r.updated, v);
+    }
+
+    /// On a partial update, `Event::transmitted()` is the (sparse) wire
+    /// instance the publisher sent, while `Event::updated()` is the
+    /// merged local clone — so the two genuinely differ.
+    #[test]
+    fn event_transmitted_differs_from_updated_on_partial_update() {
+        let c = Arc::new(DynContainer::new(Pinger::DESCRIPTOR, None));
+
+        // Seed the container with a full instance.
+        let create = Pinger {
+            id: Some(1),
+            message: Some("hi".into()),
+            sequence: Some(10),
+        };
+        c.apply(&txn(&create, &header(&create, false)));
+
+        // A partial update touching only `message` (no `sequence`).
+        let partial = Pinger {
+            id: Some(1),
+            message: Some("bye".into()),
+            sequence: None,
+        };
+        let outcome = classify(&c, &partial, &header(&partial, false)).expect("update event");
+        let mut shared = DispatchShared::Cached(outcome);
+        let ev = Event::from_shared(header(&partial, false), partial.clone(), true, &mut shared)
+            .expect("update is dispatched");
+
+        assert!(ev.is_update());
+        // `transmitted()` is exactly what arrived on the wire — sparse.
+        assert_eq!(ev.transmitted(), &partial);
+        assert_eq!(ev.transmitted().sequence, None);
+        // `updated()` is the merged local clone — it carries the
+        // surviving `sequence` and the new `message`.
+        assert_eq!(ev.updated().message.as_deref(), Some("bye"));
+        assert_eq!(ev.updated().sequence, Some(10));
+        // The whole point: the two views are not the same.
+        assert_ne!(ev.transmitted(), ev.updated());
+    }
+
+    /// On a remove, `Event::updated()` carries the container's content as
+    /// it was *prior to* the remove (the last-known state), not the
+    /// key-only wire payload that triggered the deletion.
+    #[test]
+    fn event_updated_holds_pre_remove_container_content() {
+        let c = Arc::new(DynContainer::new(Pinger::DESCRIPTOR, None));
+
+        // Create, then update, so the container holds the latest state.
+        let create = Pinger {
+            id: Some(1),
+            message: Some("hi".into()),
+            sequence: Some(10),
+        };
+        c.apply(&txn(&create, &header(&create, false)));
+        let update = Pinger {
+            id: Some(1),
+            message: Some("latest".into()),
+            sequence: Some(20),
+        };
+        c.apply(&txn(&update, &header(&update, false)));
+
+        // Capture the exact container content right before the remove.
+        let pre_remove = c.with_entries_dyn(|entries| {
+            entries
+                .values()
+                .next()
+                .expect("one entry present")
+                .value
+                .as_typed::<Pinger>()
+                .cloned()
+                .expect("entry is a Pinger")
+        });
+
+        // Remove via a key-only transmission, as a real broker sends.
+        let key_only = Pinger {
+            id: Some(1),
+            ..Default::default()
+        };
+        let outcome = classify(&c, &key_only, &header(&key_only, true)).expect("remove event");
+        let mut shared = DispatchShared::Cached(outcome);
+        let ev = Event::from_shared(header(&key_only, true), key_only.clone(), true, &mut shared)
+            .expect("remove is dispatched");
+
+        assert!(ev.is_remove());
+        // The transmitted payload is key-only — the non-key fields are
+        // absent, so it is NOT the pre-remove content.
+        assert_eq!(ev.transmitted().message, None);
+        assert_eq!(ev.transmitted().sequence, None);
+        // `updated()` reproduces the container content prior to remove.
+        assert_eq!(ev.updated(), &pre_remove);
+        assert_eq!(ev.updated().message.as_deref(), Some("latest"));
+        assert_eq!(ev.updated().sequence, Some(20));
     }
 }

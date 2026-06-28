@@ -133,8 +133,8 @@ async fn subscription_receives_event_pushed_by_server() {
     conn.next().await.unwrap().unwrap();
 
     let event = sub.recv().await.expect("subscription receives event");
-    assert_eq!(event.value.id, Some(7));
-    assert_eq!(event.value.message.as_deref(), Some("hello"));
+    assert_eq!(event.updated().id, Some(7));
+    assert_eq!(event.updated().message.as_deref(), Some("hello"));
     assert_eq!(event.header.sender, Some(42));
 
     drop(conn);
@@ -187,7 +187,7 @@ async fn subscription_filters_by_type_name() {
     conn.next().await.unwrap().unwrap();
 
     let event = pinger_sub.recv().await.unwrap();
-    assert_eq!(event.value.message.as_deref(), Some("only-this"));
+    assert_eq!(event.updated().message.as_deref(), Some("only-this"));
     // Confirm only one Pinger arrived (no spurious Bonk leaks through).
     let next = tokio::time::timeout(std::time::Duration::from_millis(50), pinger_sub.recv()).await;
     assert!(next.is_err(), "no further Pinger should be queued");
@@ -229,8 +229,8 @@ async fn multiple_subscriptions_to_same_type_each_receive() {
 
     let a = sub_a.recv().await.unwrap();
     let b = sub_b.recv().await.unwrap();
-    assert_eq!(a.value.message.as_deref(), Some("broadcast"));
-    assert_eq!(b.value.message.as_deref(), Some("broadcast"));
+    assert_eq!(a.updated().message.as_deref(), Some("broadcast"));
+    assert_eq!(b.updated().message.as_deref(), Some("broadcast"));
 
     drop(conn);
     server.await.unwrap();
@@ -267,7 +267,7 @@ async fn dropping_subscription_stops_receiving() {
     let mut sub = conn.subscribe::<Pinger>();
     conn.next().await.unwrap().unwrap();
     let first = sub.recv().await.unwrap();
-    assert_eq!(first.value.id, Some(1));
+    assert_eq!(first.updated().id, Some(1));
 
     // Drop the subscription. Subsequent dispatches should be no-ops.
     drop(sub);
@@ -353,7 +353,7 @@ async fn publish_then_server_echoes_then_subscription_receives() {
     conn.next().await.unwrap().unwrap();
 
     let event = sub.recv().await.unwrap();
-    assert_eq!(event.value, original);
+    assert_eq!(event.updated(), &original);
     assert_eq!(event.header.sender, Some(999));
 
     drop(conn);

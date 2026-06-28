@@ -72,14 +72,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some(type_name) = event.header.type_name.as_deref() else {
             return;
         };
-        let key = event.value.key_bytes();
+        let key = event.updated().key_bytes();
         let is_remove = event.header.remove_obj == Some(true);
         let from_cache = event.header.from_cache.is_some();
 
         let mut r = types_for_events.lock().expect("types registry poisoned");
         let s = r.entry(type_name.to_string()).or_insert_with(|| TypeStats {
-            cached: event.value.descriptor.flags.is_cached(),
-            internal: event.value.descriptor.flags.is_internal(),
+            cached: event.updated().descriptor.flags.is_cached(),
+            internal: event.updated().descriptor.flags.is_internal(),
             instances: HashSet::new(),
             last_op: None,
         });

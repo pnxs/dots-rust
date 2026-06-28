@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One handler for every type — the composite helper auto-installs
     // a dynamic subscription per descriptor (now and as new ones land).
     let _all = app.subscribe_all_types(move |event| {
-        let type_name = &event.value.descriptor.name;
+        let type_name = &event.transmitted.descriptor.name;
         let sender = event
             .header
             .sender
@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         println!(
             "[{type_name:<26}] from={sender:<4}{from_cache}{removal}  {}",
-            registry.display_struct(&event.value)
+            registry.display_struct(&event.updated())
         );
     });
 

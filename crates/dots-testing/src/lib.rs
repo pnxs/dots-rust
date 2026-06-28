@@ -255,7 +255,7 @@ impl TestHarness {
     /// `dots_transport::global::subscribe_stream`.
     pub fn subscribe_stream<T>(&self) -> Subscription<T>
     where
-        T: StructValue + Send + 'static + GlobalRegistration,
+        T: StructValue + Send + Sync + Clone + 'static + GlobalRegistration,
     {
         self.primary.subscribe_stream::<T>()
     }
@@ -264,7 +264,7 @@ impl TestHarness {
     /// `dots_transport::global::container`.
     pub fn container<T>(&self) -> Container<T>
     where
-        T: StructValue + Send + 'static + GlobalRegistration,
+        T: StructValue + Send + Sync + 'static + GlobalRegistration,
     {
         self.primary.container::<T>()
     }
@@ -282,7 +282,7 @@ impl TestHarness {
     /// [`recv`](Self::recv) timeout.
     pub async fn sync_publish<T>(&self, publisher: &Client, obj: &T)
     where
-        T: StructValue + Publishable + Clone + Send + 'static + GlobalRegistration,
+        T: StructValue + Publishable + Clone + Send + Sync + 'static + GlobalRegistration,
     {
         let mut sub = self.subscribe_stream::<T>();
         publisher.publish(obj);
@@ -313,7 +313,7 @@ impl TestHarness {
             Some(true),
             "expected a publish, got a remove"
         );
-        assert_fields_match(&event.value, expected);
+        assert_fields_match(&event.transmitted, expected);
         event
     }
 
@@ -337,7 +337,7 @@ impl TestHarness {
             Some(true),
             "expected a remove, got a publish"
         );
-        assert_fields_match(&event.value, expected);
+        assert_fields_match(&event.transmitted, expected);
         event
     }
 }

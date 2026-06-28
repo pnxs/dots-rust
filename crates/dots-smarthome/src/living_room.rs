@@ -21,7 +21,7 @@ impl LivingRoom {
     pub fn new(app: &App) -> Self {
         let client = app.client();
         let sub = app.subscribe::<Dimmer>(move |event| {
-            let dimmer = &event.value;
+            let dimmer = event.updated();
             // `id` is now a bare-`String` key: use the infallible getter.
             if dimmer.id != LIVING_ROOM_MASTER_DIMMER {
                 return;

@@ -35,7 +35,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Notify, mpsc};
 
 use crate::connection::{Connection, DispatchEntry, DispatchState, Event, GroupLeaver};
-use crate::container::Container;
+use crate::container::{CloneInfo, Container, DispatchShared, DynContainer, Operation};
 use crate::error::TransportError;
 use crate::ConnectionError;
 
@@ -254,7 +254,7 @@ impl GuestTransceiver {
     /// [`View<T>`] whose drop tears down the subscription.
     pub fn view<T>(self: &Arc<Self>, filter: DotsFilter) -> Result<crate::View<T>, crate::ViewError>
     where
-        T: StructValue + Send + Clone + 'static + dots_core::GlobalRegistration,
+        T: StructValue + Send + Sync + Clone + 'static + dots_core::GlobalRegistration,
     {
         crate::view::View::open(self, filter)
     }
@@ -349,7 +349,7 @@ impl GuestTransceiver {
         handler: impl FnMut(&Event<T>) + Send + 'static,
     ) -> SubscriptionHandle
     where
-        T: StructValue + Send + 'static + dots_core::GlobalRegistration,
+        T: StructValue + Send + Sync + Clone + 'static + dots_core::GlobalRegistration,
     {
         // Ensure the pool's container for T exists — `container::<T>`
         // joins the group exactly once per type and attaches the
@@ -358,18 +358,18 @@ impl GuestTransceiver {
         // membership, so the broker sees one Join per type (regardless
         // of subscriber count) and one Leave when the transceiver is
         // dropped.
-        let _ = self.container::<T>();
-        register_callback::<T, _>(&self.dispatch, handler)
+        let container = self.container::<T>().as_dyn().clone();
+        register_callback::<T, _>(&self.dispatch, container, handler)
     }
 
     /// Subscribe to typed events as an async [`crate::Subscription<T>`]
     /// stream.
     pub fn subscribe_stream<T>(self: &Arc<Self>) -> crate::Subscription<T>
     where
-        T: StructValue + Send + 'static + dots_core::GlobalRegistration,
+        T: StructValue + Send + Sync + Clone + 'static + dots_core::GlobalRegistration,
     {
-        let _ = self.container::<T>();
-        connection_subscribe::<T>(&self.dispatch)
+        let container = self.container::<T>().as_dyn().clone();
+        connection_subscribe::<T>(&self.dispatch, Some(container))
     }
 
     /// Subscribe to *every* DOTS type — known now or learned later —
@@ -445,7 +445,7 @@ impl GuestTransceiver {
         let registry = self.registry.clone();
         let handler_for_wire = handler.clone();
         self.subscribe::<StructDescriptorData>(move |event| {
-            match registry.build_dynamic_struct(&event.value) {
+            match registry.build_dynamic_struct(&event.updated()) {
                 Ok(desc) => {
                     let arc = Arc::new(desc);
                     registry.register_struct_dynamic(arc.clone());
@@ -456,7 +456,7 @@ impl GuestTransceiver {
                 Err(e) => {
                     tracing::warn!(
                         error = ?e,
-                        type_name = ?event.value.name,
+                        type_name = ?event.updated().name,
                         "could not build dynamic descriptor from wire StructDescriptorData",
                     );
                 }
@@ -504,7 +504,7 @@ impl GuestTransceiver {
     /// `Arc<DynContainer>`.
     pub fn container<T>(self: &Arc<Self>) -> Container<T>
     where
-        T: StructValue + Send + 'static + dots_core::GlobalRegistration,
+        T: StructValue + Send + Sync + 'static + dots_core::GlobalRegistration,
     {
         T::register_as_subscribed();
         let descriptor = T::type_descriptor();
@@ -1155,14 +1155,16 @@ impl Drop for SubscriptionHandle {
 
 fn register_callback<T, F>(
     dispatch: &Arc<Mutex<DispatchState>>,
+    container: Arc<DynContainer>,
     handler: F,
 ) -> SubscriptionHandle
 where
-    T: StructValue + Send + 'static,
+    T: StructValue + Send + Sync + Clone + 'static,
     F: FnMut(&Event<T>) + Send + 'static,
 {
     let entry: CallbackDispatchEntry<T, F> = CallbackDispatchEntry {
         handler,
+        _container: container,
         _phantom: PhantomData,
     };
     let type_name = T::type_descriptor().name.to_string();
@@ -1180,28 +1182,34 @@ where
 
 struct CallbackDispatchEntry<T, F> {
     handler: F,
+    /// Kept to pin the type's [`DynContainer`] alive for as long as this
+    /// subscription exists, so its (weakly-held) container dispatch entry
+    /// keeps applying updates and producing the post-update outcome this
+    /// callback reads via [`DispatchShared`]. Not read directly.
+    _container: Arc<DynContainer>,
     _phantom: PhantomData<fn() -> T>,
 }
 
 impl<T, F> DispatchEntry for CallbackDispatchEntry<T, F>
 where
-    T: StructValue + Send + 'static,
+    T: StructValue + Send + Sync + Clone + 'static,
     F: FnMut(&Event<T>) + Send + 'static,
 {
     fn dispatch(
         &mut self,
         txn: &Transmission,
+        _has_subscribers: bool,
+        shared: &mut DispatchShared,
     ) -> Result<bool, dots_core::DecodeError> {
         let bytes = txn.payload.encode();
         let value: T = decode_typed_from_slice(&bytes)?;
-        let event = Event {
-            header: txn.header.clone(),
-            value,
-        };
-        (self.handler)(&event);
+        // Callback subscribers are always cache-backed; a suppressed
+        // dispatch (remove of an absent key) fires no handler.
+        if let Some(event) = Event::from_shared(txn.header.clone(), value, true, shared) {
+            (self.handler)(&event);
+        }
         Ok(true)
     }
-
 }
 
 fn register_dynamic_callback<F>(
@@ -1243,7 +1251,12 @@ impl<F> DispatchEntry for DynamicCallbackDispatchEntry<F>
 where
     F: FnMut(&Event<DynamicStruct>) + Send + 'static,
 {
-    fn dispatch(&mut self, txn: &Transmission) -> Result<bool, dots_core::DecodeError> {
+    fn dispatch(
+        &mut self,
+        txn: &Transmission,
+        _has_subscribers: bool,
+        _shared: &mut DispatchShared,
+    ) -> Result<bool, dots_core::DecodeError> {
         // The wire-decode normally lands in `Payload::Wire` for
         // dynamic-only types. But `subscribe_all_types` can install
         // dynamic subscribers for types whose static descriptor *is*
@@ -1254,10 +1267,32 @@ where
             dots_model::Payload::Wire(d) => d.clone(),
             dots_model::Payload::Typed(a) => DynamicStruct::from_struct_value(a),
         };
-        let event = Event {
-            header: txn.header.clone(),
-            value: dyn_value,
+        // Dynamic subscribers have no typed container to classify
+        // against, so events follow uncached semantics: the transmitted
+        // value is also the updated value, and the operation is create
+        // (or remove when the header flags a deletion), mirroring
+        // dots-cpp's handling of types without a local cache.
+        // `DynamicStruct` isn't a `StructValue`, so build the event from
+        // parts rather than through `Event::new`.
+        let operation = if txn.header.remove_obj == Some(true) {
+            Operation::Remove
+        } else {
+            Operation::Create
         };
+        let clone_info = CloneInfo {
+            last_operation: operation,
+            last_update_time: txn.header.sent_time,
+            last_update_sender: txn.header.sender,
+            created_time: txn.header.sent_time,
+            created_sender: txn.header.sender,
+        };
+        let event = Event::from_parts(
+            txn.header.clone(),
+            dyn_value.clone(),
+            Arc::new(dyn_value),
+            operation,
+            clone_info,
+        );
         (self.handler)(&event);
         Ok(true)
     }
@@ -1266,13 +1301,17 @@ where
 /// Internal helper: register a stream subscription against a given
 /// dispatch handle. Mirrors `Connection::subscribe<T>`'s body without
 /// requiring a `Connection`-typed receiver.
-fn connection_subscribe<T>(dispatch: &Arc<Mutex<DispatchState>>) -> crate::Subscription<T>
+fn connection_subscribe<T>(
+    dispatch: &Arc<Mutex<DispatchState>>,
+    container: Option<Arc<DynContainer>>,
+) -> crate::Subscription<T>
 where
-    T: StructValue + Send + 'static,
+    T: StructValue + Send + Sync + Clone + 'static,
 {
     let (tx, rx) = mpsc::unbounded_channel();
     let entry = StreamDispatchEntry::<T> {
         sender: tx,
+        container,
         _phantom: PhantomData,
     };
     let type_name = T::type_descriptor().name.to_string();
@@ -1285,25 +1324,30 @@ where
 
 struct StreamDispatchEntry<T> {
     sender: mpsc::UnboundedSender<Event<T>>,
+    container: Option<Arc<DynContainer>>,
     _phantom: PhantomData<fn() -> T>,
 }
 
 impl<T> DispatchEntry for StreamDispatchEntry<T>
 where
-    T: StructValue + Send + 'static,
+    T: StructValue + Send + Sync + Clone + 'static,
 {
     fn dispatch(
         &mut self,
         txn: &Transmission,
+        _has_subscribers: bool,
+        shared: &mut DispatchShared,
     ) -> Result<bool, dots_core::DecodeError> {
         if self.sender.is_closed() {
             return Ok(false);
         }
         let bytes = txn.payload.encode();
         let value: T = decode_typed_from_slice(&bytes)?;
-        let event = Event {
-            header: txn.header.clone(),
-            value,
+        let Some(event) =
+            Event::from_shared(txn.header.clone(), value, self.container.is_some(), shared)
+        else {
+            // Suppressed (remove of an absent key): keep the entry.
+            return Ok(true);
         };
         Ok(self.sender.send(event).is_ok())
     }

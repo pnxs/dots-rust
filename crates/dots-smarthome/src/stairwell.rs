@@ -21,7 +21,7 @@ impl Stairwell {
         let lights = app.container::<LightControl>();
 
         let sub = app.subscribe::<StatelessSwitch>(move |event| {
-            let id = event.value.id.as_deref();
+            let id = event.updated().id.as_deref();
             if id != Some(STAIRWELL_LOWER_SWITCH) && id != Some(STAIRWELL_UPPER_SWITCH) {
                 return;
             }

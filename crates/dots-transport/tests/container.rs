@@ -413,7 +413,7 @@ async fn container_and_subscription_both_receive() {
 
     assert_eq!(pingers.len(), 1);
     let event = sub.recv().await.expect("subscription receives event");
-    assert_eq!(event.value.message.as_deref(), Some("dual"));
+    assert_eq!(event.updated().message.as_deref(), Some("dual"));
 
     drop(conn);
     server.await.unwrap();
