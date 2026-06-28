@@ -1091,6 +1091,24 @@ pub fn now_timepoint() -> Timepoint {
     Timepoint(secs)
 }
 
+/// Generate a fresh random (RFC 4122 version 4) UUID as the raw 16
+/// bytes a DOTS `uuid` field stores.
+///
+/// The 122 random bits come from the thread RNG; the version (`0b0100`)
+/// and variant (`0b10`) bits are set per RFC 4122 so the result is a
+/// well-formed v4 UUID — matching the random UUIDs dots-cpp produces.
+///
+/// Lives here (not in dots-core) because generating randomness needs an
+/// entropy source, and dots-core stays `no_std`. Use it to populate a
+/// `uuid` field when constructing an instance, e.g.
+/// `dots!(Foo { id: new_uuid(), .. })`.
+pub fn new_uuid() -> [u8; 16] {
+    let mut bytes: [u8; 16] = rand::random();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 1 (RFC 4122)
+    bytes
+}
+
 // ===== Callback dispatch entry =====
 
 /// RAII handle to a callback subscription. Drop = unsubscribe;
@@ -1288,5 +1306,26 @@ where
             value,
         };
         Ok(self.sender.send(event).is_ok())
+    }
+}
+
+#[cfg(test)]
+mod uuid_tests {
+    use super::new_uuid;
+
+    #[test]
+    fn new_uuid_sets_v4_version_and_variant_bits() {
+        for _ in 0..1000 {
+            let id = new_uuid();
+            assert_eq!(id[6] & 0xf0, 0x40, "version nibble must be 4");
+            assert_eq!(id[8] & 0xc0, 0x80, "variant bits must be 0b10");
+        }
+    }
+
+    #[test]
+    fn new_uuid_yields_distinct_values() {
+        let a = new_uuid();
+        let b = new_uuid();
+        assert_ne!(a, b, "two fresh UUIDs should not collide");
     }
 }

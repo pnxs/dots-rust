@@ -40,7 +40,7 @@ use crate::container::Container;
 use crate::error::TransportError;
 use crate::guest::{GuestError, GuestTransceiver, SubscriptionHandle};
 
-pub use crate::guest::now_timepoint;
+pub use crate::guest::{new_uuid, now_timepoint};
 
 /// Errors produced by the [`App`] lifecycle.
 #[derive(Debug)]

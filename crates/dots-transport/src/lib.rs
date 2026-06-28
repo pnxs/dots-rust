@@ -34,7 +34,7 @@ mod view;
 #[cfg(feature = "tracing-init")]
 mod tracing_init;
 
-pub use app::{App, AppError, Client, DriverFuture, connect_over_stream, now_timepoint};
+pub use app::{App, AppError, Client, DriverFuture, connect_over_stream, new_uuid, now_timepoint};
 pub use codec::{RawTransmissionCodec, TransmissionCodec};
 pub use connection::{Connection, ConnectionBuilder, ConnectionError, Event, Subscription};
 pub use container::{CloneInfo, Container, ContainerEntry, Operation};
