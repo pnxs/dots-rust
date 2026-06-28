@@ -135,6 +135,17 @@ where
     client().subscribe_stream::<T>()
 }
 
+/// See [`GuestTransceiver::subscribe_tasked`](crate::GuestTransceiver::subscribe_tasked).
+pub fn subscribe_tasked<T, S, F, Fut>(state: Arc<S>, handler: F) -> tokio::task::JoinHandle<()>
+where
+    T: StructValue + Send + Sync + Clone + 'static + GlobalRegistration,
+    S: Send + Sync + 'static,
+    F: Fn(Arc<S>, Event<T>) -> Fut + Send + 'static,
+    Fut: core::future::Future<Output = ()> + Send + 'static,
+{
+    client().subscribe_tasked::<T, S, F, Fut>(state, handler)
+}
+
 /// See [`GuestTransceiver::subscribe_dynamic`](crate::GuestTransceiver::subscribe_dynamic).
 pub fn subscribe_dynamic(
     descriptor: Arc<DynamicStructDescriptor>,

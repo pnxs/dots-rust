@@ -333,6 +333,21 @@ impl App {
         self.transceiver.subscribe_stream::<T>()
     }
 
+    /// See [`GuestTransceiver::subscribe_tasked`].
+    pub fn subscribe_tasked<T, S, F, Fut>(
+        &self,
+        state: Arc<S>,
+        handler: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        T: StructValue + Send + Sync + Clone + 'static + dots_core::GlobalRegistration,
+        S: Send + Sync + 'static,
+        F: Fn(Arc<S>, Event<T>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.transceiver.subscribe_tasked::<T, S, F, Fut>(state, handler)
+    }
+
     /// Subscribe to a runtime-described type — see
     /// [`GuestTransceiver::subscribe_dynamic`].
     pub fn subscribe_dynamic(

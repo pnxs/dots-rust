@@ -372,6 +372,46 @@ impl GuestTransceiver {
         connection_subscribe::<T>(&self.dispatch, Some(container))
     }
 
+    /// Subscribe to typed events and drive an **async** `handler` over them on a
+    /// dedicated task, one event at a time: each handler future is awaited to
+    /// completion before the next event is dequeued, so invocations never
+    /// overlap (a single in-flight handler at any moment). This is the
+    /// async-handler counterpart of [`subscribe`](Self::subscribe), whose
+    /// callback is synchronous and so cannot `.await`.
+    ///
+    /// `state` is shared context — commonly the actor/manager that owns the
+    /// behaviour — handed to each invocation (cloned per event), which keeps
+    /// call sites a single line even when the handler is an async method:
+    ///
+    /// ```ignore
+    /// transceiver.subscribe_tasked(manager.clone(),
+    ///     |m, evt| async move { m.on_commit(&evt).await });
+    /// ```
+    ///
+    /// The spawned task owns `state` and the subscription and ends on its own
+    /// when the subscription closes (e.g. at shutdown). The returned
+    /// [`JoinHandle`](tokio::task::JoinHandle) lets a caller abort or await the
+    /// task; it may be dropped to leave it running for the connection's life.
+    /// Requires a Tokio runtime (as the rest of the transport does).
+    pub fn subscribe_tasked<T, S, F, Fut>(
+        self: &Arc<Self>,
+        state: Arc<S>,
+        handler: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        T: StructValue + Send + Sync + Clone + 'static + dots_core::GlobalRegistration,
+        S: Send + Sync + 'static,
+        F: Fn(Arc<S>, Event<T>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut sub = self.subscribe_stream::<T>();
+        tokio::spawn(async move {
+            while let Some(evt) = sub.recv().await {
+                handler(state.clone(), evt).await;
+            }
+        })
+    }
+
     /// Subscribe to *every* DOTS type — known now or learned later —
     /// with a single handler. Composes
     /// [`subscribe_new_struct_type`](Self::subscribe_new_struct_type) and
