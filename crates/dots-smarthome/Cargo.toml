@@ -17,16 +17,13 @@ name = "smart-home-sim"
 path = "src/sim.rs"
 
 [dependencies]
-dots-core.workspace = true
-dots-derive.workspace = true
-dots-model.workspace = true
-dots-transport = { workspace = true, features = ["tracing-init"] }
+dots-rs = { workspace = true, features = ["tracing-init"] }
 
 tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time", "sync"] }
 tracing.workspace = true
 
 [build-dependencies]
-dots-build = { path = "../dots-build", version = "0.1.0" }
+dots-rs-build = { path = "../dots-rs-build", version = "0.1.0" }
 
 [lints]
 workspace = true

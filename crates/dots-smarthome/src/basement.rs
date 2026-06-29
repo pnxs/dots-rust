@@ -9,10 +9,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dots_transport::{App, SubscriptionHandle};
+use dots_rs::{App, SubscriptionHandle};
 use tokio::task::JoinHandle;
 
-use dots_core::dots;
+use dots_rs::dots;
 
 use crate::ids::{BASEMENT_LIGHT, BASEMENT_MOTION_SWITCH};
 use crate::model::*;

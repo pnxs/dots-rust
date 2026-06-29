@@ -9,9 +9,9 @@ publish = false
 description = "DOTS trace tool — connects to a broker and prints every transmission as it arrives."
 
 [dependencies]
-dots-core.workspace = true
-dots-model.workspace = true
-dots-transport = { workspace = true, features = ["tracing-init"] }
+dots-rs-core.workspace = true
+dots-rs-model.workspace = true
+dots-rs-transport = { workspace = true, features = ["tracing-init"] }
 
 tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
 

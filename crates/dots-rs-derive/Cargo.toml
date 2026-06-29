@@ -1,0 +1,37 @@
+[package]
+name = "dots-rs-derive"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Procedural macros for dots-rust: #[derive(DotsStruct)]."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+
+[dev-dependencies]
+# All intra-workspace dev-dependencies are path-only (no version) so they
+# are stripped from the published manifest. That keeps the publish order
+# acyclic (dots-rs-model normal-depends on dots-rs-derive, while these
+# tests dev-depend back on model) and lets the dots-rs umbrella be used
+# by tests/doctests even though it re-exports this crate.
+dots-rs-core = { path = "../dots-rs-core" }
+# Derived code references `filter::Attr` constants per scalar field;
+# integration tests therefore need dots-rs-model in scope.
+dots-rs-model = { path = "../dots-rs-model" }
+# Generated code routes through `::dots_rs::__rt` by default, so tests and
+# doctests that derive types need the umbrella available.
+dots-rs = { path = "../dots-rs" }
+
+[lints]
+workspace = true

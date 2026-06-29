@@ -6,18 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 publish = false
-description = "Compile-test for dots-build: parses .dots files via build.rs and includes the generated source."
+description = "Compile-test for dots-rs-build: parses .dots files via build.rs and includes the generated source."
 
 [dependencies]
-dots-core.workspace = true
-dots-derive.workspace = true
-# Derive macros emit `::dots_model::filter::Attr<...>` constants for
-# every DSL-supported leaf field; consumers therefore need dots-model
-# as a runtime dep even when they only use the typed-struct surface.
-dots-model.workspace = true
+dots-rs.workspace = true
 
 [build-dependencies]
-dots-build = { path = "../dots-build", version = "0.1.0" }
+dots-rs-build = { path = "../dots-rs-build", version = "0.1.0" }
 
 [lints]
 workspace = true

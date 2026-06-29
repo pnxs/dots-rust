@@ -24,13 +24,13 @@ use std::time::Duration;
 use dots_smarthome::basement::Basement;
 use dots_smarthome::living_room::LivingRoom;
 use dots_smarthome::stairwell::Stairwell;
-use dots_transport::App;
+use dots_rs::App;
 
 const APP_NAME: &str = "smart-home";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dots_transport::init_tracing("");
+    dots_rs::init_tracing("");
 
     let app = App::new(APP_NAME).await?;
     tracing::info!("smart-home connected");

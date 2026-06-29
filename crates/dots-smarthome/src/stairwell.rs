@@ -4,9 +4,9 @@
 //! the stairwell light: if no entry exists yet (or it's at `0`), turn
 //! to `100`; otherwise turn off (`0`).
 
-use dots_transport::{App, SubscriptionHandle};
+use dots_rs::{App, SubscriptionHandle};
 
-use dots_core::dots;
+use dots_rs::dots;
 
 use crate::ids::{STAIRWELL_LIGHT, STAIRWELL_LOWER_SWITCH, STAIRWELL_UPPER_SWITCH};
 use crate::model::*;

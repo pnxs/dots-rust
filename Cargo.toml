@@ -5,17 +5,23 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 rust-version = "1.85"
-license = "LGPL-3.0"
+# SPDX expression. `LGPL-3.0` (bare) is deprecated; `-only` preserves the
+# "this version only" meaning. Switch to `LGPL-3.0-or-later` if desired.
+license = "LGPL-3.0-only"
 authors = ["Thomas Schätzlein <thomas@pnxs.de>"]
 repository = "https://github.com/pnxs/dots-rust"
+homepage = "https://github.com/pnxs/dots-rust"
+keywords = ["pubsub", "dots", "serialization", "realtime", "tokio"]
+categories = ["network-programming", "encoding"]
 
 [workspace.dependencies]
-dots-core = { path = "crates/dots-core", version = "0.1.0" }
-dots-derive = { path = "crates/dots-derive", version = "0.1.0" }
-dots-model = { path = "crates/dots-model", version = "0.1.0" }
-dots-transport = { path = "crates/dots-transport", version = "0.1.0", default-features = false }
-dots-testing = { path = "crates/dots-testing", version = "0.1.0" }
-dots-demo-client = { path = "crates/dots-demo-client", version = "0.1.0" }
+dots-rs = { path = "crates/dots-rs", version = "0.1.0" }
+dots-rs-core = { path = "crates/dots-rs-core", version = "0.1.0" }
+dots-rs-derive = { path = "crates/dots-rs-derive", version = "0.1.0" }
+dots-rs-model = { path = "crates/dots-rs-model", version = "0.1.0" }
+dots-rs-transport = { path = "crates/dots-rs-transport", version = "0.1.0", default-features = false }
+dots-rs-testing = { path = "crates/dots-rs-testing", version = "0.1.0" }
+dots-rs-build = { path = "crates/dots-rs-build", version = "0.1.0" }
 
 minicbor = { version = "2", default-features = false, features = ["alloc"] }
 

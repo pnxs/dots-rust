@@ -18,16 +18,16 @@
 //! `info` level with `RUST_LOG`, e.g.
 //!
 //! ```text
-//! RUST_LOG=dots_transport=debug cargo run --bin dots-demo-client
+//! RUST_LOG=dots_rs_transport=debug cargo run --bin dots-demo-client
 //! ```
 
 use std::time::Duration;
-use dots_core::{PUBLISHED_TYPES, SUBSCRIBED_TYPES, dots};
-use dots_model::DotsCacheInfo;
-use dots_transport::App;
+use dots_rs::{PUBLISHED_TYPES, SUBSCRIBED_TYPES, dots};
+use dots_rs::DotsCacheInfo;
+use dots_rs::App;
 
 mod model {
-    use dots_derive::DotsStruct;
+    use dots_rs::DotsStruct;
     #[derive(DotsStruct, Default, Debug, Clone)]
     #[dots(name = "Pinger", cached)]
     pub struct Pinger {
@@ -45,7 +45,7 @@ const CLIENT_NAME: &str = "dots-demo-client";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dots_transport::init_tracing("");
+    dots_rs::init_tracing("");
 
     // Link-time-collected lists of types this binary actually touches.
     // Populated by `subscribe::<T>` / `publish::<T>` monomorphizations

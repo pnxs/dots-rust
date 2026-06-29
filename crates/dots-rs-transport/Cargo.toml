@@ -1,0 +1,54 @@
+[package]
+name = "dots-rs-transport"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Async transport for dots-rust: tokio_util::codec adapter for v2 transmission framing."
+
+[features]
+default = ["stats"]
+# Opt-in helper that installs a `tracing_subscriber` with sensible
+# defaults — see `dots_transport::init_tracing`. Off by default so
+# library consumers aren't forced to pull `tracing-subscriber`.
+tracing-init = ["dep:tracing-subscriber"]
+# Per-guest I/O statistics: counter bumps on every enqueue/drain
+# (write side) and every decoded frame (read side), plus the
+# `GuestStats` accessor surface. Default-on. Disable to remove all
+# per-event accounting overhead — counters compile away, accessors
+# return `None` / empty, and `ConnectionTransition.final_stats` is
+# always `None`. See `GuestStats` / `HostTransceiver::guest_stats`.
+stats = []
+
+[dependencies]
+dots-rs-core.workspace = true
+dots-rs-model.workspace = true
+
+bytes.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync", "macros", "net", "rt", "signal"] }
+tokio-util = { workspace = true, features = ["codec"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, optional = true }
+sha2.workspace = true
+rand.workspace = true
+rustc-hash.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+# Path-only (no version) so they are stripped from the published manifest;
+# tests derive types whose generated code routes through `::dots_rs::__rt`,
+# and the dev-dependency cycle (dots-rs → dots-rs-transport) is allowed.
+dots-rs-derive = { path = "../dots-rs-derive" }
+dots-rs = { path = "../dots-rs" }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time"] }
+tokio-util = { workspace = true, features = ["codec"] }
+sha2.workspace = true
+
+[lints]
+workspace = true

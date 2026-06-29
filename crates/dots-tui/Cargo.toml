@@ -9,8 +9,8 @@ publish = false
 description = "Terminal UI showing connected DOTS clients and per-client statistics."
 
 [dependencies]
-dots-model.workspace = true
-dots-transport.workspace = true
+dots-rs-model.workspace = true
+dots-rs-transport.workspace = true
 
 tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

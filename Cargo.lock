@@ -180,123 +180,104 @@ dependencies = [
 ]
 
 [[package]]
-name = "dots-build"
-version = "0.1.0"
-
-[[package]]
 name = "dots-build-test"
 version = "0.1.0"
 dependencies = [
- "dots-build",
- "dots-core",
- "dots-derive",
- "dots-model",
-]
-
-[[package]]
-name = "dots-core"
-version = "0.1.0"
-dependencies = [
- "dots-derive",
- "linkme",
- "minicbor",
+ "dots-rs",
+ "dots-rs-build",
 ]
 
 [[package]]
 name = "dots-demo-client"
 version = "0.1.0"
 dependencies = [
- "dots-core",
- "dots-derive",
- "dots-model",
- "dots-transport",
+ "dots-rs",
  "tokio",
-]
-
-[[package]]
-name = "dots-derive"
-version = "0.1.0"
-dependencies = [
- "dots-core",
- "dots-model",
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
 name = "dots-example"
 version = "0.1.0"
 dependencies = [
- "dots-core",
- "dots-derive",
- "dots-model",
-]
-
-[[package]]
-name = "dots-model"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "dots-core",
- "dots-derive",
+ "dots-rs",
 ]
 
 [[package]]
 name = "dots-pinger-filtered"
 version = "0.1.0"
 dependencies = [
- "dots-core",
- "dots-derive",
- "dots-model",
- "dots-transport",
+ "dots-rs",
  "rand",
  "tokio",
 ]
 
 [[package]]
-name = "dots-smarthome"
+name = "dots-rs"
 version = "0.1.0"
 dependencies = [
- "dots-build",
- "dots-core",
- "dots-derive",
- "dots-model",
- "dots-transport",
- "tokio",
- "tracing",
+ "dots-rs-core",
+ "dots-rs-derive",
+ "dots-rs-model",
+ "dots-rs-testing",
+ "dots-rs-transport",
 ]
 
 [[package]]
-name = "dots-testing"
+name = "dots-rs-build"
+version = "0.1.0"
+
+[[package]]
+name = "dots-rs-core"
 version = "0.1.0"
 dependencies = [
- "dots-core",
- "dots-derive",
- "dots-model",
- "dots-transport",
- "tokio",
- "tracing",
+ "dots-rs-derive",
+ "linkme",
+ "minicbor",
 ]
 
 [[package]]
-name = "dots-trace"
+name = "dots-rs-derive"
 version = "0.1.0"
 dependencies = [
- "dots-core",
- "dots-model",
- "dots-transport",
- "tokio",
+ "dots-rs",
+ "dots-rs-core",
+ "dots-rs-model",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
-name = "dots-transport"
+name = "dots-rs-model"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "dots-core",
- "dots-derive",
- "dots-model",
+ "dots-rs-core",
+ "dots-rs-derive",
+]
+
+[[package]]
+name = "dots-rs-testing"
+version = "0.1.0"
+dependencies = [
+ "dots-rs",
+ "dots-rs-core",
+ "dots-rs-derive",
+ "dots-rs-model",
+ "dots-rs-transport",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dots-rs-transport"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "dots-rs",
+ "dots-rs-core",
+ "dots-rs-derive",
+ "dots-rs-model",
  "futures-util",
  "parking_lot",
  "rand",
@@ -309,12 +290,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "dots-smarthome"
+version = "0.1.0"
+dependencies = [
+ "dots-rs",
+ "dots-rs-build",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dots-trace"
+version = "0.1.0"
+dependencies = [
+ "dots-rs-core",
+ "dots-rs-model",
+ "dots-rs-transport",
+ "tokio",
+]
+
+[[package]]
 name = "dots-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
- "dots-model",
- "dots-transport",
+ "dots-rs-model",
+ "dots-rs-transport",
  "futures-util",
  "ratatui",
  "tokio",
@@ -324,9 +325,9 @@ dependencies = [
 name = "dotsd"
 version = "0.1.0"
 dependencies = [
- "dots-core",
- "dots-model",
- "dots-transport",
+ "dots-rs-core",
+ "dots-rs-model",
+ "dots-rs-transport",
  "tokio",
  "tracing",
 ]

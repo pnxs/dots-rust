@@ -9,10 +9,7 @@ publish = false
 description = "End-to-end smoke test of server-side filtered subscriptions — opens a View<Pinger> with predicate (sequence < 100) and exercises the broker's four-cases dispatch."
 
 [dependencies]
-dots-core.workspace = true
-dots-derive.workspace = true
-dots-model.workspace = true
-dots-transport = { workspace = true, features = ["tracing-init"] }
+dots-rs = { workspace = true, features = ["tracing-init"] }
 
 tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
 rand.workspace = true

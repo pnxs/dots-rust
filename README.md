@@ -16,19 +16,38 @@ peers without a compiled-in copy can still decode wire payloads.
 This crate set is a from-scratch Rust implementation. It links against
 nothing from `dots-cpp`; the wire format is the only contract.
 
+## Installation
+
+Applications depend on a single crate, **`dots-rs`**, which re-exports the
+whole API (runtime, derive macros, async transport):
+
+```toml
+[dependencies]
+dots-rs = "0.1"
+
+# Only when compiling `.dots` schema files at build time:
+[build-dependencies]
+dots-rs-build = "0.1"
+```
+
 ## Layout
 
-| Crate              | Role                                                                            |
-|--------------------|---------------------------------------------------------------------------------|
-| `dots-core`        | Type-system primitives: descriptors, `StructValue`, `PropertySet`, encode/decode |
-| `dots-derive`      | `#[derive(DotsStruct)]` and `#[derive(DotsEnum)]` proc-macros                    |
-| `dots-model`       | DOTS-internal types (handshake, framing, daemon records, descriptor exchange)    |
-| `dots-transport`   | Async transport: codec, `Connection`, `GuestTransceiver`, `HostTransceiver`, `App` |
-| `dots-build`       | Compile `.dots` files into Rust source from a `build.rs`                         |
-| `dots-build-test`  | Compile-test fixture for `dots-build`                                            |
-| `dotsd`            | Broker daemon binary — listens on `tcp://` and/or `uds://` endpoints             |
-| `dots-demo-client` | Sample guest that publishes and subscribes to `Pinger`                           |
-| `dots-example`    | Minimal `#[derive(DotsStruct)]` demonstration                                     |
+The published crates are named under the `dots-rs` prefix (the bare `dots`
+name was taken on crates.io). `dots-rs` is the umbrella; the rest are its
+building blocks and are pulled in transitively.
+
+| Crate               | Role                                                                              |
+|---------------------|----------------------------------------------------------------------------------|
+| `dots-rs`           | **Umbrella** — re-exports everything; the only crate apps depend on              |
+| `dots-rs-core`      | Type-system primitives: descriptors, `StructValue`, `PropertySet`, encode/decode |
+| `dots-rs-derive`    | `#[derive(DotsStruct)]` and `#[derive(DotsEnum)]` proc-macros                    |
+| `dots-rs-model`     | DOTS-internal types (handshake, framing, daemon records, descriptor exchange)    |
+| `dots-rs-transport` | Async transport: codec, `Connection`, `GuestTransceiver`, `HostTransceiver`, `App` |
+| `dots-rs-build`     | Compile `.dots` files into Rust source from a `build.rs` (build-dependency)      |
+| `dots-build-test`   | Compile-test fixture for `dots-rs-build`                                         |
+| `dotsd`             | Broker daemon binary — listens on `tcp://` and/or `uds://` endpoints             |
+| `dots-demo-client`  | Sample guest that publishes and subscribes to `Pinger`                           |
+| `dots-example`      | Minimal `#[derive(DotsStruct)]` demonstration                                    |
 
 ## Quick start
 
@@ -74,8 +93,7 @@ cargo run -p dotsd -- tcp://0.0.0.0:11235 uds:///tmp/dotsd.sock
 Either declare types directly in Rust:
 
 ```rust
-use dots_core::{StructValue, dots};
-use dots_derive::DotsStruct;
+use dots_rs::{StructValue, dots, DotsStruct};
 
 #[derive(DotsStruct, Default, Debug, Clone)]
 #[dots(name = "Pinger", cached)]
@@ -93,15 +111,18 @@ Or compile `.dots` files at build time:
 ```toml
 # Cargo.toml
 [build-dependencies]
-dots-build = { path = "../dots-build" }
+dots-rs-build = "0.1"
 ```
 
 ```rust
 // build.rs
 fn main() {
-    dots_build::compile(&["proto/types.dots"]).unwrap();
+    dots_rs_build::compile(&["proto/types.dots"]).unwrap();
 }
 ```
+
+The generated code refers to the runtime through `dots_rs::…`, so the
+crate must also depend on `dots-rs`.
 
 ```rust
 // src/lib.rs
@@ -114,14 +135,14 @@ visible to `rust-analyzer` for completion and hover-docs.
 ## Using the App API
 
 ```rust
-use dots_transport::App;
+use dots_rs::App;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let app = App::connect("127.0.0.1:11235", "my-client").await?;
+    let app = App::connect_tcp("127.0.0.1:11235", "my-client").await?;
 
     let _sub = app.subscribe::<Pinger>(|event| {
-        println!("got {:?} from {:?}", event.value, event.header.sender);
+        println!("got {:?} from {:?}", event.transmitted, event.header.sender);
     });
 
     let client = app.client();
@@ -129,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 1u64.. {
             client.publish(&Pinger {
                 id: Some(0), message: Some("hi".into()), sequence: Some(i),
-            }).ok();
+            });
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     });
@@ -173,4 +194,4 @@ Known gaps:
 
 ## License
 
-LGPL-3.0
+LGPL-3.0-only

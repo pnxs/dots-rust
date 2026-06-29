@@ -31,9 +31,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use dots_core::dots;
-use dots_model::*;
-use dots_transport::{
+use dots_rs_core::dots;
+use dots_rs_model::*;
+use dots_rs_transport::{
     ConnectionTransition, Endpoint, EndpointHandle, GuestStats, HostTransceiver, parse_endpoint,
 };
 
@@ -48,7 +48,7 @@ const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dots_transport::init_tracing("");
+    dots_rs_transport::init_tracing("");
 
     let Args {
         name: daemon_name,

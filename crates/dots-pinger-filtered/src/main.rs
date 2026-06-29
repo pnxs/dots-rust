@@ -17,12 +17,12 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dots_core::dots;
-use dots_model::filter::predicate;
-use dots_transport::{App, ViewOp};
+use dots_rs::dots;
+use dots_rs::filter::predicate;
+use dots_rs::{App, ViewOp};
 
 mod model {
-    use dots_derive::DotsStruct;
+    use dots_rs::DotsStruct;
     #[derive(DotsStruct, Default, Debug, Clone)]
     #[dots(name = "Pinger", cached)]
     pub struct Pinger {
@@ -57,7 +57,7 @@ fn op_name(op: ViewOp) -> &'static str {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    dots_transport::init_tracing("");
+    dots_rs::init_tracing("");
 
     let app = match App::new(CLIENT_NAME).await {
         Ok(a) => a,

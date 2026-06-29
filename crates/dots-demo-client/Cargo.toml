@@ -9,10 +9,7 @@ publish = false
 description = "Minimal demo client that connects to a DOTS broker (dotsd) over TCP."
 
 [dependencies]
-dots-core.workspace = true
-dots-derive.workspace = true
-dots-model.workspace = true
-dots-transport = { workspace = true, features = ["tracing-init"] }
+dots-rs = { workspace = true, features = ["tracing-init"] }
 
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "time"] }
 

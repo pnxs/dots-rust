@@ -1,0 +1,20 @@
+[package]
+name = "dots-rs-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Core types for dots-rust: PropertySet, descriptors, StructValue, dots! macro."
+
+[dependencies]
+minicbor.workspace = true
+linkme.workspace = true
+dots-rs-derive.workspace = true
+
+[lints]
+workspace = true

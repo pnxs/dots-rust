@@ -1,0 +1,32 @@
+[package]
+name = "dots-rs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "DOTS pub/sub for Rust — the umbrella crate. Re-exports the runtime, derive macros, and async transport so a single dependency covers the whole API."
+readme = "README.md"
+keywords = ["pubsub", "dots", "serialization", "realtime", "tokio"]
+categories = ["network-programming", "encoding"]
+
+[features]
+# Per-guest I/O statistics, forwarded to dots-rs-transport. On by default.
+default = ["stats"]
+stats = ["dots-rs-transport/stats"]
+# Opt-in `init_tracing` helper (pulls tracing-subscriber via the transport).
+tracing-init = ["dots-rs-transport/tracing-init"]
+# In-process Host + Guest test harness, exposed as `dots_rs::testing`.
+testing = ["dep:dots-rs-testing"]
+
+[dependencies]
+dots-rs-core.workspace = true
+dots-rs-derive.workspace = true
+dots-rs-model.workspace = true
+dots-rs-transport.workspace = true
+dots-rs-testing = { workspace = true, optional = true }
+
+[lints]
+workspace = true

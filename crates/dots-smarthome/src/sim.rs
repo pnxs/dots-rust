@@ -15,16 +15,16 @@ use dots_smarthome::ids::{
     BASEMENT_MOTION_SWITCH, LIVING_ROOM_MASTER_DIMMER, STAIRWELL_LOWER_SWITCH,
     STAIRWELL_UPPER_SWITCH,
 };
-use dots_core::dots;
+use dots_rs::dots;
 use dots_smarthome::model::{Dimmer, StatelessSwitch, Switch};
-use dots_transport::App;
+use dots_rs::App;
 use dots_smarthome::*;
 
 const APP_NAME: &str = "smart-home-sim";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dots_transport::init_tracing("");
+    dots_rs::init_tracing("");
 
     let app = App::new(APP_NAME).await?;
     let client = app.client();

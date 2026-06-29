@@ -4,9 +4,9 @@
 //! publish the same `brightness` to both `LIVING_ROOM_COUCH_LIGHT`
 //! and `LIVING_ROOM_CEILING_LIGHT`.
 
-use dots_transport::{App, SubscriptionHandle};
+use dots_rs::{App, SubscriptionHandle};
 
-use dots_core::dots;
+use dots_rs::dots;
 
 use crate::ids::{LIVING_ROOM_CEILING_LIGHT, LIVING_ROOM_COUCH_LIGHT, LIVING_ROOM_MASTER_DIMMER};
 use crate::model::*;

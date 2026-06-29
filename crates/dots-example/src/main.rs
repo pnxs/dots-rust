@@ -13,16 +13,16 @@
 //!   typed Foo → bytes → decode-typed → typed Foo
 //!   bytes     → decode-dynamic       → AnyStruct
 //!
-//! [`AnyStruct`]: dots_core::AnyStruct
+//! [`AnyStruct`]: dots_rs::AnyStruct
 
 use std::sync::Arc;
 
-use dots_core::{
+use dots_rs::{
     AnyStruct, DynamicStruct, DynamicStructDescriptor, FieldKind, StructValue,
     decode_typed_from_slice, dots, encode_to_vec,
 };
 mod model {
-    use dots_derive::DotsStruct;
+    use dots_rs::DotsStruct;
 
     #[derive(DotsStruct, Default, Debug, Clone)]
     #[dots(name = "Address")]

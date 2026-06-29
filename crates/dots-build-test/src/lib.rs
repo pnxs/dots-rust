@@ -11,7 +11,7 @@ include!(concat!(env!("OUT_DIR"), "/dots_generated.rs"));
 #[cfg(test)]
 mod tests {
     use super::types::{DotsClient, DotsConnectionState, Pinger, StatusReport};
-    use dots_core::StructValue;
+    use dots_rs::StructValue;
 
     #[test]
     fn generated_pinger_has_expected_descriptor_name() {
@@ -30,10 +30,10 @@ mod tests {
     fn generated_status_uses_temporal_newtypes() {
         let s = StatusReport {
             server_name: "srv".into(),
-            start_time: Some(dots_core::Timepoint(123.0)),
-            uptime: Some(dots_core::Duration(45.0)),
+            start_time: Some(dots_rs::Timepoint(123.0)),
+            uptime: Some(dots_rs::Duration(45.0)),
         };
-        assert_eq!(s.start_time, Some(dots_core::Timepoint(123.0)));
-        assert_eq!(s.uptime, Some(dots_core::Duration(45.0)));
+        assert_eq!(s.start_time, Some(dots_rs::Timepoint(123.0)));
+        assert_eq!(s.uptime, Some(dots_rs::Duration(45.0)));
     }
 }

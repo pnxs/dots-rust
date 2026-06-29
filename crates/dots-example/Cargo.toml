@@ -9,12 +9,7 @@ publish = false
 description = "Demonstrates the dots-rust type-system foundation."
 
 [dependencies]
-dots-core.workspace = true
-dots-derive.workspace = true
-# Derive macros emit `::dots_model::filter::Attr<...>` constants for
-# every DSL-supported leaf field; consumers therefore need dots-model
-# as a runtime dep even when they only use the typed-struct surface.
-dots-model.workspace = true
+dots-rs.workspace = true
 
 [lints]
 workspace = true

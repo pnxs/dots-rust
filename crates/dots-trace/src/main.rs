@@ -17,7 +17,7 @@
 //!   against the registry and printed in place, rather than shown as an
 //!   opaque `any<Type>[N bytes]` blob).
 //!
-//! [`Registry::display_struct`]: dots_model::Registry::display_struct
+//! [`Registry::display_struct`]: dots_rs_model::Registry::display_struct
 //!
 //! ```text
 //! ./dotsd                                              # in one terminal
@@ -26,16 +26,16 @@
 //! ```
 //!
 //! Override the log level via `RUST_LOG`, e.g.
-//! `RUST_LOG=dots_transport=debug cargo run --bin dots-trace`.
+//! `RUST_LOG=dots_rs_transport=debug cargo run --bin dots-trace`.
 
-use dots_model::DotsDescriptorRequest;
-use dots_transport::App;
+use dots_rs_model::DotsDescriptorRequest;
+use dots_rs_transport::App;
 
 const CLIENT_NAME: &str = "dots-trace";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dots_transport::init_tracing("");
+    dots_rs_transport::init_tracing("");
 
     let app = App::new(CLIENT_NAME).await?;
 
