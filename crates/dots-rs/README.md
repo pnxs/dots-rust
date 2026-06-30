@@ -45,8 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Feature flags
 
 - `stats` (default) — per-guest I/O statistics.
-- `tracing-init` — the `init_tracing` helper (pulls `tracing-subscriber`).
-- `testing` — the in-process Host + Guest test harness, as `dots_rs::testing`.
+- `tracing-init` (default) — the `init_tracing` helper (pulls `tracing-subscriber`).
+- `testing` (default) — the in-process Host + Guest test harness, as `dots_rs::testing`.
 
 See the [repository](https://github.com/pnxs/dots-rust) for the broker daemon
 (`dotsd`), runnable examples, and design notes.

@@ -14,7 +14,7 @@ categories = ["network-programming", "encoding"]
 
 [features]
 # Per-guest I/O statistics, forwarded to dots-rs-transport. On by default.
-default = ["stats"]
+default = ["stats", "tracing-init", "testing"]
 stats = ["dots-rs-transport/stats"]
 # Opt-in `init_tracing` helper (pulls tracing-subscriber via the transport).
 tracing-init = ["dots-rs-transport/tracing-init"]
