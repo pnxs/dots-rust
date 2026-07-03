@@ -1295,7 +1295,7 @@ where
         &mut self,
         txn: &Transmission,
         _has_subscribers: bool,
-        _shared: &mut DispatchShared,
+        shared: &mut DispatchShared,
     ) -> Result<bool, dots_rs_core::DecodeError> {
         // The wire-decode normally lands in `Payload::Wire` for
         // dynamic-only types. But `subscribe_all_types` can install
@@ -1307,29 +1307,48 @@ where
             dots_rs_model::Payload::Wire(d) => d.clone(),
             dots_rs_model::Payload::Typed(a) => DynamicStruct::from_struct_value(a),
         };
-        // Dynamic subscribers have no typed container to classify
-        // against, so events follow uncached semantics: the transmitted
-        // value is also the updated value, and the operation is create
-        // (or remove when the header flags a deletion), mirroring
-        // dots-cpp's handling of types without a local cache.
-        // `DynamicStruct` isn't a `StructValue`, so build the event from
-        // parts rather than through `Event::new`.
-        let operation = if txn.header.remove_obj == Some(true) {
-            Operation::Remove
-        } else {
-            Operation::Create
-        };
-        let clone_info = CloneInfo {
-            last_operation: operation,
-            last_update_time: txn.header.sent_time,
-            last_update_sender: txn.header.sender,
-            created_time: txn.header.sent_time,
-            created_sender: txn.header.sender,
+        // When a cached container for the type ran (pass 1), classify
+        // against its outcome exactly like a statically-typed
+        // subscriber: create vs update from the cache, the post-merge
+        // instance as `updated`, and suppressed dispatches (remove of
+        // an absent key) fire no handler — matching dots-cpp, where a
+        // dynamically added handler on a cached type uses the type's
+        // container. Without a container (wire-only types), events
+        // follow uncached semantics: the transmitted value is also the
+        // updated value, and the operation is create (or remove when
+        // the header flags a deletion).
+        //
+        // `DynamicStruct` isn't a `StructValue`, so the event is built
+        // from parts rather than through `Event::from_shared` (the
+        // outcome's `Arc<T>` sharing is typed-only; dynamic subscribers
+        // project the post-merge instance per subscriber).
+        let (operation, updated, clone_info) = match shared {
+            DispatchShared::Cached(outcome) => (
+                outcome.operation,
+                DynamicStruct::from_struct_value(&outcome.updated),
+                outcome.clone_info.clone(),
+            ),
+            DispatchShared::Suppressed => return Ok(true),
+            DispatchShared::Uncached => {
+                let operation = if txn.header.remove_obj == Some(true) {
+                    Operation::Remove
+                } else {
+                    Operation::Create
+                };
+                let clone_info = CloneInfo {
+                    last_operation: operation,
+                    last_update_time: txn.header.sent_time,
+                    last_update_sender: txn.header.sender,
+                    created_time: txn.header.sent_time,
+                    created_sender: txn.header.sender,
+                };
+                (operation, dyn_value.clone(), clone_info)
+            }
         };
         let event = Event::from_parts(
             txn.header.clone(),
-            dyn_value.clone(),
-            Arc::new(dyn_value),
+            dyn_value,
+            Arc::new(updated),
             operation,
             clone_info,
         );

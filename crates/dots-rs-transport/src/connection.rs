@@ -15,7 +15,7 @@
 //! TCP, Unix domain sockets, or any in-memory pipe like
 //! [`tokio::io::duplex`] for testing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
@@ -606,12 +606,13 @@ pub(crate) fn stamp_is_from_myself(header: &mut DotsHeader, my_client_id: Option
 ///
 /// New subscribers registered during a dispatch don't see this
 /// transmission (they're put back behind the entries we just
-/// processed and only see future events). Subscribers that
-/// `drop()` themselves from inside a handler run their unregister
-/// while we hold no lock — but their type's entries vec is
-/// momentarily missing from state, so the unregister silently
-/// no-ops. The retain_mut return value is the canonical way to
-/// drop self-from-dispatch and is unaffected.
+/// processed and only see future events). Subscriptions dropped
+/// during a dispatch of their own type are recorded in
+/// `DispatchState::pending_unregister` (the type's entries vec is
+/// momentarily out of the map): the loop skips them for the current
+/// transmission — a removed handler must not fire, matching
+/// dots-cpp's `Dispatcher::m_removeIds` — and the put-back drops
+/// them for good.
 fn dispatch_external(dispatch: &Arc<Mutex<DispatchState>>, txn: &Transmission) {
     // Filtered subscription demux: if the broker tagged this
     // transmission with a `subscription_id`, it's destined for a
@@ -635,19 +636,54 @@ fn dispatch_external(dispatch: &Arc<Mutex<DispatchState>>, txn: &Transmission) {
 
     let taken = {
         let mut state = dispatch.lock().expect("dispatch mutex poisoned");
-        state.entries.remove(type_name)
+        state.take_entries_for_dispatch(type_name)
     };
     let Some(mut entries) = taken else {
         return;
     };
 
-    dispatch_entries_borrowed(&mut entries, txn, type_name);
+    dispatch_entries_borrowed(dispatch, &mut entries, txn, type_name);
 
+    put_back_entries(dispatch, type_name, entries);
+}
+
+/// Put a type's entries back after a dispatch: drop entries that were
+/// unregistered mid-dispatch, splice entries registered mid-dispatch
+/// in behind the survivors, and clear the mid-dispatch marker.
+fn put_back_entries(
+    dispatch: &Arc<Mutex<DispatchState>>,
+    type_name: &str,
+    mut entries: DispatchEntries,
+) {
     let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+    state.dispatching.remove(type_name);
+    if let Some(removed) = state.pending_unregister.remove(type_name) {
+        entries.retain(|(id, _)| !removed.contains(id));
+    }
     let slot = state.entries.entry(type_name.to_string()).or_default();
     let added_during_dispatch = std::mem::take(slot);
     *slot = entries;
     slot.extend(added_during_dispatch);
+    if slot.is_empty() {
+        state.entries.remove(type_name);
+    }
+}
+
+/// Whether `id` was unregistered while its type's dispatch is in
+/// flight. Such an entry must not be invoked for the current
+/// transmission (dots-cpp: a handler removed during dispatch does not
+/// fire); it is dropped at put-back.
+fn unregistered_mid_dispatch(
+    dispatch: &Arc<Mutex<DispatchState>>,
+    type_name: &str,
+    id: u64,
+) -> bool {
+    dispatch
+        .lock()
+        .expect("dispatch mutex poisoned")
+        .pending_unregister
+        .get(type_name)
+        .is_some_and(|ids| ids.contains(&id))
 }
 
 /// Dispatch `txn` (borrowed) to a type's entries with the container(s)
@@ -659,20 +695,37 @@ fn dispatch_external(dispatch: &Arc<Mutex<DispatchState>>, txn: &Transmission) {
 /// that the subscribers then read, so the partial-update merge and
 /// create/update/remove classification happen exactly once per
 /// transmission instead of once per subscriber.
-fn dispatch_entries_borrowed(entries: &mut DispatchEntries, txn: &Transmission, type_name: &str) {
+fn dispatch_entries_borrowed(
+    dispatch: &Arc<Mutex<DispatchState>>,
+    entries: &mut DispatchEntries,
+    txn: &Transmission,
+    type_name: &str,
+) {
     let has_subscribers = entries.iter().any(|(_, e)| !e.wants_owned());
     let mut shared = DispatchShared::Uncached;
     let mut keep = vec![true; entries.len()];
 
+    // Both passes re-check `pending_unregister` before invoking each
+    // entry: a handler removed by an earlier handler of the SAME
+    // transmission must not fire for it (dots-cpp contract).
+    //
     // Pass 1 — containers: apply the update and publish the outcome.
-    for (i, (_, entry)) in entries.iter_mut().enumerate() {
+    for (i, (id, entry)) in entries.iter_mut().enumerate() {
         if entry.wants_owned() {
+            if unregistered_mid_dispatch(dispatch, type_name, *id) {
+                keep[i] = false;
+                continue;
+            }
             keep[i] = dispatch_keep(entry.dispatch(txn, has_subscribers, &mut shared), type_name);
         }
     }
     // Pass 2 — subscribers: build events from the post-update outcome.
-    for (i, (_, entry)) in entries.iter_mut().enumerate() {
+    for (i, (id, entry)) in entries.iter_mut().enumerate() {
         if !entry.wants_owned() {
+            if unregistered_mid_dispatch(dispatch, type_name, *id) {
+                keep[i] = false;
+                continue;
+            }
             keep[i] = dispatch_keep(entry.dispatch(txn, has_subscribers, &mut shared), type_name);
         }
     }
@@ -713,7 +766,7 @@ fn dispatch_external_owned(dispatch: &Arc<Mutex<DispatchState>>, txn: Transmissi
 
     let taken = {
         let mut state = dispatch.lock().expect("dispatch mutex poisoned");
-        state.entries.remove(&type_name)
+        state.take_entries_for_dispatch(&type_name)
     };
     let Some(mut entries) = taken else {
         // No handlers for this type — the owned `txn` simply drops.
@@ -725,7 +778,7 @@ fn dispatch_external_owned(dispatch: &Arc<Mutex<DispatchState>>, txn: Transmissi
         // Subscribers need the transmission alive for `transmitted` (and
         // run after the container), so the payload can't be moved in —
         // fall back to the borrowing, container-first path.
-        dispatch_entries_borrowed(&mut entries, &txn, &type_name);
+        dispatch_entries_borrowed(dispatch, &mut entries, &txn, &type_name);
     } else {
         // No subscribers: the container is the sole consumer, so hand the
         // last owner the moved payload (the zero-clone fan-in).
@@ -753,11 +806,7 @@ fn dispatch_external_owned(dispatch: &Arc<Mutex<DispatchState>>, txn: Transmissi
         }
     }
 
-    let mut state = dispatch.lock().expect("dispatch mutex poisoned");
-    let slot = state.entries.entry(type_name).or_default();
-    let added_during_dispatch = std::mem::take(slot);
-    *slot = entries;
-    slot.extend(added_during_dispatch);
+    put_back_entries(dispatch, &type_name, entries);
 }
 
 /// Retain decision for one dispatch call, with the same warn-on-decode-
@@ -1102,6 +1151,19 @@ pub(crate) struct DispatchState {
     /// the table key here only happens when `_unregister_view` is
     /// called explicitly (typically from `View<T>::drop`).
     pub(crate) views: HashMap<u32, std::sync::Weak<dyn ViewDispatch>>,
+    /// Types whose entries vec is currently taken out of `entries`
+    /// for a dispatch (see [`dispatch_external`]). While a type is
+    /// listed here, [`unregister`](Self::unregister) can't find the
+    /// entry in the map — it records the id in `pending_unregister`
+    /// instead so the dispatch loop can honor the removal.
+    dispatching: HashSet<String>,
+    /// Ids unregistered while their type was mid-dispatch — the
+    /// analogue of dots-cpp `Dispatcher::m_removeIds`. The dispatch
+    /// loop skips these entries for the current transmission
+    /// (a handler removed during dispatch must not fire, matching
+    /// dots-cpp) and drops them at put-back. Cleared per type when
+    /// its dispatch completes.
+    pending_unregister: HashMap<String, HashSet<u64>>,
 }
 
 /// Type-erased view dispatch. Implementations decode the payload
@@ -1125,6 +1187,11 @@ impl DispatchState {
     }
 
     /// Remove an entry by `(type_name, id)`. No-op if it isn't present.
+    ///
+    /// If the type's entries are currently taken out for a dispatch,
+    /// the id is additionally recorded in `pending_unregister` so the
+    /// in-flight dispatch skips the entry (it must not fire for the
+    /// current transmission) and drops it at put-back.
     pub(crate) fn unregister(&mut self, type_name: &str, id: u64) {
         if let Some(entries) = self.entries.get_mut(type_name) {
             entries.retain(|(eid, _)| *eid != id);
@@ -1132,6 +1199,23 @@ impl DispatchState {
                 self.entries.remove(type_name);
             }
         }
+        if self.dispatching.contains(type_name) {
+            self.pending_unregister
+                .entry(type_name.to_string())
+                .or_default()
+                .insert(id);
+        }
+    }
+
+    /// Take a type's entries out for dispatch, marking the type as
+    /// mid-dispatch so concurrent/reentrant `unregister` calls are
+    /// deferred into `pending_unregister`.
+    fn take_entries_for_dispatch(&mut self, type_name: &str) -> Option<DispatchEntries> {
+        let taken = self.entries.remove(type_name);
+        if taken.is_some() {
+            self.dispatching.insert(type_name.to_string());
+        }
+        taken
     }
 
     /// Register a filtered-subscription dispatcher under
