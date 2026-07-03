@@ -1,10 +1,11 @@
 //! Filter builder DSL: typed `Attr<S, V>` handles, operator
 //! overloads, n-ary collapse, projection.
 
-use dots_rs_core::PropertySet;
+use dots_rs_core::{DynamicStruct, DynamicStructDescriptor, PropertySet, dots};
 use dots_rs_model::filter::{
     DotsCompareOp, DotsPredicateKind, predicate, project_only,
 };
+use dots_rs_transport::filter::CompiledPredicate;
 
 mod model {
     use dots_rs_derive::DotsStruct;
@@ -118,6 +119,45 @@ fn is_null_and_not_null() {
     let nodes = f.predicate.unwrap().nodes.unwrap();
     let leaf = nodes[0].leaf.as_ref().unwrap();
     assert_eq!(leaf.op, Some(DotsCompareOp::NotNull));
+}
+
+/// Ports `TestFilterBuilder.not_and_or_compose` from dots-cpp as a
+/// build-then-evaluate round trip: `id == 1 | !(message == "skip")`
+/// built via the DSL, compiled, and asserted against live payloads —
+/// the other builder tests only check wire shape, never evaluation.
+#[test]
+fn not_and_or_compose_round_trip() {
+    let payload_of = |s: &Pinger| {
+        let bytes = dots_rs_core::encode_to_vec(s);
+        DynamicStruct::decode(
+            std::sync::Arc::new(DynamicStructDescriptor::from_static(Pinger::DESCRIPTOR)),
+            &bytes,
+        )
+        .expect("decode")
+    };
+
+    // id == 1 OR message != "skip"
+    let p = Pinger::ID.eq(1_u32) | !Pinger::MESSAGE.eq("skip".to_string());
+    let f = predicate(p).build();
+    let pred = f.predicate.expect("predicate present");
+    let descriptor = DynamicStructDescriptor::from_static(Pinger::DESCRIPTOR);
+    let compiled = CompiledPredicate::compile(&pred, &descriptor).unwrap();
+
+    // a holds
+    assert!(compiled.matches(&payload_of(&dots!(Pinger {
+        id: 1_u32,
+        message: "skip",
+    }))));
+    // !b holds
+    assert!(compiled.matches(&payload_of(&dots!(Pinger {
+        id: 2_u32,
+        message: "ok",
+    }))));
+    // neither holds
+    assert!(!compiled.matches(&payload_of(&dots!(Pinger {
+        id: 2_u32,
+        message: "skip",
+    }))));
 }
 
 #[test]

@@ -121,3 +121,84 @@ impl DotsField for Duration {
 impl DotsTypeKind for Duration {
     const KIND: FieldKind = FieldKind::Duration;
 }
+
+#[cfg(test)]
+mod tests {
+    //! Wire-byte expectations copied from dots-cpp's
+    //! `tests/src/serialization/TestCborSerializer.cpp`
+    //! (`CborSerializerTestDataEncoded::timePoint1` / `duration1` /
+    //! `duration2` / `float64Zero`). Both temporal types must encode as
+    //! a plain CBOR float64 (`0xFB` + 8 bytes IEEE 754) — never shrunk
+    //! to float32/float16 — to stay byte-compatible with dots-cpp.
+
+    use alloc::vec::Vec;
+
+    use super::*;
+
+    fn encode_field<T: DotsField>(value: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut e: CborEncoder<'_> = minicbor::Encoder::new(&mut buf);
+        value
+            .dots_encode(&mut e)
+            .expect("Vec writes are infallible");
+        buf
+    }
+
+    fn decode_field<T: DotsField>(bytes: &[u8]) -> T {
+        let mut d: CborDecoder<'_> = minicbor::Decoder::new(bytes);
+        let value = T::dots_decode(&mut d).expect("decode succeeds");
+        assert_eq!(d.position(), bytes.len(), "decode must consume all bytes");
+        value
+    }
+
+    /// cpp `timePoint1`: "2020-03-11T21:07:57.500+00:00" is
+    /// 1583960877.5 seconds since the Unix epoch.
+    #[test]
+    fn timepoint_golden_wire_bytes() {
+        const TIMEPOINT1: &[u8] = &[0xFB, 0x41, 0xD7, 0x9A, 0x54, 0xCB, 0x60, 0x00, 0x00];
+        let tp = Timepoint(1583960877.5);
+        let bytes = encode_field(&tp);
+        assert_eq!(bytes, TIMEPOINT1);
+        assert_eq!(decode_field::<Timepoint>(&bytes), tp);
+    }
+
+    /// cpp `duration1` (123.456 s) and `duration2` (5min + 42s + 73ms).
+    #[test]
+    fn duration_golden_wire_bytes() {
+        const DURATION1: &[u8] = &[0xFB, 0x40, 0x5E, 0xDD, 0x2F, 0x1A, 0x9F, 0xBE, 0x77];
+        const DURATION2: &[u8] = &[0xFB, 0x40, 0x75, 0x61, 0x2B, 0x02, 0x0C, 0x49, 0xBA];
+
+        let d1 = Duration(123.456);
+        let bytes = encode_field(&d1);
+        assert_eq!(bytes, DURATION1);
+        assert_eq!(decode_field::<Duration>(&bytes), d1);
+
+        let d2 = Duration(342.073);
+        let bytes = encode_field(&d2);
+        assert_eq!(bytes, DURATION2);
+        assert_eq!(decode_field::<Duration>(&bytes), d2);
+    }
+
+    /// cpp `float64Zero`: 0.0 stays a full float64 (`0xFB` + 8 zero
+    /// bytes) — no shrinking to a shorter float encoding.
+    #[test]
+    fn zero_values_stay_float64() {
+        const FLOAT64_ZERO: &[u8] = &[0xFB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(encode_field(&Timepoint(0.0)), FLOAT64_ZERO);
+        assert_eq!(encode_field(&Duration(0.0)), FLOAT64_ZERO);
+    }
+
+    /// The temporal types are distinguishable from raw `f64` only via
+    /// their `FieldKind` — descriptor metadata, never wire bytes.
+    #[test]
+    fn field_kind_routing() {
+        assert!(matches!(
+            <Timepoint as DotsTypeKind>::KIND,
+            FieldKind::Timepoint
+        ));
+        assert!(matches!(
+            <Duration as DotsTypeKind>::KIND,
+            FieldKind::Duration
+        ));
+    }
+}

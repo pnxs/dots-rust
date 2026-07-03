@@ -117,6 +117,20 @@ mod tests {
         assert_eq!(ep, Endpoint::Tcp("0.0.0.0:11235".into()));
     }
 
+    /// Bracketed IPv6 authority: the `[::1]:12345` form is passed
+    /// through verbatim, which is exactly the `addr:port` syntax that
+    /// [`tokio::net::TcpListener::bind`] /
+    /// [`tokio::net::TcpStream::connect`] resolve (it parses as a
+    /// `std::net::SocketAddrV6`).
+    #[test]
+    fn parse_tcp_bracketed_ipv6() {
+        let ep = parse_endpoint("tcp://[::1]:12345").unwrap();
+        assert_eq!(ep, Endpoint::Tcp("[::1]:12345".into()));
+        // Sanity check that the preserved form is resolvable as-is.
+        let Endpoint::Tcp(addr) = &ep else { unreachable!() };
+        assert!(addr.parse::<std::net::SocketAddr>().is_ok());
+    }
+
     #[test]
     fn parse_uds_absolute_path() {
         let ep = parse_endpoint("uds:///tmp/dotsd.sock").unwrap();

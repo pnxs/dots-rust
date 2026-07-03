@@ -32,6 +32,15 @@ mod model {
         #[dots(tag = 2)]
         pub payload: Option<AnyObject>,
     }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "Batch")]
+    pub struct Batch {
+        #[dots(tag = 1, key)]
+        pub id: Option<u32>,
+        #[dots(tag = 2)]
+        pub items: Option<Vec<AnyObject>>,
+    }
 }
 use model::*;
 
@@ -67,6 +76,81 @@ fn envelope_with_any_roundtrips() {
     let recovered = any.decode(Ping::DESCRIPTOR).expect("decode contained Ping");
     let recovered: &Ping = recovered.as_typed::<Ping>().expect("downcast to Ping");
     assert_eq!(recovered, &ping);
+}
+
+/// Ports the descriptor half of dots-cpp
+/// `TestAnyObject.vectorOfAny_DescriptorAndCborRoundTrip`: a
+/// `vector<any>` field routes through `FieldKind::Vec` with an `Any`
+/// element kind.
+#[test]
+fn vector_of_any_field_kind_is_vec_of_any() {
+    let items_prop = Batch::DESCRIPTOR
+        .property(2)
+        .expect("items property must exist");
+    assert!(matches!(items_prop.kind, FieldKind::Vec(&FieldKind::Any)));
+}
+
+/// Ports the roundtrip half of dots-cpp
+/// `TestAnyObject.vectorOfAny_DescriptorAndCborRoundTrip`: every
+/// element of a `vector<any>` survives the CBOR roundtrip with its
+/// type name and payload intact.
+#[test]
+fn vector_of_any_cbor_roundtrip_preserves_each_element() {
+    use dots_rs_core::AnyObject;
+
+    let ping = Ping {
+        id: Some(42),
+        note: Some("hi".into()),
+    };
+    let original = Batch {
+        id: Some(1),
+        items: Some(vec![
+            // A live-wrapped object and a hand-built envelope, matching
+            // the cpp test's heterogeneous `{ "A", ... }, { "B", ... }`.
+            to_any(&ping),
+            AnyObject::new("B", vec![0x02, 0x03]),
+        ]),
+    };
+
+    let bytes = encode_to_vec(&original);
+    let decoded: Batch = decode_typed_from_slice(&bytes).expect("typed decode succeeds");
+    assert_eq!(original, decoded);
+
+    let items = decoded.items.expect("items set");
+    assert_eq!(items.len(), 2);
+
+    // Element 0: type identity in the clear, payload decodes back to
+    // the original Ping.
+    assert_eq!(items[0].type_name(), "Ping");
+    let recovered = items[0].decode(Ping::DESCRIPTOR).expect("decode contained Ping");
+    assert_eq!(recovered.as_typed::<Ping>().expect("downcast"), &ping);
+
+    // Element 1: opaque envelope passes through verbatim.
+    assert_eq!(items[1].type_name(), "B");
+    assert_eq!(items[1].payload(), &[0x02, 0x03]);
+}
+
+/// An unset / empty `vector<any>` field behaves like any other vector
+/// property: absent stays absent, empty stays empty (and non-equal to
+/// absent).
+#[test]
+fn vector_of_any_empty_and_absent_roundtrip() {
+    let absent = Batch {
+        id: Some(2),
+        items: None,
+    };
+    let bytes = encode_to_vec(&absent);
+    let decoded: Batch = decode_typed_from_slice(&bytes).expect("typed decode succeeds");
+    assert_eq!(absent, decoded);
+
+    let empty = Batch {
+        id: Some(2),
+        items: Some(vec![]),
+    };
+    let bytes = encode_to_vec(&empty);
+    let decoded: Batch = decode_typed_from_slice(&bytes).expect("typed decode succeeds");
+    assert_eq!(empty, decoded);
+    assert_ne!(absent, empty);
 }
 
 #[test]

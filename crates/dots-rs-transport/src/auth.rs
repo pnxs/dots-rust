@@ -95,6 +95,34 @@ mod tests {
         assert!(got.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    /// Interop guard against dots-cpp: fixed vector ported from
+    /// `tests/src/io/auth/TestDigest.cpp` (`stringHashValue1`). The
+    /// cpp ctor is `Digest{ Nonce{ 0 }, "cnonce", "clientName",
+    /// "secret" }`, i.e. (nonce, cnonce, user_name, secret) — the same
+    /// argument order as `compute_response`. Unlike
+    /// `known_vector_matches_documented_chain`, the expected digest is
+    /// not recomputed here, so this catches any divergence from the
+    /// cpp implementation (endianness, separators, hashing order).
+    #[test]
+    fn cpp_fixed_vector_nonce_0() {
+        assert_eq!(
+            compute_response(0, "cnonce", "clientName", "secret"),
+            "f374890c4765d9da457724f82f516f4ebc874a24b4ea5a2a0f983922aa0b8149"
+        );
+    }
+
+    /// Interop guard against dots-cpp: fixed vector ported from
+    /// `tests/src/io/auth/TestDigest.cpp` (`stringHashValue2`) —
+    /// same inputs as above but with nonce 5, exercising a non-zero
+    /// little-endian nonce byte.
+    #[test]
+    fn cpp_fixed_vector_nonce_5() {
+        assert_eq!(
+            compute_response(5, "cnonce", "clientName", "secret"),
+            "de10dac51d89b3e206e47d29d270472dca04cc860d71ec3cb563bc619ff7794d"
+        );
+    }
+
     #[test]
     fn cnonce_is_16_lowercase_hex() {
         let n = generate_cnonce();

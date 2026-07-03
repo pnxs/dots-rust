@@ -196,6 +196,133 @@ fn n_ary_and_or_not() {
     assert!(compiled.matches(&payload_of(&dots!(Sample { id: 2_u32 }))));
 }
 
+/// Ports `TestFilter.or_n_ary` from dots-cpp: an n-ary Or matches when
+/// any child holds — first, middle, or last — and fails when none do.
+/// (The existing `n_ary_and_or_not` only evaluates And and Not.)
+#[test]
+fn or_n_ary() {
+    // or(id == 1, id == 7, id == 42) — OrOp with arity 3
+    let pred = dots!(DotsPredicate {
+        nodes: vec![
+            op_node(DotsPredicateKind::OrOp, 3),
+            leaf(
+                1,
+                DotsCompareOp::Eq,
+                Some(dots!(DotsPredicateValue { uint_val: 1_u64 })),
+            ),
+            leaf(
+                1,
+                DotsCompareOp::Eq,
+                Some(dots!(DotsPredicateValue { uint_val: 7_u64 })),
+            ),
+            leaf(
+                1,
+                DotsCompareOp::Eq,
+                Some(dots!(DotsPredicateValue { uint_val: 42_u64 })),
+            ),
+        ],
+    });
+    let compiled = CompiledPredicate::compile(&pred, &descriptor()).unwrap();
+    assert!(compiled.matches(&payload_of(&dots!(Sample { id: 1_u32 })))); // first child
+    assert!(compiled.matches(&payload_of(&dots!(Sample { id: 7_u32 })))); // middle child
+    assert!(compiled.matches(&payload_of(&dots!(Sample { id: 42_u32 })))); // last child
+    assert!(!compiled.matches(&payload_of(&dots!(Sample { id: 3_u32 })))); // none
+}
+
+/// Ports `TestFilter.not_in_on_string` from dots-cpp: value absent from
+/// the list matches, present does not. A property that isn't set on the
+/// instance is a non-match too — cpp returns false for a missing lhs on
+/// all non-null ops, NotIn included.
+#[test]
+fn not_in_on_string() {
+    let pred = dots!(DotsPredicate {
+        nodes: vec![leaf(
+            2,
+            DotsCompareOp::NotIn,
+            Some(dots!(DotsPredicateValue {
+                string_list: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            })),
+        )],
+    });
+    let compiled = CompiledPredicate::compile(&pred, &descriptor()).unwrap();
+    assert!(compiled.matches(&payload_of(&dots!(Sample { name: "d" }))));
+    assert!(!compiled.matches(&payload_of(&dots!(Sample { name: "b" }))));
+    assert!(!compiled.matches(&payload_of(&Sample::default()))); // name unset
+}
+
+/// Ports `TestFilter.nested_and_or_not` from dots-cpp:
+/// `(id == 1 && name != "drop") || !(score < 0)`.
+#[test]
+fn nested_and_or_not() {
+    let pred = dots!(DotsPredicate {
+        nodes: vec![
+            op_node(DotsPredicateKind::OrOp, 2),
+            op_node(DotsPredicateKind::AndOp, 2),
+            leaf(
+                1,
+                DotsCompareOp::Eq,
+                Some(dots!(DotsPredicateValue { uint_val: 1_u64 })),
+            ),
+            leaf(
+                2,
+                DotsCompareOp::Neq,
+                Some(dots!(DotsPredicateValue { string_val: "drop" })),
+            ),
+            op_node(DotsPredicateKind::NotOp, 1),
+            leaf(
+                3,
+                DotsCompareOp::Lt,
+                Some(dots!(DotsPredicateValue { int_val: 0_i64 })),
+            ),
+        ],
+    });
+    let compiled = CompiledPredicate::compile(&pred, &descriptor()).unwrap();
+    // left And branch matches
+    assert!(compiled.matches(&payload_of(&dots!(Sample {
+        id: 1_u32,
+        name: "ok",
+        score: 0_i64,
+    }))));
+    // left fails, !(score < 0) matches
+    assert!(compiled.matches(&payload_of(&dots!(Sample {
+        id: 2_u32,
+        name: "drop",
+        score: 5_i64,
+    }))));
+    // both branches fail
+    assert!(!compiled.matches(&payload_of(&dots!(Sample {
+        id: 2_u32,
+        name: "drop",
+        score: -1_i64,
+    }))));
+}
+
+/// Ports `TestFilter.ordered_ops_on_uint64` from dots-cpp: Gt/Le with
+/// boundary values on an unsigned property (Sample's u32 `id`).
+#[test]
+fn ordered_ops_on_uint() {
+    let gt_1000 = dots!(DotsPredicate {
+        nodes: vec![leaf(
+            1,
+            DotsCompareOp::Gt,
+            Some(dots!(DotsPredicateValue { uint_val: 1000_u64 })),
+        )],
+    });
+    let le_1000 = dots!(DotsPredicate {
+        nodes: vec![leaf(
+            1,
+            DotsCompareOp::Le,
+            Some(dots!(DotsPredicateValue { uint_val: 1000_u64 })),
+        )],
+    });
+    let c_gt = CompiledPredicate::compile(&gt_1000, &descriptor()).unwrap();
+    let c_le = CompiledPredicate::compile(&le_1000, &descriptor()).unwrap();
+    assert!(c_gt.matches(&payload_of(&dots!(Sample { id: 1001_u32 }))));
+    assert!(!c_gt.matches(&payload_of(&dots!(Sample { id: 1000_u32 }))));
+    assert!(c_le.matches(&payload_of(&dots!(Sample { id: 1000_u32 }))));
+    assert!(!c_le.matches(&payload_of(&dots!(Sample { id: 1001_u32 }))));
+}
+
 #[test]
 fn n_ary_collapsed_and() {
     // (a & b & c) → arity-3 And, not nested 2,2
@@ -279,6 +406,28 @@ fn rejects_truncated_tree() {
                 1,
                 DotsCompareOp::Eq,
                 Some(dots!(DotsPredicateValue { uint_val: 0_u64 })),
+            ),
+        ],
+    });
+    assert!(CompiledPredicate::compile(&pred, &descriptor()).is_err());
+}
+
+/// Ports `TestFilter.validate_rejects_extra_nodes` from dots-cpp: two
+/// unattached top-level subtrees — the second node is never consumed
+/// by the root walk, so compilation must fail.
+#[test]
+fn rejects_extra_trailing_nodes() {
+    let pred = dots!(DotsPredicate {
+        nodes: vec![
+            leaf(
+                1,
+                DotsCompareOp::Eq,
+                Some(dots!(DotsPredicateValue { uint_val: 1_u64 })),
+            ),
+            leaf(
+                1,
+                DotsCompareOp::Eq,
+                Some(dots!(DotsPredicateValue { uint_val: 2_u64 })),
             ),
         ],
     });
