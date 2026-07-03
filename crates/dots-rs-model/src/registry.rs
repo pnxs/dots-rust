@@ -488,10 +488,10 @@ fn fmt_value(
     match (v, kind) {
         // Resolve enum variant names from the property's descriptor,
         // matching the bare `DynamicStruct` Display.
-        (DynamicValue::Enum(int_val), DynamicFieldKind::Enum(enum_desc)) => {
-            match enum_desc.element_by_value(*int_val) {
+        (DynamicValue::Enum(tag), DynamicFieldKind::Enum(enum_desc)) => {
+            match enum_desc.element_by_tag(*tag) {
                 Some(elem) => f.write_str(&elem.name),
-                None => write!(f, "{int_val}"),
+                None => write!(f, "{tag}"),
             }
         }
         // Recurse so nested `any` inside a sub-struct also expands.

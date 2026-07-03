@@ -98,9 +98,14 @@ pub struct DynamicEnumDescriptor {
 }
 
 impl DynamicEnumDescriptor {
-    /// Look up a variant by its wire `int32` value.
+    /// Look up a variant by its `int32` metadata value.
     pub fn element_by_value(&self, value: i32) -> Option<&DynamicEnumElement> {
         self.elements.iter().find(|e| e.value == value)
+    }
+
+    /// Look up a variant by metadata tag (the wire encoding).
+    pub fn element_by_tag(&self, tag: u32) -> Option<&DynamicEnumElement> {
+        self.elements.iter().find(|e| e.tag == tag)
     }
 
     /// Project a static enum descriptor into the dynamic shape.
@@ -215,10 +220,12 @@ pub enum DynamicValue {
     /// Nested struct value. Boxed to keep `DynamicValue`'s size bounded
     /// independently of `DynamicStruct`'s growth.
     Struct(Box<DynamicStruct>),
-    /// DOTS enum value — the wire `int32`. The descriptor lives in the
-    /// containing property's `DynamicFieldKind::Enum`, so consumers
-    /// look up the element name by walking back to the descriptor.
-    Enum(i32),
+    /// DOTS enum value — the wire `u32` enumerator *tag* (dots-cpp
+    /// convention; the `int32` `value` is descriptor metadata and is
+    /// never transmitted). The descriptor lives in the containing
+    /// property's `DynamicFieldKind::Enum`, so consumers look up the
+    /// element name/value by walking back to the descriptor.
+    Enum(u32),
     /// Wall-clock timestamp (fractional seconds since Unix epoch).
     Timepoint(f64),
     /// Fractional-second duration.
@@ -594,7 +601,7 @@ fn encode_value(value: &DynamicValue, e: &mut CborEncoder<'_>) -> Result<(), Enc
             Ok(())
         }
         DynamicValue::Struct(inner) => encode_struct(inner, inner.valid, e),
-        DynamicValue::Enum(v) => e.i32(*v).map(|_| ()),
+        DynamicValue::Enum(v) => e.u32(*v).map(|_| ()),
         DynamicValue::Timepoint(v) | DynamicValue::Duration(v) => e.f64(*v).map(|_| ()),
         // Opaque passthrough: re-emit the `[type-name, payload]`
         // envelope verbatim without touching the inner object.
@@ -673,7 +680,16 @@ fn decode_value(
                 properties,
             })))
         }
-        DynamicFieldKind::Enum(_) => Ok(DynamicValue::Enum(d.i32()?)),
+        DynamicFieldKind::Enum(desc) => {
+            // The wire carries the enumerator tag; reject tags the
+            // descriptor doesn't list, mirroring both the static path
+            // and dots-cpp's `enumeratorFromTag` (which throws).
+            let tag = d.u32()?;
+            if desc.element_by_tag(tag).is_none() {
+                return Err(DecodeError::message("unknown DOTS enum tag"));
+            }
+            Ok(DynamicValue::Enum(tag))
+        }
         DynamicFieldKind::Timepoint => Ok(DynamicValue::Timepoint(d.f64()?)),
         DynamicFieldKind::Duration => Ok(DynamicValue::Duration(d.f64()?)),
         // Read the opaque envelope into an `AnyObject` without decoding
@@ -765,10 +781,10 @@ impl core::fmt::Display for DynamicStruct {
                 .map(|(_, v)| v);
 
             match (value, &prop.kind) {
-                (Some(DynamicValue::Enum(int_val)), DynamicFieldKind::Enum(enum_desc)) => {
-                    match enum_desc.element_by_value(*int_val) {
+                (Some(DynamicValue::Enum(tag)), DynamicFieldKind::Enum(enum_desc)) => {
+                    match enum_desc.element_by_tag(*tag) {
                         Some(elem) => f.write_str(&elem.name)?,
-                        None => write!(f, "{int_val}")?,
+                        None => write!(f, "{tag}")?,
                     }
                 }
                 (Some(v), _) => core::fmt::Display::fmt(v, f)?,
@@ -851,7 +867,7 @@ mod display_tests {
         let enum_desc = Arc::new(DynamicEnumDescriptor {
             name: "Mood".into(),
             elements: alloc::vec![
-                DynamicEnumElement { name: "Happy".into(), tag: 1, value: 1 },
+                DynamicEnumElement { name: "Happy".into(), tag: 1, value: 0 },
                 DynamicEnumElement { name: "Grumpy".into(), tag: 2, value: 7 },
             ],
         });
@@ -868,7 +884,9 @@ mod display_tests {
         let value = DynamicStruct {
             descriptor: desc,
             valid: PropertySet::EMPTY.with_tag(1),
-            properties: alloc::vec![(1, DynamicValue::Enum(7))],
+            // Enum values are stored/transmitted as the enumerator tag
+            // (2 = Grumpy), not the metadata value (7).
+            properties: alloc::vec![(1, DynamicValue::Enum(2))],
         };
         assert_eq!(format!("{value}"), "Person{ mood: Grumpy }");
     }
@@ -882,5 +900,217 @@ mod display_tests {
             properties: alloc::vec![],
         };
         assert_eq!(format!("{value}"), "Pinger{}");
+    }
+}
+
+/// Key identity for wire-only values.
+///
+/// Ports the key halves of dots-cpp `TestStaticStruct._KeyProperties` /
+/// `TestDynamicStruct._keyProperties` (the key set is exactly the
+/// `key`-marked tags) and `TestStaticStruct.same` /
+/// `TestDynamicStruct.same` (two instances are "the same" iff their
+/// key properties are equal, regardless of non-key differences —
+/// here surfaced via `key_bytes()` equality).
+#[cfg(test)]
+mod key_identity_tests {
+    use super::*;
+
+    /// A descriptor with two keys (tags 1, 2) and one non-key (tag 3),
+    /// so "exactly the key tags" is distinguishable from "first tag" or
+    /// "all tags".
+    fn record_descriptor() -> Arc<DynamicStructDescriptor> {
+        Arc::new(DynamicStructDescriptor {
+            name: "Record".into(),
+            flags: StructFlags::NONE,
+            properties: alloc::vec![
+                DynamicPropertyDescriptor {
+                    name: "realm".into(),
+                    tag: 1,
+                    is_key: true,
+                    kind: DynamicFieldKind::U32,
+                },
+                DynamicPropertyDescriptor {
+                    name: "id".into(),
+                    tag: 2,
+                    is_key: true,
+                    kind: DynamicFieldKind::U64,
+                },
+                DynamicPropertyDescriptor {
+                    name: "label".into(),
+                    tag: 3,
+                    is_key: false,
+                    kind: DynamicFieldKind::String,
+                },
+            ],
+        })
+    }
+
+    fn record(
+        descriptor: Arc<DynamicStructDescriptor>,
+        realm: u32,
+        id: u64,
+        label: Option<&str>,
+    ) -> DynamicStruct {
+        let mut valid = PropertySet::EMPTY.with_tag(1).with_tag(2);
+        let mut properties = alloc::vec![
+            (1, DynamicValue::U32(realm)),
+            (2, DynamicValue::U64(id)),
+        ];
+        if let Some(label) = label {
+            valid = valid.with_tag(3);
+            properties.push((3, DynamicValue::String(label.into())));
+        }
+        DynamicStruct {
+            descriptor,
+            valid,
+            properties,
+        }
+    }
+
+    /// Ports `TestDynamicStruct._keyProperties`: the key set is exactly
+    /// the set of `key`-marked tags — no more, no less.
+    #[test]
+    fn key_set_is_exactly_the_key_tags() {
+        let value = record(record_descriptor(), 1, 2, Some("x"));
+        let expected = PropertySet::EMPTY.with_tag(1).with_tag(2);
+        assert_eq!(Transmittable::key_set(&value), expected);
+    }
+
+    /// Ports `TestDynamicStruct.same` (positive half): equal keys but
+    /// different non-key properties → identical `key_bytes()`.
+    #[test]
+    fn key_bytes_equal_for_equal_keys_despite_non_key_differences() {
+        let desc = record_descriptor();
+        let a = record(desc.clone(), 7, 42, Some("foo"));
+        let b = record(desc.clone(), 7, 42, Some("bar"));
+        // Even a *missing* non-key property doesn't affect key identity.
+        let c = record(desc, 7, 42, None);
+        assert_eq!(a.key_bytes(), b.key_bytes());
+        assert_eq!(a.key_bytes(), c.key_bytes());
+    }
+
+    /// Ports `TestDynamicStruct.same` (negative half): any differing
+    /// key property → different `key_bytes()`.
+    #[test]
+    fn key_bytes_differ_when_key_differs() {
+        let desc = record_descriptor();
+        let a = record(desc.clone(), 7, 42, Some("foo"));
+        let other_realm = record(desc.clone(), 8, 42, Some("foo"));
+        let other_id = record(desc, 7, 43, Some("foo"));
+        assert_ne!(a.key_bytes(), other_realm.key_bytes());
+        assert_ne!(a.key_bytes(), other_id.key_bytes());
+    }
+
+    /// A missing key property encodes as `null`, so a partial-key
+    /// value stays distinguishable from one whose key is set to zero
+    /// (the `key_bytes` doc contract).
+    #[test]
+    fn key_bytes_distinguish_missing_key_from_zero_key() {
+        let desc = record_descriptor();
+        let zero_key = record(desc.clone(), 0, 42, None);
+        let missing_key = DynamicStruct {
+            descriptor: desc,
+            valid: PropertySet::EMPTY.with_tag(2),
+            properties: alloc::vec![(2, DynamicValue::U64(42))],
+        };
+        assert_ne!(zero_key.key_bytes(), missing_key.key_bytes());
+    }
+}
+
+/// `DynamicStruct` equality semantics.
+///
+/// Ports dots-cpp `TestDynamicStruct.equal` (`_equal` compares all
+/// property values) onto the hand-written `PartialEq` impl, and pins
+/// that impl's descriptor-comparison behavior: descriptors compare by
+/// `Arc` pointer identity, not structurally.
+#[cfg(test)]
+mod partial_eq_tests {
+    use super::*;
+
+    fn pair_descriptor() -> Arc<DynamicStructDescriptor> {
+        Arc::new(DynamicStructDescriptor {
+            name: "Pair".into(),
+            flags: StructFlags::NONE,
+            properties: alloc::vec![
+                DynamicPropertyDescriptor {
+                    name: "n".into(),
+                    tag: 1,
+                    is_key: false,
+                    kind: DynamicFieldKind::I32,
+                },
+                DynamicPropertyDescriptor {
+                    name: "s".into(),
+                    tag: 2,
+                    is_key: false,
+                    kind: DynamicFieldKind::String,
+                },
+            ],
+        })
+    }
+
+    fn pair(descriptor: Arc<DynamicStructDescriptor>, n: i32, s: Option<&str>) -> DynamicStruct {
+        let mut valid = PropertySet::EMPTY.with_tag(1);
+        let mut properties = alloc::vec![(1, DynamicValue::I32(n))];
+        if let Some(s) = s {
+            valid = valid.with_tag(2);
+            properties.push((2, DynamicValue::String(s.into())));
+        }
+        DynamicStruct {
+            descriptor,
+            valid,
+            properties,
+        }
+    }
+
+    /// Ports `TestDynamicStruct.equal` (positive half): same descriptor
+    /// `Arc`, same valid set, same property values → equal.
+    #[test]
+    fn equal_when_same_descriptor_valid_and_properties() {
+        let desc = pair_descriptor();
+        let a = pair(desc.clone(), 2, Some("foo"));
+        let b = pair(desc, 2, Some("foo"));
+        assert_eq!(a, a);
+        assert_eq!(a, b);
+    }
+
+    /// Ports `TestDynamicStruct.equal` (negative half): a differing
+    /// property value → unequal.
+    #[test]
+    fn unequal_when_property_value_differs() {
+        let desc = pair_descriptor();
+        let a = pair(desc.clone(), 2, Some("foo"));
+        let b = pair(desc, 2, Some("bar"));
+        assert_ne!(a, b);
+    }
+
+    /// A differing valid set → unequal, even before property values
+    /// are considered.
+    #[test]
+    fn unequal_when_valid_set_differs() {
+        let desc = pair_descriptor();
+        let a = pair(desc.clone(), 2, Some("foo"));
+        let b = pair(desc, 2, None);
+        assert_ne!(a, b);
+    }
+
+    /// Pins the descriptor-comparison sharp edge: `PartialEq` uses
+    /// `Arc::ptr_eq`, so two values built from *structurally identical*
+    /// descriptors held in different `Arc`s compare unequal even when
+    /// all their data matches. This is deliberate (documented on the
+    /// impl: "values built from different descriptor instances (even if
+    /// structurally identical) compare unequal") — descriptors are
+    /// expected to be shared per type, e.g. via a registry. Do not
+    /// "fix" this test by deep-comparing descriptors without deciding
+    /// that semantic change on purpose.
+    #[test]
+    fn structurally_identical_descriptors_in_different_arcs_compare_unequal() {
+        let a = pair(pair_descriptor(), 2, Some("foo"));
+        let b = pair(pair_descriptor(), 2, Some("foo"));
+        assert!(!Arc::ptr_eq(&a.descriptor, &b.descriptor));
+        // Same name, same properties, same values — still unequal.
+        assert_eq!(a.descriptor.name, b.descriptor.name);
+        assert_eq!(a.valid, b.valid);
+        assert_eq!(a.properties, b.properties);
+        assert_ne!(a, b);
     }
 }

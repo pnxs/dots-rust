@@ -329,10 +329,15 @@ impl StructDescriptor {
 pub struct EnumElement {
     /// Variant name in the source enum.
     pub name: &'static str,
-    /// DOTS metadata tag for this variant (1-based).
+    /// DOTS metadata tag for this variant (1-based). This is what an
+    /// enum is encoded as in instance payloads (CBOR unsigned int),
+    /// matching dots-cpp's `CborSerializer`.
     pub tag: u32,
-    /// `int32` value transmitted on the wire. By default equal to `tag`,
-    /// but the `.dots` model permits them to differ.
+    /// `int32` value associated with the variant. Descriptor metadata
+    /// only (exchanged as `EnumElementDescriptor.enum_value`); never
+    /// transmitted in instance payloads. Defaults to `tag - 1`, the
+    /// dots-cpp code-generator default, but the `.dots` model permits
+    /// an explicit override.
     pub value: i32,
 }
 
@@ -340,7 +345,7 @@ pub struct EnumElement {
 ///
 /// Held as a `&'static EnumDescriptor` constant on each generated enum
 /// (e.g. `MyEnum::DESCRIPTOR`). Enums are encoded on the wire as their
-/// `int32` `value`; the descriptor maps wire values back to variants.
+/// `u32` `tag`; the descriptor maps wire tags back to variants.
 #[derive(Debug, Clone, Copy)]
 pub struct EnumDescriptor {
     pub name: &'static str,
@@ -348,12 +353,12 @@ pub struct EnumDescriptor {
 }
 
 impl EnumDescriptor {
-    /// Look up a variant by its wire `int32` value.
+    /// Look up a variant by its `int32` metadata value.
     pub fn element_by_value(&self, value: i32) -> Option<&'static EnumElement> {
         self.elements.iter().find(|e| e.value == value)
     }
 
-    /// Look up a variant by metadata tag.
+    /// Look up a variant by metadata tag (the wire encoding).
     pub fn element_by_tag(&self, tag: u32) -> Option<&'static EnumElement> {
         self.elements.iter().find(|e| e.tag == tag)
     }

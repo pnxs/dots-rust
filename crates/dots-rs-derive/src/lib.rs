@@ -97,15 +97,22 @@ pub fn derive_dots_struct(input: TokenStream) -> TokenStream {
 /// Derive a DOTS enum.
 ///
 /// Each variant must be unit-style (no payload) and tagged with
-/// `#[dots(tag = N)]`. The wire `int32` value defaults to `tag` but
-/// can be overridden with `#[dots(tag = N, value = M)]`.
+/// `#[dots(tag = N)]`. On the wire an enum is encoded as its
+/// enumerator **tag** (a CBOR unsigned int) — the same convention as
+/// dots-cpp's `CborSerializer` (`enumeratorFromValue(value).tag()` on
+/// write, `enumeratorFromTag(...)` on read).
+///
+/// The `int32` `value` is descriptor metadata only (exchanged in
+/// `EnumElementDescriptor.enum_value`, never in instance payloads).
+/// It defaults to `tag - 1` — the dots-cpp code-generator default —
+/// and can be overridden with `#[dots(tag = N, value = M)]`.
 ///
 /// # Emitted code
 ///
 /// 1. `T::DESCRIPTOR` static `&'static EnumDescriptor`.
 /// 2. `impl DotsTypeKind for T` exposing `FieldKind::Enum(Self::DESCRIPTOR)`.
-/// 3. `impl DotsField for T` that encodes/decodes the wire `int32`,
-///    matching variants by value.
+/// 3. `impl DotsField for T` that encodes/decodes the wire tag,
+///    matching variants by tag.
 #[proc_macro_derive(DotsEnum, attributes(dots))]
 pub fn derive_dots_enum(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -1393,14 +1400,14 @@ fn expand_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let encode_arms = variants.iter().map(|v| {
         let ident = v.ident;
-        let value = v.value;
-        quote! { Self::#ident => #value }
+        let tag = v.tag;
+        quote! { Self::#ident => #tag }
     });
 
     let decode_arms = variants.iter().map(|v| {
         let ident = v.ident;
-        let value = v.value;
-        quote! { #value => ::core::result::Result::Ok(Self::#ident) }
+        let tag = v.tag;
+        quote! { #tag => ::core::result::Result::Ok(Self::#ident) }
     });
 
     let descriptor_const_ident = Ident::new(
@@ -1440,10 +1447,13 @@ fn expand_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
                 &self,
                 e: &mut #dots_rt::layout::CborEncoder<'_>,
             ) -> ::core::result::Result<(), #dots_rt::EncodeError> {
-                let v: i32 = match self {
+                // The wire carries the enumerator tag (unsigned),
+                // matching dots-cpp's CborSerializer; the `value` is
+                // descriptor metadata only.
+                let v: u32 = match self {
                     #( #encode_arms ),*
                 };
-                e.i32(v)?;
+                e.u32(v)?;
                 ::core::result::Result::Ok(())
             }
 
@@ -1451,12 +1461,12 @@ fn expand_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
             fn dots_decode(
                 d: &mut #dots_rt::layout::CborDecoder<'_>,
             ) -> ::core::result::Result<Self, #dots_rt::DecodeError> {
-                let v: i32 = d.i32()?;
+                let v: u32 = d.u32()?;
                 match v {
                     #( #decode_arms ),*,
                     _ => ::core::result::Result::Err(
                         #dots_rt::DecodeError::message(
-                            "unknown DOTS enum value"
+                            "unknown DOTS enum tag"
                         ),
                     ),
                 }
@@ -1492,9 +1502,11 @@ fn parse_enum_variant(v: &Variant) -> syn::Result<DotsEnumVariant<'_>> {
             "DOTS enum tags are 1-based; tag must be > 0",
         ));
     }
-    // Default the wire `int32` value to the tag — matches the .dots
-    // convention for `1: variant_name` declarations.
-    let value = attrs.value.unwrap_or(tag as i32);
+    // The `value` is descriptor metadata (not transmitted in instance
+    // payloads — the wire carries the tag). Default it to `tag - 1`,
+    // matching the dots-cpp code generator (DotsTransformer.py) for
+    // `1: variant_name` declarations without an explicit `= N`.
+    let value = attrs.value.unwrap_or((tag - 1) as i32);
     Ok(DotsEnumVariant {
         ident: &v.ident,
         tag,

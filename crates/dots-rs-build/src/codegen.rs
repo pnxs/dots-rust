@@ -176,7 +176,17 @@ fn emit_enum_item(out: &mut String, item: &EnumItem, is_first: bool) {
     if is_first {
         out.push_str("    #[default]\n");
     }
-    let _ = writeln!(out, "    #[dots(tag = {})]", item.tag);
+    // Forward an explicit `= N` value to the derive; without one the
+    // derive defaults the metadata value to `tag - 1`, matching the
+    // dots-cpp code generator.
+    match item.value {
+        Some(v) => {
+            let _ = writeln!(out, "    #[dots(tag = {}, value = {})]", item.tag, v);
+        }
+        None => {
+            let _ = writeln!(out, "    #[dots(tag = {})]", item.tag);
+        }
+    }
     let _ = writeln!(out, "    {},", rustify_variant_name(&item.name));
 }
 
@@ -404,6 +414,19 @@ mod tests {
         assert!(out.contains("Create,"));
         assert!(out.contains("Update,"));
         assert!(out.contains("Remove,"));
+    }
+
+    #[test]
+    fn enum_explicit_values_are_forwarded_to_derive() {
+        // Mirrors dots-cpp's dotstesttypes.dots convention: explicit
+        // `= N` metadata values must reach the derive, which otherwise
+        // defaults them to `tag - 1`.
+        let src = "enum E { 1: a = 0, 2: b = 7, 3: c }";
+        let file = parse_str(src).unwrap();
+        let out = generate(&file);
+        assert!(out.contains("#[dots(tag = 1, value = 0)]"));
+        assert!(out.contains("#[dots(tag = 2, value = 7)]"));
+        assert!(out.contains("#[dots(tag = 3)]"));
     }
 
     #[test]

@@ -239,7 +239,8 @@ fn enum_descriptor_data_reverse_conversion() {
     assert_eq!(dyn_desc.name, "Severity");
     assert_eq!(dyn_desc.elements.len(), 3);
     assert_eq!(dyn_desc.elements[0].name, "Info");
-    assert_eq!(dyn_desc.elements[2].value, 3);
+    // Metadata value defaults to `tag - 1` (dots-cpp generator default).
+    assert_eq!(dyn_desc.elements[2].value, 2);
 }
 
 #[test]
@@ -283,6 +284,63 @@ fn struct_descriptor_data_with_nested_dynamic_struct_in_registry() {
         }
         _ => panic!(),
     }
+}
+
+/// Ports dots-cpp `TestRegistry.forEach` (the
+/// `forEach<StructDescriptor>` / `forEach<EnumDescriptor>` filtered
+/// walks): with a mix of static structs, dynamic structs, and enums
+/// registered, `iter_structs` yields exactly the structs and
+/// `iter_enums` exactly the enums.
+#[test]
+fn iter_structs_and_iter_enums_partition_the_registry() {
+    use dots_rs_core::{
+        DynamicEnumDescriptor, DynamicEnumElement, DynamicFieldKind, DynamicPropertyDescriptor,
+        StructFlags,
+    };
+
+    let reg = Registry::new();
+
+    // Static structs.
+    reg.register_struct_static(Address::DESCRIPTOR);
+    reg.register_struct_static(LogEntry::DESCRIPTOR);
+
+    // A purely dynamic struct (no compile-time counterpart).
+    reg.register_struct_dynamic(Arc::new(DynamicStructDescriptor {
+        name: "WireOnly".into(),
+        flags: StructFlags::NONE,
+        properties: vec![DynamicPropertyDescriptor {
+            name: "id".into(),
+            tag: 1,
+            is_key: true,
+            kind: DynamicFieldKind::U32,
+        }],
+    }));
+
+    // A static enum and a purely dynamic enum.
+    reg.register_enum_static(Severity::DESCRIPTOR);
+    reg.register_enum_dynamic(Arc::new(DynamicEnumDescriptor {
+        name: "Mood".into(),
+        elements: vec![
+            DynamicEnumElement { name: "Happy".into(), tag: 1, value: 0 },
+            DynamicEnumElement { name: "Grumpy".into(), tag: 2, value: 1 },
+        ],
+    }));
+
+    assert_eq!(reg.len(), 5);
+
+    // iter_structs: exactly the three structs, no enums.
+    let structs = reg.iter_structs();
+    assert_eq!(structs.len(), 3);
+    let mut struct_names: Vec<&str> = structs.iter().map(|d| d.name.as_str()).collect();
+    struct_names.sort_unstable();
+    assert_eq!(struct_names, ["Address", "LogEntry", "WireOnly"]);
+
+    // iter_enums: exactly the two enums, no structs.
+    let enums = reg.iter_enums();
+    assert_eq!(enums.len(), 2);
+    let mut enum_names: Vec<&str> = enums.iter().map(|d| d.name.as_str()).collect();
+    enum_names.sort_unstable();
+    assert_eq!(enum_names, ["Mood", "Severity"]);
 }
 
 #[test]

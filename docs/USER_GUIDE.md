@@ -229,7 +229,7 @@ enum Status {
     #[dots(tag = 3)] Failed,
 }
 
-// Explicit wire values (e.g. to mirror an errno space) use `value`:
+// Explicit metadata values (e.g. to mirror an errno space) use `value`:
 #[derive(DotsEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[dots(name = "Errno")]
 enum Errno {
@@ -241,8 +241,11 @@ enum Errno {
 ```
 
 Enums must be **unit-only** (no data-carrying variants). Each variant needs a
-`tag`; `value` optionally sets the integer transmitted on the wire (defaults
-follow the tag). Use enums as struct field types like any other:
+`tag` — that tag is what instance payloads carry on the wire (the dots-cpp
+convention). `value` optionally sets the `int32` metadata value exchanged in
+descriptors (defaults to `tag - 1`, matching the dots-cpp code generator);
+it is never transmitted in payloads. Use enums as struct field types like
+any other:
 
 ```rust
 #[derive(DotsStruct, Default, Debug, Clone)]

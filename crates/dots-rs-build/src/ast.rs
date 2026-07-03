@@ -51,7 +51,9 @@ pub struct EnumItem {
     pub tag: u32,
     pub name: String,
     /// Optional explicit `= INT` value. When absent, the value
-    /// defaults to the tag (matches dots-cpp behavior).
+    /// defaults to `tag - 1` (the dots-cpp code-generator default).
+    /// The value is descriptor metadata only — instance payloads
+    /// carry the enumerator tag.
     pub value: Option<i64>,
     /// Trailing same-line `///` doc comment, if any.
     pub trailing_doc: Vec<String>,
