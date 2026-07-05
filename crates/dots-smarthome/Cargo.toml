@@ -1,6 +1,6 @@
 [package]
 name = "dots-smarthome"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -23,7 +23,7 @@ tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time",
 tracing.workspace = true
 
 [build-dependencies]
-dots-rs-build = { path = "../dots-rs-build", version = "0.1.0" }
+dots-rs-build.workspace = true
 
 [lints]
 workspace = true
