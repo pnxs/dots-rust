@@ -3,12 +3,15 @@
 //! for types it has NOT compiled in and must be able to build and
 //! register the dynamic descriptors.
 //!
-//! Regression test for the guest-side gap where incoming
-//! `EnumDescriptorData` was never registered into the codec registry,
-//! so every `StructDescriptorData` referencing an enum failed with
-//! `UnknownType` (`could not build dynamic descriptor from wire
-//! StructDescriptorData`). The host has always registered wire enums;
-//! `maybe_register_wire_enum` is the guest mirror.
+//! Mirrors dots-cpp `Channel::processReceive` →
+//! `Channel::importDependencies` (Channel.cpp): descriptor import is
+//! unconditional at the receive layer — before dispatch, independent
+//! of any subscription — and reuse-if-present (an already-registered
+//! name, e.g. a compiled-in static type echoed back by the broker, is
+//! never replaced). Regression tests for the guest-side gap where
+//! incoming `EnumDescriptorData` was never registered, so every
+//! `StructDescriptorData` referencing an enum failed with
+//! `UnknownType`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -165,6 +168,98 @@ async fn wire_enum_descriptor_registers_and_struct_referencing_it_builds() {
         }
         other => panic!("expected registered struct TracePerson, got {other:?}"),
     }
+
+    transceiver.exit();
+    let _ = timeout(Duration::from_secs(2), driver_handle).await;
+}
+
+/// Descriptor import is a receive-layer concern, not a subscription
+/// concern (cpp `Channel::importDependencies` runs on EVERY received
+/// transmission): even with no `subscribe_new_struct_type` installed,
+/// wire descriptors must land in the registry.
+#[tokio::test]
+async fn wire_descriptors_import_without_any_subscription() {
+    let (transceiver, driver, mut server, reg) = connect_guest().await;
+    let driver_handle = tokio::spawn(driver.run());
+
+    let enum_data = EnumDescriptorData::from_static(TraceMood::DESCRIPTOR);
+    push_typed(&mut server, "EnumDescriptorData", &enum_data).await;
+    let struct_data = StructDescriptorData::from_static(TracePerson::DESCRIPTOR);
+    push_typed(&mut server, "StructDescriptorData", &struct_data).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while reg.lookup("TracePerson").is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out: TracePerson was never imported without a subscription"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(matches!(
+        reg.lookup("TraceMood"),
+        Some(dots_rs_model::DescriptorEntry::Enum(_))
+    ));
+
+    transceiver.exit();
+    let _ = timeout(Duration::from_secs(2), driver_handle).await;
+}
+
+/// Import is reuse-if-present (cpp `DescriptorConverter` returns the
+/// registry's existing descriptor for a known name): a replayed or
+/// echoed descriptor — including the broker echoing back a type this
+/// guest has compiled in statically — must NOT replace the existing
+/// registry entry. `DynamicStruct` equality compares descriptors by
+/// `Arc` identity, so a silent replacement would split the world.
+#[tokio::test]
+async fn echoed_descriptor_does_not_replace_existing_entry() {
+    let (transceiver, driver, mut server, reg) = connect_guest().await;
+
+    // "Compiled-in" type: statically registered before anything
+    // arrives on the wire, as GuestDriver::early_subscribe does.
+    reg.register_struct_static(TracePerson::DESCRIPTOR);
+    reg.register_enum_static(TraceMood::DESCRIPTOR);
+    let static_person = match reg.lookup("TracePerson").unwrap() {
+        dots_rs_model::DescriptorEntry::Struct(d) => d,
+        _ => unreachable!(),
+    };
+
+    let driver_handle = tokio::spawn(driver.run());
+
+    // The broker echoes our own descriptors back (it fans descriptor
+    // publishes out like any cached type).
+    let enum_data = EnumDescriptorData::from_static(TraceMood::DESCRIPTOR);
+    push_typed(&mut server, "EnumDescriptorData", &enum_data).await;
+    let struct_data = StructDescriptorData::from_static(TracePerson::DESCRIPTOR);
+    push_typed(&mut server, "StructDescriptorData", &struct_data).await;
+
+    // Barrier: a later unrelated descriptor proves the echoes above
+    // have been processed once it appears in the registry.
+    #[derive(dots_rs_derive::DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "TraceBarrier")]
+    struct TraceBarrier {
+        #[dots(tag = 1)]
+        note: Option<String>,
+    }
+    let barrier_data = StructDescriptorData::from_static(TraceBarrier::DESCRIPTOR);
+    push_typed(&mut server, "StructDescriptorData", &barrier_data).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while reg.lookup("TraceBarrier").is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the barrier descriptor"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let after = match reg.lookup("TracePerson").unwrap() {
+        dots_rs_model::DescriptorEntry::Struct(d) => d,
+        _ => panic!("TracePerson entry changed kind"),
+    };
+    assert!(
+        Arc::ptr_eq(&static_person, &after),
+        "an echoed StructDescriptorData replaced the static registry entry"
+    );
 
     transceiver.exit();
     let _ = timeout(Duration::from_secs(2), driver_handle).await;

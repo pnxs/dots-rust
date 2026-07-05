@@ -456,8 +456,12 @@ impl GuestTransceiver {
     }
 
     /// Subscribe to type-system events: every `StructDescriptorData`
-    /// arriving on the wire is converted to a [`DynamicStructDescriptor`],
-    /// registered with the codec registry, and passed to `handler`.
+    /// arriving on the wire is passed to `handler` as the
+    /// [`DynamicStructDescriptor`] the codec registry holds for it.
+    /// (Registration itself happens unconditionally in the receive
+    /// path — the mirror of dots-cpp `Channel::importDependencies` —
+    /// before the transmission is dispatched here, so the handler
+    /// always sees the same `Arc` the codec decodes against.)
     /// Additionally, `handler` is invoked synchronously for each
     /// currently-registered struct descriptor before this returns
     /// (catch-up replay), so a fresh subscriber sees what's already
@@ -485,20 +489,19 @@ impl GuestTransceiver {
         let registry = self.registry.clone();
         let handler_for_wire = handler.clone();
         self.subscribe::<StructDescriptorData>(move |event| {
-            match registry.build_dynamic_struct(&event.updated()) {
-                Ok(desc) => {
-                    let arc = Arc::new(desc);
-                    registry.register_struct_dynamic(arc.clone());
-                    if let Ok(mut h) = handler_for_wire.lock() {
-                        h(&arc);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = ?e,
-                        type_name = ?event.updated().name,
-                        "could not build dynamic descriptor from wire StructDescriptorData",
-                    );
+            // The receive path (`import_wire_descriptors`) registered
+            // the descriptor before this dispatch ran; surface the
+            // registry's entry — the Arc the codec decodes against —
+            // instead of building a second, pointer-distinct copy
+            // (DynamicStruct equality compares descriptors by
+            // Arc identity). A missing entry means the import failed
+            // and already warned; nothing to surface then.
+            let Some(name) = event.updated().name.clone() else {
+                return;
+            };
+            if let Some(dots_rs_model::DescriptorEntry::Struct(d)) = registry.lookup(&name) {
+                if let Ok(mut h) = handler_for_wire.lock() {
+                    h(&d);
                 }
             }
         })
@@ -999,12 +1002,13 @@ where
                             &mut txn.header,
                             self.transceiver.client_id(),
                         );
-                        // Wire-learned enums must land in the codec
-                        // registry before dispatch, so struct
-                        // descriptors referencing them resolve (the
-                        // guest mirror of the host's
-                        // EnumDescriptorData handling).
-                        crate::connection::maybe_register_wire_enum(
+                        // Wire-learned descriptors must land in the
+                        // codec registry before dispatch, so struct
+                        // descriptors referencing a just-shipped enum
+                        // resolve (the mirror of dots-cpp
+                        // Channel::importDependencies, which checks
+                        // every received transmission).
+                        crate::connection::import_wire_descriptors(
                             &self.transceiver.registry,
                             &txn,
                         );

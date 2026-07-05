@@ -134,9 +134,8 @@ pub struct Connection<S> {
     /// the connection stays `Send` for multi-threaded runtimes.
     dispatch: Arc<Mutex<DispatchState>>,
     /// The codec registry, shared with the framed stream's
-    /// [`TransmissionCodec`]. Used to register wire-learned
-    /// `EnumDescriptorData` before dispatch (see
-    /// [`maybe_register_wire_enum`]).
+    /// [`TransmissionCodec`]. Used to import wire-learned descriptors
+    /// before dispatch (see [`import_wire_descriptors`]).
     registry: Arc<Registry>,
 }
 
@@ -460,7 +459,7 @@ where
     }
 
     fn dispatch_to_subscribers(&self, txn: &Transmission) {
-        maybe_register_wire_enum(&self.registry, txn);
+        import_wire_descriptors(&self.registry, txn);
         dispatch_external(&self.dispatch, txn);
     }
 
@@ -601,51 +600,88 @@ pub(crate) fn stamp_is_from_myself(header: &mut DotsHeader, my_client_id: Option
     header.is_from_myself = Some(my_client_id.is_some() && header.sender == my_client_id);
 }
 
-/// Register a wire-learned enum descriptor into the codec registry.
+/// Import wire-learned type descriptors into the codec registry.
 ///
-/// The guest-side mirror of the host's `EnumDescriptorData` handling:
-/// enums have no dedicated subscription API (unlike
-/// `GuestTransceiver::subscribe_new_struct_type` for structs), but a
-/// struct descriptor referencing an enum can only be built once the
-/// enum is registered — descriptor exchange ships enums before the
-/// structs that use them, so registering here, before the transmission
-/// is dispatched, guarantees the ordering. Registration is idempotent
-/// (re-registering overwrites with an equivalent entry).
+/// The mirror of dots-cpp `Channel::processReceive` →
+/// `Channel::importDependencies` (Channel.cpp): EVERY received
+/// transmission is checked — before dispatch — for
+/// `StructDescriptorData` / `EnumDescriptorData`, and new types are
+/// registered so later transmissions (including struct descriptors
+/// referencing an enum shipped just before them) can be resolved and
+/// decoded.
 ///
-/// Anything that isn't a decodable `EnumDescriptorData` is left to the
-/// normal dispatch path untouched.
-pub(crate) fn maybe_register_wire_enum(registry: &Registry, txn: &Transmission) {
-    if txn.header.type_name.as_deref() != Some("EnumDescriptorData") {
-        return;
-    }
-    let data: EnumDescriptorData = match &txn.payload {
-        dots_rs_model::Payload::Typed(a) => match a.as_typed::<EnumDescriptorData>() {
-            Some(v) => v.clone(),
-            None => return,
-        },
-        dots_rs_model::Payload::Wire(_) => {
-            let bytes = txn.payload.encode();
-            match dots_rs_core::decode_typed_from_slice(&bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to decode wire EnumDescriptorData");
-                    return;
+/// Like cpp's `DescriptorConverter`, import is reuse-if-present: a
+/// name that is already registered — a compiled-in static type, or a
+/// descriptor learned earlier — is left untouched, so the broker
+/// echoing our own descriptors back never replaces a static entry
+/// with a dynamic rebuild.
+///
+/// Anything that isn't a decodable descriptor transmission is left to
+/// the normal dispatch path untouched.
+pub(crate) fn import_wire_descriptors(registry: &Registry, txn: &Transmission) {
+    fn decode_as<T>(txn: &Transmission) -> Option<T>
+    where
+        T: StructValue + Clone,
+    {
+        match &txn.payload {
+            dots_rs_model::Payload::Typed(a) => a.as_typed::<T>().cloned(),
+            dots_rs_model::Payload::Wire(_) => {
+                let bytes = txn.payload.encode();
+                match dots_rs_core::decode_typed_from_slice(&bytes) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to decode wire descriptor data");
+                        None
+                    }
                 }
             }
         }
-    };
-    match registry.build_dynamic_enum(&data) {
-        Ok(d) => {
-            tracing::debug!(name = %d.name, "registered enum descriptor from wire");
-            registry.register_enum_dynamic(Arc::new(d));
+    }
+
+    match txn.header.type_name.as_deref() {
+        Some("EnumDescriptorData") => {
+            let Some(data) = decode_as::<EnumDescriptorData>(txn) else {
+                return;
+            };
+            if data.name.as_deref().is_some_and(|n| registry.lookup(n).is_some()) {
+                return;
+            }
+            match registry.build_dynamic_enum(&data) {
+                Ok(d) => {
+                    tracing::debug!(name = %d.name, "registered enum descriptor from wire");
+                    registry.register_enum_dynamic(Arc::new(d));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        name = ?data.name,
+                        "could not build dynamic enum from wire EnumDescriptorData",
+                    );
+                }
+            }
         }
-        Err(e) => {
-            tracing::warn!(
-                error = ?e,
-                name = ?data.name,
-                "could not build dynamic enum from wire EnumDescriptorData",
-            );
+        Some("StructDescriptorData") => {
+            let Some(data) = decode_as::<StructDescriptorData>(txn) else {
+                return;
+            };
+            if data.name.as_deref().is_some_and(|n| registry.lookup(n).is_some()) {
+                return;
+            }
+            match registry.build_dynamic_struct(&data) {
+                Ok(d) => {
+                    tracing::debug!(name = %d.name, "registered struct descriptor from wire");
+                    registry.register_struct_dynamic(Arc::new(d));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        name = ?data.name,
+                        "could not build dynamic descriptor from wire StructDescriptorData",
+                    );
+                }
+            }
         }
+        _ => {}
     }
 }
 
