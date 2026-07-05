@@ -3,9 +3,13 @@
 //! Mirrors dots-cpp's `Container<type::Struct>` + `Container<T>` split:
 //!
 //! - [`DynContainer`] is the actual storage. It holds
-//!   `BTreeMap<key_bytes, DynContainerEntry>` where each entry is an
-//!   [`AnyStruct`] (a heap allocation laid out exactly like the typed
-//!   `T` would be) plus [`CloneInfo`]. The dispatcher inserts incoming
+//!   `BTreeMap<key_bytes, DynContainerEntry>` where each entry is a
+//!   [`ContainerValue`] plus [`CloneInfo`]. Built over either
+//!   descriptor kind (see [`ContainerDescriptor`]): a static
+//!   descriptor stores [`AnyStruct`] entries (heap allocations laid
+//!   out exactly like the typed `T`), a runtime-described one stores
+//!   [`DynamicStruct`] entries — the cache behind `subscribe_dynamic`
+//!   on wire-learned cached types. The dispatcher inserts incoming
 //!   transmissions here knowing only the descriptor — no compile-time
 //!   `T`.
 //! - [`Container<T>`] is a thin handle: `Arc<DynContainer>` +
@@ -40,9 +44,10 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex, Weak};
 
 use dots_rs_core::{
-    AnyStruct, StructDescriptor, StructValue, Timepoint, encode_key_bytes, encode_key_into,
+    AnyStruct, DynamicStruct, DynamicStructDescriptor, PropertySet, StructDescriptor, StructValue,
+    Timepoint, encode_key_bytes, encode_key_into, encode_to_vec,
 };
-use dots_rs_model::{DotsHeader, Transmission};
+use dots_rs_model::{DotsHeader, Payload, Transmission};
 use parking_lot::{RwLock, RwLockReadGuard};
 
 use crate::connection::{DispatchEntry, DispatchState, GroupLeaver};
@@ -62,6 +67,14 @@ thread_local! {
 /// by the read paths ([`Container::get`], [`ContainerReadGuard::get`])
 /// where the key is consumed immediately by a `BTreeMap` lookup and
 /// never stored.
+/// Panic message for typed reads over a mismatching stored value. The
+/// monotone promotion invariant (a container reachable through a typed
+/// `Container<T>` view is in the static representation and stays there)
+/// makes hitting this a library bug, not a user error — hence panic
+/// rather than `Option` on every read path.
+const TYPED_VIEW_EXPECT: &str = "typed Container over a dynamic-representation container — \
+     obtain typed views via GuestTransceiver::container so promotion runs";
+
 fn with_key_bytes<R>(query: &dyn StructValue, f: impl FnOnce(&[u8]) -> R) -> R {
     KEY_SCRATCH.with(|cell| {
         let mut buf = cell.borrow_mut();
@@ -137,21 +150,281 @@ where
     }
 }
 
+/// The descriptor a [`DynContainer`] is built over: either the
+/// compile-time `&'static` descriptor a `#[derive(DotsStruct)]` type
+/// emits, or a runtime-described descriptor learned from the wire
+/// (descriptor exchange). The kind determines the container's storage
+/// representation — see [`ContainerValue`].
+#[derive(Clone)]
+pub enum ContainerDescriptor {
+    /// Compile-time descriptor; entries are stored as [`AnyStruct`]
+    /// (layout-compatible with the typed `T`, zero-copy typed reads).
+    Static(&'static StructDescriptor),
+    /// Runtime-described descriptor; entries are stored as
+    /// [`DynamicStruct`] (the wire-only tagged-union representation).
+    Dynamic(Arc<DynamicStructDescriptor>),
+}
+
+impl ContainerDescriptor {
+    /// The described type's wire name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Static(d) => d.name,
+            Self::Dynamic(d) => &d.name,
+        }
+    }
+
+    /// Whether the described type is cached (broker keeps state;
+    /// containers classify create/update/remove against it).
+    pub fn is_cached(&self) -> bool {
+        match self {
+            Self::Static(d) => d.flags.is_cached(),
+            Self::Dynamic(d) => d.flags.is_cached(),
+        }
+    }
+}
+
+impl From<&'static StructDescriptor> for ContainerDescriptor {
+    fn from(d: &'static StructDescriptor) -> Self {
+        Self::Static(d)
+    }
+}
+
+impl From<Arc<DynamicStructDescriptor>> for ContainerDescriptor {
+    fn from(d: Arc<DynamicStructDescriptor>) -> Self {
+        Self::Dynamic(d)
+    }
+}
+
+impl core::fmt::Debug for ContainerDescriptor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Static(d) => f.debug_tuple("Static").field(&d.name).finish(),
+            Self::Dynamic(d) => f.debug_tuple("Dynamic").field(&d.name).finish(),
+        }
+    }
+}
+
+/// A stored instance, in the representation the owning container's
+/// [`ContainerDescriptor`] kind mandates: `Static` containers hold
+/// only `Typed` values, `Dynamic` containers only `Dynamic` values.
+/// Incoming payloads of the other representation are converted on the
+/// way in (see `convert_payload`), so the variants never mix within
+/// one container.
+#[derive(Clone, Debug)]
+pub enum ContainerValue {
+    /// Layout-compatible heap buffer; typed views borrow `&T` from it.
+    Typed(AnyStruct),
+    /// Wire-only tagged-union representation.
+    Dynamic(DynamicStruct),
+}
+
+impl ContainerValue {
+    /// Borrow the stored value as `&T`. `None` for the `Dynamic`
+    /// representation (no typed layout to cast to).
+    pub fn as_typed<T: StructValue>(&self) -> Option<&T> {
+        match self {
+            Self::Typed(a) => a.as_typed::<T>(),
+            Self::Dynamic(_) => None,
+        }
+    }
+
+    /// Borrow the stored value as a [`DynamicStruct`]. `None` for the
+    /// `Typed` representation (project via CBOR instead if needed).
+    pub fn as_dynamic(&self) -> Option<&DynamicStruct> {
+        match self {
+            Self::Typed(_) => None,
+            Self::Dynamic(d) => Some(d),
+        }
+    }
+
+    /// The stored type's wire name.
+    pub fn type_name(&self) -> &str {
+        match self {
+            Self::Typed(a) => a.descriptor().name,
+            Self::Dynamic(d) => &d.descriptor.name,
+        }
+    }
+
+    /// Masked partial-update merge, cloning the addressed properties
+    /// in. Both sides are same-variant by the container's
+    /// representation invariant; a cross-variant call is a library bug
+    /// and degrades to a no-op.
+    fn merge_from(&mut self, src: &ContainerValue, mask: PropertySet) {
+        match (self, src) {
+            (Self::Typed(dst), Self::Typed(s)) => dst.merge_from(s, mask),
+            (Self::Dynamic(dst), Self::Dynamic(s)) => dst.merge_from(s, mask),
+            _ => debug_assert!(false, "container representation invariant violated in merge_from"),
+        }
+    }
+
+    /// Masked partial-update merge that **moves** the addressed
+    /// properties out of `src`. Same-variant invariant as
+    /// [`merge_from`](Self::merge_from).
+    fn merge_take(&mut self, src: &mut ContainerValue, mask: PropertySet) {
+        match (self, src) {
+            (Self::Typed(dst), Self::Typed(s)) => dst.merge_take(s, mask),
+            (Self::Dynamic(dst), Self::Dynamic(s)) => dst.merge_take(s, mask),
+            _ => debug_assert!(false, "container representation invariant violated in merge_take"),
+        }
+    }
+}
+
+/// A payload admitted into a container, borrowed when its
+/// representation already matches the container's and owned when it
+/// had to be converted. Keeps the hot path (matching representation)
+/// clone-free: updates merge straight from the borrow, and only a
+/// create clones the value in.
+enum Converted<'a> {
+    BorrowedTyped(&'a AnyStruct),
+    BorrowedDynamic(&'a DynamicStruct),
+    Owned(ContainerValue),
+}
+
+impl Converted<'_> {
+    /// Merge this payload's masked properties into an existing entry.
+    fn merge_into(&self, dst: &mut ContainerValue, mask: PropertySet) {
+        match (dst, self) {
+            (ContainerValue::Typed(d), Self::BorrowedTyped(s)) => d.merge_from(*s, mask),
+            (ContainerValue::Dynamic(d), Self::BorrowedDynamic(s)) => d.merge_from(s, mask),
+            (d, Self::Owned(s)) => d.merge_from(s, mask),
+            _ => debug_assert!(false, "container representation invariant violated in merge_into"),
+        }
+    }
+
+    /// Take ownership for a create insert (clones the borrowed cases).
+    fn into_value(self) -> ContainerValue {
+        match self {
+            Self::BorrowedTyped(a) => ContainerValue::Typed(a.clone()),
+            Self::BorrowedDynamic(d) => ContainerValue::Dynamic(d.clone()),
+            Self::Owned(v) => v,
+        }
+    }
+}
+
+/// Admit `payload` into a container described by `descriptor`:
+/// identity-check it, and convert it to the container's representation
+/// when it arrived in the other one. Cross-representation conversion
+/// goes through a descriptor-driven CBOR roundtrip **against the
+/// container's own descriptor** — for the `Dynamic` side this keeps
+/// every stored entry sharing the container's `Arc` (never
+/// [`DynamicStruct::from_struct_value`], which mints a fresh `Arc` per
+/// call and breaks pointer-identity equality of stored values).
+///
+/// Returns `None` (with a warning) for foreign types and conversion
+/// failures; the transmission is dropped for this container.
+fn convert_payload<'a>(
+    payload: &'a Payload,
+    descriptor: &ContainerDescriptor,
+) -> Option<Converted<'a>> {
+    let payload_name = match payload {
+        Payload::Typed(a) => a.descriptor().name,
+        Payload::Wire(w) => &w.descriptor.name,
+    };
+    if payload_name != descriptor.name() {
+        tracing::warn!(
+            container = descriptor.name(),
+            payload = payload_name,
+            "DynContainer received payload for unexpected type"
+        );
+        return None;
+    }
+    match (descriptor, payload) {
+        (ContainerDescriptor::Static(d), Payload::Typed(a)) => {
+            if core::ptr::eq(a.descriptor(), *d) {
+                Some(Converted::BorrowedTyped(a))
+            } else {
+                // Same name, different static descriptor — cannot
+                // happen (one 'static descriptor per derived type).
+                tracing::warn!(
+                    container = d.name,
+                    "DynContainer payload static descriptor identity mismatch"
+                );
+                None
+            }
+        }
+        (ContainerDescriptor::Dynamic(d), Payload::Wire(w)) => {
+            if Arc::ptr_eq(&w.descriptor, d) {
+                Some(Converted::BorrowedDynamic(w))
+            } else {
+                // Structurally the same type but a different descriptor
+                // instance (registry re-registration) — normalise onto
+                // the container's Arc via re-decode.
+                decode_dynamic(&w.encode(), d).map(Converted::Owned)
+            }
+        }
+        (ContainerDescriptor::Static(d), Payload::Wire(w)) => {
+            decode_typed(&w.encode(), d).map(Converted::Owned)
+        }
+        (ContainerDescriptor::Dynamic(d), Payload::Typed(a)) => {
+            decode_dynamic(&encode_to_vec(a), d).map(Converted::Owned)
+        }
+    }
+}
+
+/// Owned-payload variant of [`convert_payload`]: moves the value
+/// through when the representation matches, converts otherwise.
+fn convert_payload_owned(
+    payload: Payload,
+    descriptor: &ContainerDescriptor,
+) -> Option<ContainerValue> {
+    match (descriptor, payload) {
+        (ContainerDescriptor::Static(d), Payload::Typed(a))
+            if core::ptr::eq(a.descriptor(), *d) =>
+        {
+            Some(ContainerValue::Typed(a))
+        }
+        (ContainerDescriptor::Dynamic(d), Payload::Wire(w)) if Arc::ptr_eq(&w.descriptor, d) => {
+            Some(ContainerValue::Dynamic(w))
+        }
+        (_, payload) => Some(convert_payload(&payload, descriptor)?.into_value()),
+    }
+}
+
+fn decode_dynamic(bytes: &[u8], descriptor: &Arc<DynamicStructDescriptor>) -> Option<ContainerValue> {
+    match DynamicStruct::decode(descriptor.clone(), bytes) {
+        Ok(d) => Some(ContainerValue::Dynamic(d)),
+        Err(e) => {
+            tracing::warn!(
+                container = %descriptor.name,
+                error = %e,
+                "DynContainer dropped payload that failed dynamic conversion"
+            );
+            None
+        }
+    }
+}
+
+fn decode_typed(bytes: &[u8], descriptor: &'static StructDescriptor) -> Option<ContainerValue> {
+    match AnyStruct::decode_from_slice(descriptor, bytes) {
+        Ok(a) => Some(ContainerValue::Typed(a)),
+        Err(e) => {
+            tracing::warn!(
+                container = descriptor.name,
+                error = %e,
+                "DynContainer dropped payload that failed typed conversion"
+            );
+            None
+        }
+    }
+}
+
 /// Type-erased entry as held in [`DynContainer`]'s storage.
 ///
-/// The value is an [`AnyStruct`] — a heap allocation whose layout
-/// matches the typed `T` exactly. Typed views borrow `&T` directly
-/// via [`AnyStruct::as_typed`].
+/// The value is a [`ContainerValue`] in the representation the
+/// container's [`ContainerDescriptor`] kind mandates — [`AnyStruct`]
+/// under a static descriptor (typed views borrow `&T` directly via
+/// [`AnyStruct::as_typed`]), [`DynamicStruct`] under a runtime one.
 #[derive(Clone)]
 pub struct DynContainerEntry {
-    pub value: AnyStruct,
+    pub value: ContainerValue,
     pub clone_info: CloneInfo,
 }
 
 impl core::fmt::Debug for DynContainerEntry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DynContainerEntry")
-            .field("type", &self.value.descriptor().name)
+            .field("type", &self.value.type_name())
             .field("clone_info", &self.clone_info)
             .finish_non_exhaustive()
     }
@@ -178,14 +451,21 @@ pub struct ContainerEntry<T> {
 pub(crate) struct DispatchOutcome {
     pub operation: Operation,
     /// The post-update container instance (create / update) or the
-    /// just-removed instance (remove), type-erased.
-    pub updated: AnyStruct,
+    /// just-removed instance (remove), type-erased, in the container's
+    /// representation.
+    pub updated: ContainerValue,
     pub clone_info: CloneInfo,
     /// Lazily-materialised typed `Arc<T>` of [`updated`](Self::updated),
-    /// shared by every subscriber of this transmission. Type-erased so the
-    /// (type-erased) container can build the outcome; the first subscriber
-    /// fills it, the rest clone the `Arc`. `None` until first use.
+    /// shared by every typed subscriber of this transmission. Type-erased
+    /// so the (type-erased) container can build the outcome; the first
+    /// subscriber fills it, the rest clone the `Arc`. `None` until first
+    /// use.
     shared_typed: Option<Arc<dyn Any + Send + Sync>>,
+    /// Lazily-materialised `Arc<DynamicStruct>` of `updated`, shared by
+    /// every *dynamic* subscriber of this transmission. A separate slot
+    /// from `shared_typed` so mixed typed + dynamic subscriber sets don't
+    /// evict each other's projection.
+    shared_dynamic: Option<Arc<DynamicStruct>>,
 }
 
 impl DispatchOutcome {
@@ -193,9 +473,11 @@ impl DispatchOutcome {
     /// caller deep-clones it out of the type-erased [`updated`](Self::updated)
     /// and caches it; subsequent callers get a cheap `Arc` clone.
     ///
-    /// `fallback` covers the impossible case of a descriptor-identity
+    /// `fallback` covers the impossible cases — a descriptor-identity
     /// mismatch (the transmission was routed here by type name, so the
-    /// stored value is a `T`); it is never expected to run.
+    /// stored value is a `T`) or a dynamic-representation container (a
+    /// typed subscriber's existence implies the typed pool path ran and
+    /// promoted the container to static). Never expected to run.
     pub(crate) fn shared_updated<T>(&mut self, fallback: &T) -> Arc<T>
     where
         T: StructValue + Clone + Send + Sync + 'static,
@@ -213,6 +495,32 @@ impl DispatchOutcome {
         );
         self.shared_typed = Some(Arc::clone(&typed) as Arc<dyn Any + Send + Sync>);
         typed
+    }
+
+    /// The `updated` instance as a [`DynamicStruct`], shared across the
+    /// transmission's dynamic subscribers: the first caller materialises
+    /// it (an `Arc`-bump for dynamic-representation containers, one CBOR
+    /// projection for static ones) and caches it; the rest clone the
+    /// `Arc`.
+    ///
+    /// `descriptor` is the subscriber's runtime descriptor — projections
+    /// from a `Typed` value decode against it so successive events of one
+    /// subscription share a single descriptor `Arc` (pointer-identity
+    /// equality between event values works).
+    pub(crate) fn shared_dynamic(
+        &mut self,
+        descriptor: &Arc<DynamicStructDescriptor>,
+    ) -> Arc<DynamicStruct> {
+        if let Some(existing) = &self.shared_dynamic {
+            return Arc::clone(existing);
+        }
+        let dynamic = Arc::new(match &self.updated {
+            ContainerValue::Dynamic(d) => d.clone(),
+            ContainerValue::Typed(a) => DynamicStruct::decode(descriptor.clone(), &encode_to_vec(a))
+                .unwrap_or_else(|_| DynamicStruct::from_struct_value(a)),
+        });
+        self.shared_dynamic = Some(Arc::clone(&dynamic));
+        dynamic
     }
 }
 
@@ -235,6 +543,15 @@ pub(crate) enum DispatchShared {
 
 type Entries = BTreeMap<Vec<u8>, DynContainerEntry>;
 
+/// A [`DynContainer`]'s lock-guarded interior: the descriptor and the
+/// entries live behind ONE `RwLock` so [`DynContainer::promote_to_static`]
+/// can swap both atomically — no reader or dispatcher ever observes a
+/// mixed representation.
+pub(crate) struct ContainerState {
+    descriptor: ContainerDescriptor,
+    entries: Entries,
+}
+
 /// Type-erased local cache mirror. Owns the storage; a typed
 /// [`Container<T>`] is a thin handle over `Arc<DynContainer>`.
 ///
@@ -242,15 +559,20 @@ type Entries = BTreeMap<Vec<u8>, DynContainerEntry>;
 /// pool — matching dots-cpp's `Container<type::Struct>`. The
 /// dispatcher inserts incoming transmissions by looking up the
 /// type name in the pool and applying the update directly here.
+/// Built over either a compile-time or a runtime-described descriptor
+/// (see [`ContainerDescriptor`]); the descriptor kind fixes the entry
+/// representation.
 pub struct DynContainer {
-    descriptor: &'static StructDescriptor,
+    /// The described type's wire name — stable and lock-free (a
+    /// container never changes its type, only its representation).
+    name: String,
     /// Read-mostly storage: dispatch takes the write lock on each
     /// incoming transmission (bursty), while application reads
     /// (`get` / `for_each` / `snapshot` / `len`) take the read lock and
     /// run concurrently. `parking_lot::RwLock` also means the lock
     /// can't be poisoned, so a panic inside a user closure passed to
     /// [`Container::for_each`] won't brick every later access.
-    entries: RwLock<Entries>,
+    state: RwLock<ContainerState>,
     /// Optional RAII leaver — publishes `DotsMember(Leave)` when this
     /// container drops. `Some` only for the
     /// [`crate::GuestTransceiver::container`] path; `None` for raw
@@ -261,27 +583,41 @@ pub struct DynContainer {
 
 impl DynContainer {
     /// Construct an empty container for the given descriptor.
-    pub(crate) fn new(descriptor: &'static StructDescriptor, leaver: Option<GroupLeaver>) -> Self {
+    pub(crate) fn new(
+        descriptor: impl Into<ContainerDescriptor>,
+        leaver: Option<GroupLeaver>,
+    ) -> Self {
+        let descriptor = descriptor.into();
         Self {
-            descriptor,
-            entries: RwLock::new(BTreeMap::new()),
+            name: descriptor.name().to_string(),
+            state: RwLock::new(ContainerState {
+                descriptor,
+                entries: BTreeMap::new(),
+            }),
             _leaver: leaver,
         }
     }
 
-    /// The descriptor this container holds instances of.
-    pub fn descriptor(&self) -> &'static StructDescriptor {
-        self.descriptor
+    /// The described type's wire name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The descriptor this container holds instances of. Cheap clone
+    /// (`&'static` ref or `Arc` bump) taken under the read lock — the
+    /// kind can change once via `promote_to_static` (crate-internal).
+    pub fn descriptor(&self) -> ContainerDescriptor {
+        self.state.read().descriptor.clone()
     }
 
     /// Number of stored entries.
     pub fn len(&self) -> usize {
-        self.entries.read().len()
+        self.state.read().entries.len()
     }
 
     /// `true` if no entries are stored.
     pub fn is_empty(&self) -> bool {
-        self.entries.read().is_empty()
+        self.state.read().entries.is_empty()
     }
 
     /// Run a closure over the type-erased storage while holding the
@@ -291,46 +627,77 @@ impl DynContainer {
     where
         F: FnOnce(&BTreeMap<Vec<u8>, DynContainerEntry>) -> R,
     {
-        let entries = self.entries.read();
-        f(&entries)
+        let state = self.state.read();
+        f(&state.entries)
     }
 
-    /// Apply an incoming transmission to this container. The
-    /// payload's [`AnyStruct`] is stored verbatim (cloned out of the
-    /// transmission); key bytes for indexing come from
-    /// [`encode_key_bytes`] over the same buffer.
+    /// Convert a dynamic-representation container to the static
+    /// representation **in place**: every stored [`DynamicStruct`] is
+    /// re-decoded into an [`AnyStruct`] and the descriptor swaps to
+    /// `Static`, all under one write lock. No-op if already static.
+    ///
+    /// Called by the typed pool path
+    /// ([`crate::GuestTransceiver::container`]) when it finds a
+    /// container that `subscribe_dynamic` created first from a
+    /// wire-learned descriptor. Promotion is monotone — a container
+    /// never goes back to the dynamic representation — which is what
+    /// lets typed read paths `expect` the `Typed` variant. Callers
+    /// must not hold the pool mutex.
+    pub(crate) fn promote_to_static(&self, descriptor: &'static StructDescriptor) {
+        let mut state = self.state.write();
+        if matches!(state.descriptor, ContainerDescriptor::Static(_)) {
+            return;
+        }
+        debug_assert_eq!(state.descriptor.name(), descriptor.name);
+        state.entries.retain(|key, entry| {
+            let ContainerValue::Dynamic(d) = &entry.value else {
+                return true;
+            };
+            match AnyStruct::decode_from_slice(descriptor, &d.encode()) {
+                Ok(a) => {
+                    debug_assert_eq!(
+                        *key,
+                        encode_key_bytes(&a),
+                        "key bytes must be representation-independent"
+                    );
+                    entry.value = ContainerValue::Typed(a);
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        container = %self.name,
+                        error = %e,
+                        "dropping entry that failed static promotion"
+                    );
+                    false
+                }
+            }
+        });
+        state.descriptor = ContainerDescriptor::Static(descriptor);
+    }
+
+    /// Apply an incoming transmission to this container. Payloads in
+    /// the container's representation are stored verbatim (cloned out
+    /// of the transmission); the other representation is converted on
+    /// the way in (see [`convert_payload`]). Key bytes for indexing
+    /// come from [`Payload::key_bytes`], which is
+    /// representation-independent.
     ///
     /// `remove_obj == Some(true)` headers remove the keyed entry;
     /// otherwise the entry is inserted-or-updated with refreshed
     /// `CloneInfo`. Matches the C++ `Container<>::insert` / `remove`
     /// semantics.
-    ///
-    /// Wire-only payloads ([`dots_rs_model::Payload::Wire`]) are silently
-    /// dropped: typed containers exist only for types whose static
-    /// descriptor is known, so a Wire payload here would mean the
-    /// receiver subscribed to a dynamic type whose container was
-    /// somehow opened — not a supported path.
     pub(crate) fn apply(&self, txn: &Transmission) {
-        let dots_rs_model::Payload::Typed(value) = &txn.payload else {
-            tracing::warn!(
-                type_name = txn.header.type_name.as_deref().unwrap_or("?"),
-                "DynContainer dropped a Wire payload (no static descriptor)"
-            );
+        // Write lock FIRST: conversion consults the descriptor, which
+        // may only change (promotion) under this same lock.
+        let mut state = self.state.write();
+        let Some(value) = convert_payload(&txn.payload, &state.descriptor) else {
             return;
         };
-        if !core::ptr::eq(value.descriptor(), self.descriptor) {
-            tracing::warn!(
-                container = self.descriptor.name,
-                payload = value.descriptor().name,
-                "DynContainer received payload for unexpected type"
-            );
-            return;
-        }
-        let key = encode_key_bytes(value);
-        let mut entries = self.entries.write();
+        let key = txn.payload.key_bytes();
 
         if txn.header.remove_obj == Some(true) {
-            entries.remove(&key);
+            state.entries.remove(&key);
             return;
         }
 
@@ -339,7 +706,7 @@ impl DynContainer {
         // Single BTree traversal: the entry API locates the slot once,
         // and we read the prior `created_*` (on update) or seed it (on
         // create) from that same slot rather than a separate `get`.
-        match entries.entry(key) {
+        match state.entries.entry(key) {
             Entry::Occupied(mut slot) => {
                 // Partial-update merge, matching dots-cpp
                 // `Container::updateWithoutKeys`: overlay only the
@@ -355,16 +722,16 @@ impl DynContainer {
                 // buffer and deep-clones only the changed properties;
                 // `created_*` survive because we mutate the entry
                 // instead of rebuilding it.
-                let mask = txn.header.attributes.unwrap_or_else(|| value.valid_set());
+                let mask = txn.header.attributes.unwrap_or_else(|| txn.payload.valid_set());
                 let entry = slot.get_mut();
-                entry.value.merge_from(value, mask);
+                value.merge_into(&mut entry.value, mask);
                 entry.clone_info.last_operation = Operation::Update;
                 entry.clone_info.last_update_time = now_time;
                 entry.clone_info.last_update_sender = now_sender;
             }
             Entry::Vacant(slot) => {
                 slot.insert(DynContainerEntry {
-                    value: value.clone(),
+                    value: value.into_value(),
                     clone_info: CloneInfo {
                         last_operation: Operation::Create,
                         last_update_time: now_time,
@@ -381,49 +748,37 @@ impl DynContainer {
     /// dispatcher hands this container the only copy of an incoming
     /// transmission (the read loop owns it and drops it afterward).
     ///
-    /// It moves the decoded value rather than cloning it:
-    /// - **create** stores the [`AnyStruct`] directly (zero deep clone);
+    /// It moves the decoded value rather than cloning it (when the
+    /// payload is already in the container's representation):
+    /// - **create** stores the value directly (zero deep clone);
     /// - **update** moves the changed properties out of the incoming
-    ///   value into the existing entry via
-    ///   [`AnyStruct::merge_take`](dots_rs_core::AnyStruct::merge_take)
-    ///   (no deep clone of `String`/`Vec` payloads).
+    ///   value into the existing entry via `merge_take` (no deep clone
+    ///   of `String`/`Vec` payloads).
     ///
-    /// Behaviour is otherwise identical to [`apply`](Self::apply); only
-    /// `Payload::Typed` reaches here (the dispatcher routes `Wire`
-    /// payloads through the borrowing path).
+    /// Cross-representation payloads are converted first (see
+    /// [`convert_payload_owned`]); behaviour is otherwise identical to
+    /// [`apply`](Self::apply).
     pub(crate) fn apply_owned(&self, txn: Transmission) {
         let dots_rs_model::Transmission { header, payload } = txn;
-        let dots_rs_model::Payload::Typed(value) = payload else {
-            tracing::warn!(
-                type_name = header.type_name.as_deref().unwrap_or("?"),
-                "DynContainer::apply_owned dropped a non-Typed payload"
-            );
+        let key = payload.key_bytes();
+        let mask_fallback = payload.valid_set();
+        let mut state = self.state.write();
+        let Some(mut value) = convert_payload_owned(payload, &state.descriptor) else {
             return;
         };
-        if !core::ptr::eq(value.descriptor(), self.descriptor) {
-            tracing::warn!(
-                container = self.descriptor.name,
-                payload = value.descriptor().name,
-                "DynContainer received payload for unexpected type"
-            );
-            return;
-        }
-        let key = encode_key_bytes(&value);
-        let mut entries = self.entries.write();
 
         if header.remove_obj == Some(true) {
-            entries.remove(&key);
+            state.entries.remove(&key);
             return;
         }
 
         let now_sender = header.sender;
         let now_time = header.sent_time;
-        match entries.entry(key) {
+        match state.entries.entry(key) {
             Entry::Occupied(mut slot) => {
-                let mask = header.attributes.unwrap_or_else(|| value.valid_set());
+                let mask = header.attributes.unwrap_or(mask_fallback);
                 // Move the changed properties out of the owned incoming
                 // value; whatever isn't moved drops with `value`.
-                let mut value = value;
                 let entry = slot.get_mut();
                 entry.value.merge_take(&mut value, mask);
                 entry.clone_info.last_operation = Operation::Update;
@@ -458,24 +813,19 @@ impl DynContainer {
     /// that isn't present (dots-cpp emits no event in that case) or a
     /// payload that doesn't belong to this container.
     pub(crate) fn apply_and_classify(&self, txn: &Transmission) -> Option<DispatchOutcome> {
-        let dots_rs_model::Payload::Typed(value) = &txn.payload else {
-            return None;
-        };
-        if !core::ptr::eq(value.descriptor(), self.descriptor) {
-            return None;
-        }
-        let key = encode_key_bytes(value);
+        let mut state = self.state.write();
+        let value = convert_payload(&txn.payload, &state.descriptor)?;
+        let key = txn.payload.key_bytes();
         let now_sender = txn.header.sender;
         let now_time = txn.header.sent_time;
-        let mut entries = self.entries.write();
 
         if txn.header.remove_obj == Some(true) {
             // Extract the entry so the dispatched instance is the
             // last-known value merged with the (key-only) remove payload;
             // an absent key emits no event, matching dots-cpp.
-            let mut removed = entries.remove(&key)?;
-            let mask = txn.header.attributes.unwrap_or_else(|| value.valid_set());
-            removed.value.merge_from(value, mask);
+            let mut removed = state.entries.remove(&key)?;
+            let mask = txn.header.attributes.unwrap_or_else(|| txn.payload.valid_set());
+            value.merge_into(&mut removed.value, mask);
             removed.clone_info.last_operation = Operation::Remove;
             removed.clone_info.last_update_time = now_time;
             removed.clone_info.last_update_sender = now_sender;
@@ -484,14 +834,15 @@ impl DynContainer {
                 updated: removed.value,
                 clone_info: removed.clone_info,
                 shared_typed: None,
+                shared_dynamic: None,
             });
         }
 
-        match entries.entry(key) {
+        match state.entries.entry(key) {
             Entry::Occupied(mut slot) => {
-                let mask = txn.header.attributes.unwrap_or_else(|| value.valid_set());
+                let mask = txn.header.attributes.unwrap_or_else(|| txn.payload.valid_set());
                 let entry = slot.get_mut();
-                entry.value.merge_from(value, mask);
+                value.merge_into(&mut entry.value, mask);
                 entry.clone_info.last_operation = Operation::Update;
                 entry.clone_info.last_update_time = now_time;
                 entry.clone_info.last_update_sender = now_sender;
@@ -500,11 +851,12 @@ impl DynContainer {
                     updated: entry.value.clone(),
                     clone_info: entry.clone_info.clone(),
                     shared_typed: None,
+                    shared_dynamic: None,
                 })
             }
             Entry::Vacant(slot) => {
                 let stored = slot.insert(DynContainerEntry {
-                    value: value.clone(),
+                    value: value.into_value(),
                     clone_info: CloneInfo {
                         last_operation: Operation::Create,
                         last_update_time: now_time,
@@ -518,6 +870,7 @@ impl DynContainer {
                     updated: stored.value.clone(),
                     clone_info: stored.clone_info.clone(),
                     shared_typed: None,
+                    shared_dynamic: None,
                 })
             }
         }
@@ -588,7 +941,7 @@ where
     /// need several lookups under the same lock.
     pub fn lock(&self) -> ContainerReadGuard<'_, T> {
         ContainerReadGuard {
-            guard: self.inner.entries.read(),
+            guard: self.inner.state.read(),
             _phantom: PhantomData,
         }
     }
@@ -603,25 +956,22 @@ where
     /// specific fields you need, or `(*entry).clone()` for the whole
     /// value, then drop the ref to release the lock.
     pub fn get<'a>(&'a self, query: &T) -> Option<ContainerRef<'a, T>> {
-        let entries = self.inner.entries.read();
+        let state = self.inner.state.read();
         // `with_key_bytes` borrows a thread-local scratch buffer only
         // for the lookup; the returned `&DynContainerEntry` borrows
-        // `entries`, not the scratch, so it outlives the closure.
-        let entry = with_key_bytes(query, |key| entries.get(key))?;
-        // SAFETY: while `entries` (the read guard) is held, the
+        // `state`, not the scratch, so it outlives the closure.
+        let entry = with_key_bytes(query, |key| state.entries.get(key))?;
+        // SAFETY: while `state` (the read guard) is held, the
         // BTreeMap's entries (and therefore the AnyStruct buffer at
         // this key) are stable. The `&T` reflects the buffer's
         // contents; the pointer remains valid for the guard's lifetime.
-        let value: &T = entry
-            .value
-            .as_typed::<T>()
-            .expect("container stored value descriptor must match T");
+        let value: &T = entry.value.as_typed::<T>().expect(TYPED_VIEW_EXPECT);
         let value_ptr: *const T = value;
         let clone_info_ptr: *const CloneInfo = &entry.clone_info;
         Some(ContainerRef {
             value: value_ptr,
             clone_info: clone_info_ptr,
-            _guard: entries,
+            _guard: state,
             _phantom: PhantomData,
         })
     }
@@ -637,12 +987,9 @@ where
     where
         F: FnMut(&[u8], &T, &CloneInfo),
     {
-        let entries = self.inner.entries.read();
-        for (k, entry) in entries.iter() {
-            let value: &T = entry
-                .value
-                .as_typed::<T>()
-                .expect("container stored value descriptor must match T");
+        let state = self.inner.state.read();
+        for (k, entry) in state.entries.iter() {
+            let value: &T = entry.value.as_typed::<T>().expect(TYPED_VIEW_EXPECT);
             f(k.as_slice(), value, &entry.clone_info);
         }
     }
@@ -652,14 +999,12 @@ where
     /// returning — useful when the caller wants to process entries
     /// without blocking the dispatch path.
     pub fn snapshot(&self) -> Vec<ContainerEntry<T>> {
-        let entries = self.inner.entries.read();
-        entries
+        let state = self.inner.state.read();
+        state
+            .entries
             .values()
             .map(|entry| {
-                let value: &T = entry
-                    .value
-                    .as_typed::<T>()
-                    .expect("container stored value descriptor must match T");
+                let value: &T = entry.value.as_typed::<T>().expect(TYPED_VIEW_EXPECT);
                 ContainerEntry {
                     value: value.clone(),
                     clone_info: entry.clone_info.clone(),
@@ -694,7 +1039,7 @@ pub struct ContainerRef<'a, T> {
     /// Guard listed last so it drops *after* the raw-pointer fields
     /// (the fields themselves have no Drop, but order encodes intent
     /// — pointers should never outlive the guard).
-    _guard: RwLockReadGuard<'a, Entries>,
+    _guard: RwLockReadGuard<'a, ContainerState>,
     /// Encodes the `'a` lifetime + `T` covariance so the borrow
     /// checker treats `&self -> &T` correctly.
     _phantom: PhantomData<&'a T>,
@@ -733,7 +1078,7 @@ impl<T> Deref for ContainerRef<'_, T> {
 /// look up via its methods, then drop the guard to release the lock.
 /// Dispatch updates to this container block while the guard is alive.
 pub struct ContainerReadGuard<'a, T> {
-    guard: RwLockReadGuard<'a, Entries>,
+    guard: RwLockReadGuard<'a, ContainerState>,
     _phantom: PhantomData<fn() -> T>,
 }
 
@@ -746,30 +1091,27 @@ where
     /// stored `AnyStruct` buffers.
     pub fn iter(&self) -> ContainerIter<'_, T> {
         ContainerIter {
-            inner: self.guard.iter(),
+            inner: self.guard.entries.iter(),
             _phantom: PhantomData,
         }
     }
 
     /// Number of entries currently held.
     pub fn len(&self) -> usize {
-        self.guard.len()
+        self.guard.entries.len()
     }
 
     /// `true` if no entries are held.
     pub fn is_empty(&self) -> bool {
-        self.guard.is_empty()
+        self.guard.entries.is_empty()
     }
 
     /// Look up the entry whose key matches `query` (only `#[dots(key)]`
     /// properties matter). Cheaper than [`Container::get`] when you
     /// already hold the guard — no second lock acquisition.
     pub fn get(&self, query: &T) -> Option<(&T, &CloneInfo)> {
-        let entry = with_key_bytes(query, |key| self.guard.get(key))?;
-        let value: &T = entry
-            .value
-            .as_typed::<T>()
-            .expect("container stored value descriptor must match T");
+        let entry = with_key_bytes(query, |key| self.guard.entries.get(key))?;
+        let value: &T = entry.value.as_typed::<T>().expect(TYPED_VIEW_EXPECT);
         Some((value, &entry.clone_info))
     }
 }
@@ -800,10 +1142,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let (k, entry) = self.inner.next()?;
-        let value: &T = entry
-            .value
-            .as_typed::<T>()
-            .expect("container stored value descriptor must match T");
+        let value: &T = entry.value.as_typed::<T>().expect(TYPED_VIEW_EXPECT);
         Some((k.as_slice(), value, &entry.clone_info))
     }
 }
@@ -822,7 +1161,7 @@ where
 /// are constructed via [`crate::Connection::container`] or by
 /// [`crate::View`].
 pub(crate) fn make_dyn_container(
-    descriptor: &'static StructDescriptor,
+    descriptor: impl Into<ContainerDescriptor>,
     dispatch: &Arc<Mutex<DispatchState>>,
     leaver: Option<GroupLeaver>,
 ) -> Arc<DynContainer> {
@@ -833,7 +1172,7 @@ pub(crate) fn make_dyn_container(
     dispatch
         .lock()
         .expect("dispatch mutex poisoned")
-        .register(descriptor.name.into(), Box::new(entry));
+        .register(container.name().to_string(), Box::new(entry));
     container
 }
 
@@ -924,12 +1263,8 @@ impl DispatchEntry for DynContainerDispatchEntry {
                 Some(outcome) => DispatchShared::Cached(outcome),
                 None => DispatchShared::Suppressed,
             };
-        } else if matches!(txn.payload, dots_rs_model::Payload::Typed(_)) {
-            // `apply_owned` only handles `Typed`; route `Wire` (no owned
-            // `AnyStruct` to move) through the borrowing path.
-            container.apply_owned(txn);
         } else {
-            container.apply(&txn);
+            container.apply_owned(txn);
         }
         Ok(true)
     }
@@ -1144,5 +1479,275 @@ mod classify_tests {
         assert_eq!(ev.updated(), &pre_remove);
         assert_eq!(ev.updated().message.as_deref(), Some("latest"));
         assert_eq!(ev.updated().sequence, Some(20));
+    }
+}
+
+/// The dynamic-representation counterpart of `classify_tests`: a
+/// container built over a runtime descriptor (`ContainerDescriptor::
+/// Dynamic`) storing `DynamicStruct` entries — the `subscribe_dynamic`
+/// / wire-learned-type cache.
+#[cfg(test)]
+mod dynamic_classify_tests {
+    use super::*;
+    use dots_rs_core::Timepoint;
+    use dots_rs_derive::DotsStruct;
+
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "DynClassifyDynPinger", cached)]
+    struct DynPinger {
+        #[dots(tag = 1, key)]
+        id: Option<u32>,
+        #[dots(tag = 2)]
+        message: Option<String>,
+        #[dots(tag = 3)]
+        sequence: Option<u64>,
+    }
+
+    fn dyn_descriptor() -> Arc<DynamicStructDescriptor> {
+        Arc::new(DynamicStructDescriptor::from_static(DynPinger::DESCRIPTOR))
+    }
+
+    fn dyn_container(desc: &Arc<DynamicStructDescriptor>) -> Arc<DynContainer> {
+        Arc::new(DynContainer::new(desc.clone(), None))
+    }
+
+    fn header(value: &DynPinger, remove: bool) -> DotsHeader {
+        DotsHeader {
+            attributes: Some(value.valid_set()),
+            remove_obj: if remove { Some(true) } else { None },
+            sender: Some(7),
+            sent_time: Some(Timepoint(1.0)),
+            ..Default::default()
+        }
+    }
+
+    /// A `Payload::Wire` transmission, decoded against `desc` — what a
+    /// wire-learned type's transmission looks like after the codec ran.
+    fn wire_txn(desc: &Arc<DynamicStructDescriptor>, value: &DynPinger, h: &DotsHeader) -> Transmission {
+        let d = DynamicStruct::decode(desc.clone(), &encode_to_vec(value))
+            .expect("descriptor-driven roundtrip succeeds");
+        Transmission {
+            header: h.clone(),
+            payload: Payload::Wire(d),
+        }
+    }
+
+    fn typed_txn(value: &DynPinger, h: &DotsHeader) -> Transmission {
+        Transmission {
+            header: h.clone(),
+            payload: Payload::Typed(AnyStruct::from_struct_value(value)),
+        }
+    }
+
+    /// Full-value comparison through the deterministic encoding —
+    /// avoids descriptor-identity concerns of `DynamicStruct`'s
+    /// `PartialEq`.
+    fn assert_dynamic_eq(d: &DynamicStruct, expected: &DynPinger) {
+        assert_eq!(d.encode(), encode_to_vec(expected));
+    }
+
+    #[test]
+    fn dynamic_container_classifies_create_update_remove() {
+        let desc = dyn_descriptor();
+        let c = dyn_container(&desc);
+
+        let v1 = DynPinger {
+            id: Some(1),
+            message: Some("hi".into()),
+            sequence: Some(10),
+        };
+        let r = c
+            .apply_and_classify(&wire_txn(&desc, &v1, &header(&v1, false)))
+            .expect("create emits an event");
+        assert_eq!(r.operation, Operation::Create);
+        assert_dynamic_eq(r.updated.as_dynamic().expect("dynamic representation"), &v1);
+        assert_eq!(r.clone_info.created_sender, Some(7));
+
+        // Partial update touching only `message`: `sequence` survives.
+        let v2 = DynPinger {
+            id: Some(1),
+            message: Some("yo".into()),
+            sequence: None,
+        };
+        let r = c
+            .apply_and_classify(&wire_txn(&desc, &v2, &header(&v2, false)))
+            .expect("update emits an event");
+        assert_eq!(r.operation, Operation::Update);
+        let merged = DynPinger {
+            id: Some(1),
+            message: Some("yo".into()),
+            sequence: Some(10),
+        };
+        assert_dynamic_eq(r.updated.as_dynamic().unwrap(), &merged);
+        assert_eq!(r.clone_info.last_operation, Operation::Update);
+
+        // Remove: key-only payload; `updated` is the pre-remove state.
+        let v3 = DynPinger {
+            id: Some(1),
+            ..Default::default()
+        };
+        let r = c
+            .apply_and_classify(&wire_txn(&desc, &v3, &header(&v3, true)))
+            .expect("removing a present key emits an event");
+        assert_eq!(r.operation, Operation::Remove);
+        assert_dynamic_eq(r.updated.as_dynamic().unwrap(), &merged);
+        assert!(c.is_empty(), "the entry is gone after remove");
+    }
+
+    #[test]
+    fn dynamic_container_suppresses_remove_of_absent_key() {
+        let desc = dyn_descriptor();
+        let c = dyn_container(&desc);
+        let v = DynPinger {
+            id: Some(99),
+            ..Default::default()
+        };
+        assert!(
+            c.apply_and_classify(&wire_txn(&desc, &v, &header(&v, true)))
+                .is_none()
+        );
+        assert!(c.is_empty());
+    }
+
+    /// Stored entries share the container's descriptor `Arc` even when
+    /// the payload was decoded against a *different* descriptor
+    /// instance (registry re-registration) — the conversion normalises
+    /// onto the container's `Arc`.
+    #[test]
+    fn foreign_descriptor_arc_normalises_onto_container_arc() {
+        let container_desc = dyn_descriptor();
+        let c = dyn_container(&container_desc);
+        let other_desc = dyn_descriptor(); // structurally equal, different Arc
+        assert!(!Arc::ptr_eq(&container_desc, &other_desc));
+
+        let v = DynPinger {
+            id: Some(1),
+            message: Some("hi".into()),
+            sequence: None,
+        };
+        c.apply(&wire_txn(&other_desc, &v, &header(&v, false)));
+        c.with_entries_dyn(|entries| {
+            let entry = entries.values().next().expect("one entry");
+            let stored = entry.value.as_dynamic().expect("dynamic representation");
+            assert!(Arc::ptr_eq(&stored.descriptor, &container_desc));
+        });
+    }
+
+    /// Cross-representation admission, both directions: a `Typed`
+    /// payload converts into a dynamic-representation container, and a
+    /// `Wire` payload converts into a static-representation container
+    /// (which used to warn-drop it).
+    #[test]
+    fn cross_representation_payloads_convert_on_the_way_in() {
+        // Typed payload -> dynamic container.
+        let desc = dyn_descriptor();
+        let c = dyn_container(&desc);
+        let v = DynPinger {
+            id: Some(1),
+            message: Some("typed".into()),
+            sequence: Some(5),
+        };
+        c.apply(&typed_txn(&v, &header(&v, false)));
+        c.with_entries_dyn(|entries| {
+            let entry = entries.values().next().expect("one entry");
+            let stored = entry.value.as_dynamic().expect("converted to dynamic");
+            assert!(Arc::ptr_eq(&stored.descriptor, &desc));
+            assert_dynamic_eq(stored, &v);
+        });
+
+        // Wire payload -> static container.
+        let c = Arc::new(DynContainer::new(DynPinger::DESCRIPTOR, None));
+        c.apply(&wire_txn(&desc, &v, &header(&v, false)));
+        let typed_view = Container::<DynPinger>::from_dyn(c);
+        let entry = typed_view.get(&v).expect("converted to typed");
+        assert_eq!(&*entry, &v);
+    }
+
+    #[test]
+    fn promotion_migrates_entries_and_is_idempotent() {
+        let desc = dyn_descriptor();
+        let c = dyn_container(&desc);
+        let v1 = DynPinger {
+            id: Some(1),
+            message: Some("one".into()),
+            sequence: Some(10),
+        };
+        let v2 = DynPinger {
+            id: Some(2),
+            message: Some("two".into()),
+            sequence: Some(20),
+        };
+        c.apply(&wire_txn(&desc, &v1, &header(&v1, false)));
+        c.apply(&wire_txn(&desc, &v2, &header(&v2, false)));
+        let keys_before =
+            c.with_entries_dyn(|entries| entries.keys().cloned().collect::<Vec<_>>());
+
+        c.promote_to_static(DynPinger::DESCRIPTOR);
+        c.promote_to_static(DynPinger::DESCRIPTOR); // idempotent
+
+        assert!(matches!(c.descriptor(), ContainerDescriptor::Static(_)));
+        let keys_after = c.with_entries_dyn(|entries| entries.keys().cloned().collect::<Vec<_>>());
+        assert_eq!(keys_before, keys_after, "keys are representation-independent");
+
+        let typed_view = Container::<DynPinger>::from_dyn(c.clone());
+        let snapshot = typed_view.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].value, v1);
+        assert_eq!(snapshot[1].value, v2);
+        assert_eq!(
+            snapshot[0].clone_info.created_sender,
+            Some(7),
+            "CloneInfo survives promotion"
+        );
+
+        // The promoted container keeps classifying (now converting
+        // incoming Wire payloads to the static representation).
+        let v1b = DynPinger {
+            id: Some(1),
+            message: Some("one-updated".into()),
+            sequence: None,
+        };
+        let r = c
+            .apply_and_classify(&wire_txn(&desc, &v1b, &header(&v1b, false)))
+            .expect("update after promotion");
+        assert_eq!(r.operation, Operation::Update);
+        let u = r.updated.as_typed::<DynPinger>().cloned().expect("typed representation");
+        assert_eq!(u.message.as_deref(), Some("one-updated"));
+        assert_eq!(u.sequence, Some(10));
+    }
+
+    #[test]
+    fn shared_dynamic_projects_once_and_keeps_separate_slot_from_typed() {
+        // Dynamic-representation outcome: Arc is shared across calls.
+        let desc = dyn_descriptor();
+        let c = dyn_container(&desc);
+        let v = DynPinger {
+            id: Some(1),
+            message: Some("hi".into()),
+            sequence: Some(10),
+        };
+        let mut outcome = c
+            .apply_and_classify(&wire_txn(&desc, &v, &header(&v, false)))
+            .expect("create");
+        let a = outcome.shared_dynamic(&desc);
+        let b = outcome.shared_dynamic(&desc);
+        assert!(Arc::ptr_eq(&a, &b), "one projection, shared by Arc");
+        assert!(Arc::ptr_eq(&a.descriptor, &desc));
+
+        // Typed-representation outcome: `shared_updated::<T>` and
+        // `shared_dynamic` materialise independently (separate slots),
+        // and repeated calls of each share their own Arc.
+        let c = Arc::new(DynContainer::new(DynPinger::DESCRIPTOR, None));
+        let mut outcome = c
+            .apply_and_classify(&typed_txn(&v, &header(&v, false)))
+            .expect("create");
+        let t1 = outcome.shared_updated::<DynPinger>(&v);
+        let d1 = outcome.shared_dynamic(&desc);
+        let t2 = outcome.shared_updated::<DynPinger>(&v);
+        let d2 = outcome.shared_dynamic(&desc);
+        assert!(Arc::ptr_eq(&t1, &t2));
+        assert!(Arc::ptr_eq(&d1, &d2));
+        assert_eq!(&*t1, &v);
+        assert_dynamic_eq(&d1, &v);
     }
 }

@@ -524,10 +524,29 @@ impl GuestTransceiver {
         handler: impl FnMut(&Event<DynamicStruct>) + Send + 'static,
     ) -> SubscriptionHandle {
         let type_name = descriptor.name.clone();
-        self.registry.register_struct_dynamic(descriptor);
+        // Reuse-if-present: when the registry already holds a descriptor
+        // for this name (wire import, an earlier subscription), converge
+        // on its `Arc` so the codec, the container, and this subscriber
+        // all share one descriptor instance — `DynamicStruct` equality
+        // compares descriptors by pointer identity.
+        let descriptor = match self.registry.lookup(&type_name) {
+            Some(dots_rs_model::DescriptorEntry::Struct(existing)) => existing,
+            _ => {
+                self.registry.register_struct_dynamic(descriptor.clone());
+                descriptor
+            }
+        };
         self.join_group(&type_name);
         let leaver = self.make_leaver(&type_name);
-        let mut handle = register_dynamic_callback(&self.dispatch, type_name, handler);
+        // Cached types get a pool container so events classify
+        // create / update / remove against the local mirror — the
+        // dynamic counterpart of dots-cpp's `Dispatcher::dispatchEvent`
+        // routing every cached type through the container pool.
+        // Uncached types keep container-less always-create semantics.
+        if descriptor.flags.is_cached() {
+            let _ = self.get_or_create_dyn_container_dynamic(descriptor.clone());
+        }
+        let mut handle = register_dynamic_callback(&self.dispatch, type_name, descriptor, handler);
         handle.set_leaver(leaver);
         handle
     }
@@ -572,17 +591,64 @@ impl GuestTransceiver {
         {
             let pool = self.container_pool.lock().expect("container pool poisoned");
             if let Some(existing) = pool.get(name) {
-                return existing.clone();
+                let existing = existing.clone();
+                drop(pool);
+                // The pool entry may have been created by a *dynamic*
+                // subscription (wire-learned descriptor) before the typed
+                // path ran. Typed views need the static representation, so
+                // migrate in place; a no-op when already static. Runs
+                // outside the pool mutex — promotion takes the container's
+                // write lock and must not nest under the pool lock.
+                existing.promote_to_static(descriptor);
+                return existing;
             }
         }
         self.join_group(name);
         let leaver = self.make_leaver(name);
         let container =
             crate::container::make_dyn_container(descriptor, &self.dispatch, Some(leaver));
+        let winner = {
+            let mut pool = self.container_pool.lock().expect("container pool poisoned");
+            // Race: another thread may have raced us to insert. Honor
+            // the first insertion so dispatch entries don't double-up.
+            pool.entry(name.to_string()).or_insert(container).clone()
+        };
+        // If we lost the race the winner may be dynamic-representation.
+        winner.promote_to_static(descriptor);
+        winner
+    }
+
+    /// Dynamic-descriptor counterpart of
+    /// [`get_or_create_dyn_container`](Self::get_or_create_dyn_container),
+    /// used by [`subscribe_dynamic`](Self::subscribe_dynamic) for cached
+    /// wire-learned types. An existing pool entry is returned as-is —
+    /// in particular a *static*-representation container serves dynamic
+    /// subscribers via per-transmission projection, and is never
+    /// demoted. On a miss, the container is created in the static
+    /// representation when the codec registry holds a static descriptor
+    /// for the name (payloads will arrive as `Payload::Typed` anyway),
+    /// otherwise in the dynamic representation.
+    pub(crate) fn get_or_create_dyn_container_dynamic(
+        self: &Arc<Self>,
+        descriptor: Arc<DynamicStructDescriptor>,
+    ) -> Arc<crate::container::DynContainer> {
+        {
+            let pool = self.container_pool.lock().expect("container pool poisoned");
+            if let Some(existing) = pool.get(descriptor.name.as_str()) {
+                return existing.clone();
+            }
+        }
+        let name = descriptor.name.clone();
+        let container_descriptor = match self.registry.lookup_static_struct(&name) {
+            Some(d) => crate::container::ContainerDescriptor::Static(d),
+            None => crate::container::ContainerDescriptor::Dynamic(descriptor),
+        };
+        self.join_group(&name);
+        let leaver = self.make_leaver(&name);
+        let container =
+            crate::container::make_dyn_container(container_descriptor, &self.dispatch, Some(leaver));
         let mut pool = self.container_pool.lock().expect("container pool poisoned");
-        // Race: another thread may have raced us to insert. Honor
-        // the first insertion so dispatch entries don't double-up.
-        pool.entry(name.to_string()).or_insert(container).clone()
+        pool.entry(name).or_insert(container).clone()
     }
 
     /// Build a `GroupLeaver` whose drop publishes `DotsMember(Leave)`
@@ -1268,12 +1334,16 @@ where
 fn register_dynamic_callback<F>(
     dispatch: &Arc<Mutex<DispatchState>>,
     type_name: String,
+    descriptor: Arc<DynamicStructDescriptor>,
     handler: F,
 ) -> SubscriptionHandle
 where
     F: FnMut(&Event<DynamicStruct>) + Send + 'static,
 {
-    let entry = DynamicCallbackDispatchEntry { handler };
+    let entry = DynamicCallbackDispatchEntry {
+        descriptor,
+        handler,
+    };
     let id = dispatch
         .lock()
         .expect("dispatch mutex poisoned")
@@ -1297,6 +1367,11 @@ pub struct AllTypesSubscription {
 }
 
 struct DynamicCallbackDispatchEntry<F> {
+    /// The subscription's runtime descriptor. Projections of `Typed`
+    /// payloads / outcomes decode against this one `Arc` so successive
+    /// events of a subscription share a descriptor instance
+    /// (`DynamicStruct` equality is descriptor-pointer-identity).
+    descriptor: Arc<DynamicStructDescriptor>,
     handler: F,
 }
 
@@ -1315,10 +1390,16 @@ where
         // dynamic subscribers for types whose static descriptor *is*
         // compiled in — those decode to `Payload::Typed`, and the
         // handler still needs the `DynamicStruct` shape. Project
-        // through CBOR in that case.
+        // through CBOR in that case, decoding against this
+        // subscription's descriptor `Arc` (the `from_struct_value`
+        // fallback mints a fresh `Arc` and only runs on descriptor
+        // drift).
         let dyn_value = match &txn.payload {
             dots_rs_model::Payload::Wire(d) => d.clone(),
-            dots_rs_model::Payload::Typed(a) => DynamicStruct::from_struct_value(a),
+            dots_rs_model::Payload::Typed(a) => {
+                DynamicStruct::decode(self.descriptor.clone(), &dots_rs_core::encode_to_vec(a))
+                    .unwrap_or_else(|_| DynamicStruct::from_struct_value(a))
+            }
         };
         // When a cached container for the type ran (pass 1), classify
         // against its outcome exactly like a statically-typed
@@ -1326,19 +1407,19 @@ where
         // instance as `updated`, and suppressed dispatches (remove of
         // an absent key) fire no handler — matching dots-cpp, where a
         // dynamically added handler on a cached type uses the type's
-        // container. Without a container (wire-only types), events
+        // container. Without a container (uncached types), events
         // follow uncached semantics: the transmitted value is also the
         // updated value, and the operation is create (or remove when
         // the header flags a deletion).
         //
         // `DynamicStruct` isn't a `StructValue`, so the event is built
-        // from parts rather than through `Event::from_shared` (the
-        // outcome's `Arc<T>` sharing is typed-only; dynamic subscribers
-        // project the post-merge instance per subscriber).
+        // from parts rather than through `Event::from_shared`; the
+        // outcome's `shared_dynamic` slot shares one projection across
+        // all dynamic subscribers of the transmission.
         let (operation, updated, clone_info) = match shared {
             DispatchShared::Cached(outcome) => (
                 outcome.operation,
-                DynamicStruct::from_struct_value(&outcome.updated),
+                outcome.shared_dynamic(&self.descriptor),
                 outcome.clone_info.clone(),
             ),
             DispatchShared::Suppressed => return Ok(true),
@@ -1355,16 +1436,10 @@ where
                     created_time: txn.header.sent_time,
                     created_sender: txn.header.sender,
                 };
-                (operation, dyn_value.clone(), clone_info)
+                (operation, Arc::new(dyn_value.clone()), clone_info)
             }
         };
-        let event = Event::from_parts(
-            txn.header.clone(),
-            dyn_value,
-            Arc::new(updated),
-            operation,
-            clone_info,
-        );
+        let event = Event::from_parts(txn.header.clone(), dyn_value, updated, operation, clone_info);
         (self.handler)(&event);
         Ok(true)
     }

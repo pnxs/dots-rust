@@ -841,13 +841,13 @@ fn dispatch_entries_borrowed(
 /// consumers carries no contract, so running the owner last is
 /// transparent.
 ///
-/// Filtered (`subscription_id`) traffic, payloads with no type name,
-/// and non-`Typed` (`Wire`) payloads have nothing to move and fall back
-/// to the borrowing path.
+/// Filtered (`subscription_id`) traffic and payloads with no type name
+/// have nothing to move and fall back to the borrowing path. Both
+/// payload representations are movable — a `Wire` payload moves into a
+/// dynamic-representation container just like a `Typed` one moves into
+/// a static-representation container.
 fn dispatch_external_owned(dispatch: &Arc<Mutex<DispatchState>>, txn: Transmission) {
-    let movable = matches!(txn.payload, dots_rs_model::Payload::Typed(_))
-        && txn.header.subscription_id.is_none()
-        && txn.header.type_name.is_some();
+    let movable = txn.header.subscription_id.is_none() && txn.header.type_name.is_some();
     if !movable {
         dispatch_external(dispatch, &txn);
         return;
