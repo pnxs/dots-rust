@@ -999,6 +999,15 @@ where
                             &mut txn.header,
                             self.transceiver.client_id(),
                         );
+                        // Wire-learned enums must land in the codec
+                        // registry before dispatch, so struct
+                        // descriptors referencing them resolve (the
+                        // guest mirror of the host's
+                        // EnumDescriptorData handling).
+                        crate::connection::maybe_register_wire_enum(
+                            &self.transceiver.registry,
+                            &txn,
+                        );
                         // The driver owns `txn` and drops it after
                         // dispatch, so use the move-capable path: a
                         // container takes ownership of the payload

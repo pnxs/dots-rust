@@ -133,6 +133,11 @@ pub struct Connection<S> {
     /// owner is in the middle of an `&mut self` `next()` call), and so
     /// the connection stays `Send` for multi-threaded runtimes.
     dispatch: Arc<Mutex<DispatchState>>,
+    /// The codec registry, shared with the framed stream's
+    /// [`TransmissionCodec`]. Used to register wire-learned
+    /// `EnumDescriptorData` before dispatch (see
+    /// [`maybe_register_wire_enum`]).
+    registry: Arc<Registry>,
 }
 
 impl<S> Connection<S>
@@ -168,7 +173,7 @@ where
 
     /// Construct an empty connection wrapping the given framed stream.
     /// Used internally by [`ConnectionBuilder::connect`].
-    fn from_framed(framed: Framed<S, TransmissionCodec>) -> Self {
+    fn from_framed(framed: Framed<S, TransmissionCodec>, registry: Arc<Registry>) -> Self {
         Self {
             framed,
             state: DotsConnectionState::Connecting,
@@ -177,6 +182,7 @@ where
             peer_capabilities: None,
             scratch: Vec::with_capacity(256),
             dispatch: Arc::new(Mutex::new(DispatchState::default())),
+            registry,
         }
     }
 
@@ -454,6 +460,7 @@ where
     }
 
     fn dispatch_to_subscribers(&self, txn: &Transmission) {
+        maybe_register_wire_enum(&self.registry, txn);
         dispatch_external(&self.dispatch, txn);
     }
 
@@ -592,6 +599,54 @@ where
 /// client), it is `false`.
 pub(crate) fn stamp_is_from_myself(header: &mut DotsHeader, my_client_id: Option<u32>) {
     header.is_from_myself = Some(my_client_id.is_some() && header.sender == my_client_id);
+}
+
+/// Register a wire-learned enum descriptor into the codec registry.
+///
+/// The guest-side mirror of the host's `EnumDescriptorData` handling:
+/// enums have no dedicated subscription API (unlike
+/// `GuestTransceiver::subscribe_new_struct_type` for structs), but a
+/// struct descriptor referencing an enum can only be built once the
+/// enum is registered — descriptor exchange ships enums before the
+/// structs that use them, so registering here, before the transmission
+/// is dispatched, guarantees the ordering. Registration is idempotent
+/// (re-registering overwrites with an equivalent entry).
+///
+/// Anything that isn't a decodable `EnumDescriptorData` is left to the
+/// normal dispatch path untouched.
+pub(crate) fn maybe_register_wire_enum(registry: &Registry, txn: &Transmission) {
+    if txn.header.type_name.as_deref() != Some("EnumDescriptorData") {
+        return;
+    }
+    let data: EnumDescriptorData = match &txn.payload {
+        dots_rs_model::Payload::Typed(a) => match a.as_typed::<EnumDescriptorData>() {
+            Some(v) => v.clone(),
+            None => return,
+        },
+        dots_rs_model::Payload::Wire(_) => {
+            let bytes = txn.payload.encode();
+            match dots_rs_core::decode_typed_from_slice(&bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to decode wire EnumDescriptorData");
+                    return;
+                }
+            }
+        }
+    };
+    match registry.build_dynamic_enum(&data) {
+        Ok(d) => {
+            tracing::debug!(name = %d.name, "registered enum descriptor from wire");
+            registry.register_enum_dynamic(Arc::new(d));
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = ?e,
+                name = ?data.name,
+                "could not build dynamic enum from wire EnumDescriptorData",
+            );
+        }
+    }
 }
 
 /// Dispatch a transmission to all subscribers of its `type_name`,
@@ -1402,9 +1457,10 @@ where
     /// Run the handshake and return a [`Connection`] in the appropriate
     /// state (see [`preload`](Self::preload)).
     pub async fn connect(self) -> Result<Connection<S>, ConnectionError> {
+        let registry = self.registry.clone();
         let codec = TransmissionCodec::new(self.registry);
         let framed = Framed::new(self.stream, codec);
-        let mut conn = Connection::from_framed(framed);
+        let mut conn = Connection::from_framed(framed, registry);
 
         conn.run_initial_handshake(
             &self.client_name,
