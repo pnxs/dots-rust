@@ -12,6 +12,7 @@ description = "DOTS trace tool — connects to a broker and prints every transmi
 dots-rs-core.workspace = true
 dots-rs-model.workspace = true
 dots-rs-transport = { workspace = true, features = ["tracing-init"] }
+chrono = "0.4"
 
 tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
 

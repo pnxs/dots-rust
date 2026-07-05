@@ -20,6 +20,7 @@
 //! ```
 
 mod app;
+mod ascii;
 mod auth;
 mod codec;
 mod connection;
@@ -35,6 +36,7 @@ mod view;
 mod tracing_init;
 
 pub use app::{App, AppError, Client, DriverFuture, connect_over_stream, new_uuid, now_timepoint};
+pub use ascii::{ColorSchema, StructDisplay};
 pub use codec::{RawTransmissionCodec, TransmissionCodec};
 pub use connection::{Connection, ConnectionBuilder, ConnectionError, Event, Subscription};
 pub use container::{
