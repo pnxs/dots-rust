@@ -36,6 +36,12 @@ impl PropertySet {
     /// All properties invalid.
     pub const EMPTY: Self = Self(0);
 
+    /// Every representable tag set. Mirrors dots-cpp's
+    /// `PropertySet::All`; used as the default mask for whole-struct
+    /// operations (equal/diff/assign/...). Intersecting with a valid
+    /// set or a descriptor's property mask trims the unused bits.
+    pub const ALL: Self = Self(u32::MAX);
+
     /// Maximum tag value supported by this representation.
     /// Tag = bit-position, so we lose tag 0 (unused in DOTS) and the
     /// max usable tag is 31.
@@ -90,6 +96,22 @@ impl PropertySet {
         self.0.count_ones()
     }
 
+    /// True if every tag in `self` is also in `other`.
+    ///
+    /// Equivalent of dots-cpp's `operator<=` on `PropertySet`, exposed
+    /// as a named method (Rust reserves `<=` for `PartialOrd`, and a
+    /// partial order on masks would be more confusing than helpful).
+    #[inline]
+    pub const fn is_subset_of(self, other: Self) -> bool {
+        (self.0 & other.0) == self.0
+    }
+
+    /// True if every tag in `other` is also in `self`.
+    #[inline]
+    pub const fn is_superset_of(self, other: Self) -> bool {
+        other.is_subset_of(self)
+    }
+
     /// Iterate the tags that are set, in ascending order.
     pub fn iter(self) -> impl Iterator<Item = u32> {
         let mut bits = self.0;
@@ -142,6 +164,18 @@ impl core::ops::Sub for PropertySet {
     #[inline]
     fn sub(self, rhs: Self) -> Self {
         Self(self.0 & !rhs.0)
+    }
+}
+
+impl core::ops::BitXor for PropertySet {
+    type Output = Self;
+    /// Symmetric difference: tags in exactly one of the two sets.
+    ///
+    /// Note this is the *Rust* xor meaning — dots-cpp overloads `^` on
+    /// its `PropertySet` as **intersection**, which here is `&`.
+    #[inline]
+    fn bitxor(self, rhs: Self) -> Self {
+        Self(self.0 ^ rhs.0)
     }
 }
 

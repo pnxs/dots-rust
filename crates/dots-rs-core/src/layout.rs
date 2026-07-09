@@ -31,7 +31,7 @@ use core::alloc::Layout;
 use core::any::Any;
 use core::ptr::NonNull;
 
-use crate::{PropertySet, StructDescriptor, StructValue};
+use crate::{DotsFieldOps, PropertySet, StructDescriptor, StructValue};
 
 /// CBOR encoder type used by property thunks. Fixed-writer (`&mut Vec<u8>`)
 /// so thunk fn-pointer signatures are stable across types.
@@ -216,32 +216,36 @@ impl AnyStruct {
         out
     }
 
-    /// Apply a flat, masked overlay of `src` onto `self`, matching
-    /// dots-cpp's `Container::updateWithoutKeys` — the partial-update
-    /// merge the cache performs on every non-create transmission.
+    /// Apply a flat, masked mirror of `src` onto `self` — dots-cpp
+    /// `Struct::_copy` semantics restricted to non-key properties,
+    /// matching `Container::updateWithoutKeys`: the partial-update
+    /// operation the cache performs on every non-create transmission.
     ///
     /// For each **non-key** property whose tag is set in `mask`:
     /// - set in `src` → deep-clone it into `self`, dropping any prior
     ///   value (`clone_in_place`);
     /// - unset in `src` → clear it in `self` (`set_none`).
     ///
-    /// Properties whose tag is **outside** `mask` are left untouched —
-    /// that's what preserves values the update didn't mention. Key
-    /// properties are never modified (they define identity and the
-    /// container keys by them), so the merge can never move an entry.
+    /// The "in the mask but unset in `src` means clear" rule is the
+    /// DOTS wire-update contract (`DotsHeader.attributes`) — it is how
+    /// a publish invalidates a single field. Properties whose tag is
+    /// **outside** `mask` are left untouched — that's what preserves
+    /// values the update didn't mention. Key properties are never
+    /// modified (they define identity and the container keys by them),
+    /// so the copy can never move an entry.
     ///
     /// The overlay is **flat**: a sub-struct property is replaced
     /// wholesale, not merged field-by-field — exactly as the C++
-    /// container does. (The recursive `_merge` is a separate operation
-    /// the cache doesn't use.)
+    /// container does. (The recursive, non-destructive overlay is
+    /// [`merge_from`](Self::merge_from).)
     ///
     /// `src` must share `self`'s descriptor; mismatches are a caller
     /// bug (asserted in debug builds) and the call is a no-op in
     /// release.
-    pub fn merge_from(&mut self, src: &dyn StructValue, mask: PropertySet) {
+    pub fn copy_from(&mut self, src: &dyn StructValue, mask: PropertySet) {
         debug_assert!(
             core::ptr::eq(self.descriptor, src.descriptor()),
-            "merge_from requires matching descriptors"
+            "copy_from requires matching descriptors"
         );
         if !core::ptr::eq(self.descriptor, src.descriptor()) {
             return;
@@ -269,7 +273,7 @@ impl AnyStruct {
         }
     }
 
-    /// Like [`merge_from`](Self::merge_from), but **moves** each set
+    /// Like [`copy_from`](Self::copy_from), but **moves** each set
     /// property out of `src` instead of deep-cloning it — `src`'s owned
     /// heap allocations (`String`/`Vec` buffers, nested data) are handed
     /// over to `self`. After the call the moved-out slots of `src` are
@@ -278,11 +282,11 @@ impl AnyStruct {
     /// Use this on the cache's update path when the incoming value is
     /// owned and about to be dropped: it saves a deep clone of every
     /// changed property. Semantics (mask, flat overlay, keys untouched,
-    /// clear-when-unset-in-mask) are identical to `merge_from`.
-    pub fn merge_take(&mut self, src: &mut AnyStruct, mask: PropertySet) {
+    /// clear-when-unset-in-mask) are identical to `copy_from`.
+    pub fn copy_take(&mut self, src: &mut AnyStruct, mask: PropertySet) {
         debug_assert!(
             core::ptr::eq(self.descriptor, src.descriptor),
-            "merge_take requires matching descriptors"
+            "copy_take requires matching descriptors"
         );
         if !core::ptr::eq(self.descriptor, src.descriptor) {
             return;
@@ -308,6 +312,172 @@ impl AnyStruct {
                 }
             }
         }
+    }
+
+    /// Make `self` an exact masked copy of `src` — dots-cpp
+    /// `Struct::_assign` semantics, minus keys: every **non-key**
+    /// property that is in `mask` *and* set on `src` is deep-cloned in;
+    /// every other non-key property is cleared, **including those
+    /// outside `mask`** (that's what distinguishes `assign` from
+    /// [`copy_from`](Self::copy_from), which leaves out-of-mask
+    /// properties untouched).
+    ///
+    /// Key properties are never modified — unlike C++, where `_assign`
+    /// can invalidate a key, dots-rust keeps keys permanently valid
+    /// (bare-`T` key storage cannot represent an unset key on the typed
+    /// side). Panics on a descriptor mismatch.
+    pub fn assign_from(&mut self, src: &dyn StructValue, mask: PropertySet) {
+        assert!(
+            core::ptr::eq(self.descriptor, src.descriptor()),
+            "assign_from requires matching descriptors"
+        );
+        let src_valid = src.valid_set();
+        let src_base = src.data_ptr();
+        for prop in self.descriptor.properties {
+            if prop.is_key {
+                continue;
+            }
+            // SAFETY: shared descriptor — offsets in-range for both
+            // buffers, slots valid for the thunk's type.
+            unsafe {
+                let dst_p = self.data.as_ptr().add(prop.offset);
+                if mask.has(prop.tag) && src_valid.has(prop.tag) {
+                    (prop.vtable.clone_in_place)(src_base.add(prop.offset), dst_p);
+                    self.valid = self.valid.with_tag(prop.tag);
+                } else {
+                    (prop.vtable.set_none)(dst_p);
+                    self.valid = self.valid.without_tag(prop.tag);
+                }
+            }
+        }
+    }
+
+    /// Like [`assign_from`](Self::assign_from), but **moves** each
+    /// assigned property out of `src` (the C++ rvalue `_assign`
+    /// overload). Moved-out slots of `src` are cleared, so `src` stays
+    /// valid and drops cleanly. Panics on a descriptor mismatch.
+    pub fn assign_take(&mut self, src: &mut AnyStruct, mask: PropertySet) {
+        assert!(
+            core::ptr::eq(self.descriptor, src.descriptor),
+            "assign_take requires matching descriptors"
+        );
+        for prop in self.descriptor.properties {
+            if prop.is_key {
+                continue;
+            }
+            // SAFETY: shared descriptor — see `assign_from`;
+            // `take_in_place` leaves `src`'s slot cleared and valid.
+            unsafe {
+                let dst_p = self.data.as_ptr().add(prop.offset);
+                let src_p = src.data.as_ptr().add(prop.offset);
+                if mask.has(prop.tag) && src.valid.has(prop.tag) {
+                    (prop.vtable.take_in_place)(src_p, dst_p);
+                    self.valid = self.valid.with_tag(prop.tag);
+                    src.valid = src.valid.without_tag(prop.tag);
+                } else {
+                    (prop.vtable.set_none)(dst_p);
+                    self.valid = self.valid.without_tag(prop.tag);
+                }
+            }
+        }
+    }
+
+    /// Non-destructive recursive overlay of `src` onto `self` —
+    /// dots-cpp `Struct::_merge` semantics, minus keys.
+    ///
+    /// Only **non-key** properties that are in `mask` *and* set on
+    /// `src` are touched; nothing is ever cleared (contrast with
+    /// [`copy_from`](Self::copy_from), the wire-update operation).
+    /// A struct-typed property is merged property-wise, recursively —
+    /// fields the source sub-struct doesn't carry survive on the
+    /// target. Every other kind of property (including vectors) is
+    /// replaced wholesale.
+    ///
+    /// Panics on a descriptor mismatch.
+    pub fn merge_from(&mut self, src: &dyn StructValue, mask: PropertySet) {
+        assert!(
+            core::ptr::eq(self.descriptor, src.descriptor()),
+            "merge_from requires matching descriptors"
+        );
+        let src_valid = src.valid_set();
+        let src_base = src.data_ptr();
+        for prop in self.descriptor.properties {
+            if prop.is_key || !mask.has(prop.tag) || !src_valid.has(prop.tag) {
+                continue;
+            }
+            // SAFETY: shared descriptor — offsets in-range for both
+            // buffers; `merge_in_place` handles set and unset targets.
+            unsafe {
+                (prop.vtable.merge_in_place)(
+                    src_base.add(prop.offset),
+                    self.data.as_ptr().add(prop.offset),
+                );
+            }
+            self.valid = self.valid.with_tag(prop.tag);
+        }
+    }
+
+    /// Swap the masked **non-key** properties of `self` and `other` —
+    /// values and validity change sides; owned heap data is handed
+    /// over, not cloned. Properties outside `mask` and all keys stay
+    /// put. Panics on a descriptor mismatch.
+    pub fn swap(&mut self, other: &mut AnyStruct, mask: PropertySet) {
+        assert!(
+            core::ptr::eq(self.descriptor, other.descriptor),
+            "swap requires matching descriptors"
+        );
+        for prop in self.descriptor.properties {
+            if prop.is_key || !mask.has(prop.tag) {
+                continue;
+            }
+            // SAFETY: shared descriptor; the two buffers are distinct
+            // allocations (`&mut` on both), so the slots don't alias.
+            unsafe {
+                (prop.vtable.swap_in_place)(
+                    self.data.as_ptr().add(prop.offset),
+                    other.data.as_ptr().add(prop.offset),
+                );
+            }
+            let (s, o) = (self.valid.has(prop.tag), other.valid.has(prop.tag));
+            self.valid = if o {
+                self.valid.with_tag(prop.tag)
+            } else {
+                self.valid.without_tag(prop.tag)
+            };
+            other.valid = if s {
+                other.valid.with_tag(prop.tag)
+            } else {
+                other.valid.without_tag(prop.tag)
+            };
+        }
+    }
+
+    /// Clear the masked **non-key** properties of `self` — dots-cpp
+    /// `Struct::_clear` semantics, minus keys (dots-rust never
+    /// invalidates a key property).
+    pub fn clear(&mut self, mask: PropertySet) {
+        for prop in self.descriptor.properties {
+            if prop.is_key || !mask.has(prop.tag) {
+                continue;
+            }
+            // SAFETY: `self.data` follows this descriptor's layout;
+            // `set_none` drops any existing value and writes `None`.
+            unsafe {
+                (prop.vtable.set_none)(self.data.as_ptr().add(prop.offset));
+            }
+            self.valid = self.valid.without_tag(prop.tag);
+        }
+    }
+}
+
+/// Whole-value equality: same descriptor (by pointer identity) and
+/// every property equal. Values of different DOTS types are unequal,
+/// never a panic — mirroring [`DynamicStruct`](crate::DynamicStruct)'s
+/// `PartialEq`. For masked comparison use [`equal`].
+impl PartialEq for AnyStruct {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self.descriptor, other.descriptor)
+            && equal(self, other, PropertySet::ALL)
     }
 }
 
@@ -522,6 +692,203 @@ pub fn encode_key_into(value: &dyn StructValue, buf: &mut Vec<u8>) {
         }
     }
 }
+
+// ===== Value-level struct operations (dots-cpp `Struct` method family) =====
+//
+// These free functions accept any two `&dyn StructValue`s — typed
+// structs and `AnyStruct` interoperate freely as long as they share the
+// same `&'static StructDescriptor`. A descriptor mismatch is a caller
+// bug and panics: silently comparing differently-typed values would
+// produce garbage orderings.
+
+fn assert_shared_descriptor(
+    lhs: &dyn StructValue,
+    rhs: &dyn StructValue,
+) -> &'static StructDescriptor {
+    let d = lhs.descriptor();
+    assert!(
+        core::ptr::eq(d, rhs.descriptor()),
+        "struct value operation requires matching descriptors: `{}` vs `{}`",
+        d.name,
+        rhs.descriptor().name,
+    );
+    d
+}
+
+/// Masked property-wise equality — the analogue of dots-cpp's
+/// `Struct::_equal(rhs, includedProperties)`.
+///
+/// A property in `mask` is equal when it is unset on both sides, or set
+/// on both sides with equal values. Pass [`PropertySet::ALL`] to compare
+/// every property. Panics on a descriptor mismatch.
+pub fn equal(lhs: &dyn StructValue, rhs: &dyn StructValue, mask: PropertySet) -> bool {
+    let descriptor = assert_shared_descriptor(lhs, rhs);
+    let (lv, rv) = (lhs.valid_set(), rhs.valid_set());
+    for prop in descriptor.properties {
+        if !mask.has(prop.tag) {
+            continue;
+        }
+        let (l, r) = (lv.has(prop.tag), rv.has(prop.tag));
+        if l != r {
+            return false;
+        }
+        if !l {
+            continue;
+        }
+        // SAFETY: both buffers follow this shared descriptor's layout,
+        // so `prop.offset` is in-range for each and the slots are valid
+        // for the thunk's `Option<T>` / bare-`T` type.
+        if !unsafe {
+            (prop.vtable.eq_in_place)(
+                lhs.data_ptr().add(prop.offset),
+                rhs.data_ptr().add(prop.offset),
+            )
+        } {
+            return false;
+        }
+    }
+    true
+}
+
+/// Key-property equality — the analogue of dots-cpp's `Struct::_same`:
+/// do the two values identify the *same instance*? Non-key properties
+/// are ignored. Panics on a descriptor mismatch.
+pub fn same(lhs: &dyn StructValue, rhs: &dyn StructValue) -> bool {
+    equal(lhs, rhs, lhs.descriptor().key_mask())
+}
+
+/// Masked total order — lexicographic over the properties in `mask`, in
+/// descriptor (declaration) order, with an unset property sorting before
+/// any set one. Replaces dots-cpp's `_less`/`_lessEqual`/`_greater`/
+/// `_greaterEqual` quartet with a single `Ordering`. Coherent with
+/// [`equal`]: `Ordering::Equal` ⇔ `equal(lhs, rhs, mask)`.
+///
+/// Panics on a descriptor mismatch.
+pub fn cmp_masked(
+    lhs: &dyn StructValue,
+    rhs: &dyn StructValue,
+    mask: PropertySet,
+) -> core::cmp::Ordering {
+    let descriptor = assert_shared_descriptor(lhs, rhs);
+    let (lv, rv) = (lhs.valid_set(), rhs.valid_set());
+    for prop in descriptor.properties {
+        if !mask.has(prop.tag) {
+            continue;
+        }
+        let (l, r) = (lv.has(prop.tag), rv.has(prop.tag));
+        let ord = match (l, r) {
+            (false, false) => core::cmp::Ordering::Equal,
+            (false, true) => core::cmp::Ordering::Less,
+            (true, false) => core::cmp::Ordering::Greater,
+            // SAFETY: see `equal` — shared descriptor layout.
+            (true, true) => unsafe {
+                (prop.vtable.cmp_in_place)(
+                    lhs.data_ptr().add(prop.offset),
+                    rhs.data_ptr().add(prop.offset),
+                )
+            },
+        };
+        if ord != core::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    core::cmp::Ordering::Equal
+}
+
+/// The set of properties on which the two values differ — the analogue
+/// of dots-cpp's `Struct::_diffProperties(other, includedProperties)`.
+///
+/// A tag lands in the result when it is set on exactly one side
+/// (validity difference) or set on both with unequal values. Only tags
+/// in `mask` are considered. The result is exactly the update mask that
+/// would make a receiver of `lhs` mirror `rhs` when applied via
+/// [`AnyStruct::copy_from`] — diff and copy are inverse operations.
+///
+/// Panics on a descriptor mismatch.
+pub fn diff_properties(
+    lhs: &dyn StructValue,
+    rhs: &dyn StructValue,
+    mask: PropertySet,
+) -> PropertySet {
+    let descriptor = assert_shared_descriptor(lhs, rhs);
+    let (lv, rv) = (lhs.valid_set(), rhs.valid_set());
+    // Set on exactly one side → different by validity alone.
+    let mut diff = (lv ^ rv) & mask;
+    // Set on both sides → compare values.
+    for prop in descriptor.properties {
+        if !((lv & rv) & mask).has(prop.tag) {
+            continue;
+        }
+        // SAFETY: see `equal` — shared descriptor layout.
+        if !unsafe {
+            (prop.vtable.eq_in_place)(
+                lhs.data_ptr().add(prop.offset),
+                rhs.data_ptr().add(prop.offset),
+            )
+        } {
+            diff = diff.with_tag(prop.tag);
+        }
+    }
+    diff
+}
+
+/// True when every property named in `mask` is set on `value` —
+/// dots-cpp `Struct::_hasProperties` (subset flavor). For an exact
+/// match compare `value.valid_set() == mask` directly.
+pub fn has_properties(value: &dyn StructValue, mask: PropertySet) -> bool {
+    mask.is_subset_of(value.valid_set())
+}
+
+/// Validate that every property named in `mask` is set on `value`,
+/// returning a [`MissingProperties`] error naming the absent ones —
+/// the `Result`-shaped analogue of dots-cpp's
+/// `Struct::_assertHasProperties`.
+pub fn expect_properties(
+    value: &dyn StructValue,
+    mask: PropertySet,
+) -> Result<(), MissingProperties> {
+    let missing = mask - value.valid_set();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let descriptor = value.descriptor();
+    Err(MissingProperties {
+        type_name: descriptor.name.into(),
+        missing: descriptor
+            .properties
+            .iter()
+            .filter(|p| missing.has(p.tag))
+            .map(|p| p.name.into())
+            .collect(),
+    })
+}
+
+/// Error returned by [`expect_properties`]: the value is missing
+/// properties the caller requires. Lists the missing property names
+/// for diagnostics, like dots-cpp's `_assertHasProperties` message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingProperties {
+    /// DOTS type name of the offending value.
+    pub type_name: alloc::string::String,
+    /// Names of the required-but-unset properties, in declaration
+    /// order.
+    pub missing: Vec<alloc::string::String>,
+}
+
+impl core::fmt::Display for MissingProperties {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} instance is missing expected properties: ", self.type_name)?;
+        for (i, name) in self.missing.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(name)?;
+        }
+        Ok(())
+    }
+}
+
+impl core::error::Error for MissingProperties {}
 
 /// Walk the descriptor and emit each set property to the encoder.
 ///
@@ -933,6 +1300,58 @@ pub unsafe fn opt_take<T>(src: *mut u8, dst: *mut u8) {
     }
 }
 
+/// Compare the `Option<T>` slots at `lhs` and `rhs` for equality —
+/// validity and value, per [`opt_field_eq`](crate::field_ops::opt_field_eq).
+///
+/// # Safety
+///
+/// `lhs` and `rhs` must each point to a valid `Option<T>`.
+pub unsafe fn opt_eq<T: DotsFieldOps>(lhs: *const u8, rhs: *const u8) -> bool {
+    // SAFETY: caller-upheld.
+    let (a, b) = unsafe { (&*(lhs as *const Option<T>), &*(rhs as *const Option<T>)) };
+    crate::field_ops::opt_field_eq(a, b)
+}
+
+/// Order the `Option<T>` slots at `lhs` and `rhs` — `None` first, per
+/// [`opt_field_cmp`](crate::field_ops::opt_field_cmp).
+///
+/// # Safety
+///
+/// `lhs` and `rhs` must each point to a valid `Option<T>`.
+pub unsafe fn opt_cmp<T: DotsFieldOps>(lhs: *const u8, rhs: *const u8) -> core::cmp::Ordering {
+    // SAFETY: caller-upheld.
+    let (a, b) = unsafe { (&*(lhs as *const Option<T>), &*(rhs as *const Option<T>)) };
+    crate::field_ops::opt_field_cmp(a, b)
+}
+
+/// Swap the `Option<T>` slots at `a` and `b` in place.
+///
+/// # Safety
+///
+/// `a` and `b` must each point to a valid `Option<T>`, and must not
+/// alias.
+pub unsafe fn opt_swap<T>(a: *mut u8, b: *mut u8) {
+    // SAFETY: caller-upheld; `swap` moves both values without dropping.
+    unsafe {
+        core::ptr::swap(a as *mut Option<T>, b as *mut Option<T>);
+    }
+}
+
+/// Merge the `Option<T>` slot at `src` into `dst`, per
+/// [`opt_field_merge`](crate::field_ops::opt_field_merge) — recursive
+/// for struct-typed `T`, clone-assign otherwise, no-op when `src` is
+/// `None`.
+///
+/// # Safety
+///
+/// `src` and `dst` must each point to a valid `Option<T>` and must not
+/// alias.
+pub unsafe fn opt_merge<T: DotsFieldOps>(src: *const u8, dst: *mut u8) {
+    // SAFETY: caller-upheld.
+    let (s, d) = unsafe { (&*(src as *const Option<T>), &mut *(dst as *mut Option<T>)) };
+    crate::field_ops::opt_field_merge(d, s);
+}
+
 /// Clone the `Option<Vec<T>>` at `src` into `dst`. Same shape as
 /// [`opt_clone`] but routed via the `Vec` family so the derive macro
 /// can pick a `Vec`-specific clone without a `DotsField` bound.
@@ -1144,9 +1563,9 @@ pub unsafe fn key_clone<T: Clone>(src: *const u8, dst: *mut u8) {
 
 /// "Clear" a bare-`T` key slot by restoring `T::default()`, dropping the
 /// previous value first. Key properties are never cleared by
-/// [`AnyStruct::merge_from`] (the merge mask always excludes keys), but
-/// the vtable slot must be total and sound, so this keeps the bare-`T`
-/// slot a valid, droppable `T` should it ever be invoked.
+/// [`AnyStruct::copy_from`] (key tags are skipped), but the vtable slot
+/// must be total and sound, so this keeps the bare-`T` slot a valid,
+/// droppable `T` should it ever be invoked.
 ///
 /// # Safety
 ///
@@ -1162,9 +1581,9 @@ pub unsafe fn key_set_none<T: Default>(ptr: *mut u8) {
 
 /// Move the bare `T` at `src` into `dst`, dropping `dst`'s prior value
 /// and restoring `src` to `T::default()` so it stays a valid, droppable
-/// `T`. Key properties are never moved by [`AnyStruct::merge_take`]
-/// (the merge mask excludes keys), but the vtable slot must be total
-/// and sound.
+/// `T`. Key properties are never moved by [`AnyStruct::copy_take`]
+/// (key tags are skipped), but the vtable slot must be total and
+/// sound.
 ///
 /// # Safety
 ///
@@ -1178,5 +1597,52 @@ pub unsafe fn key_take<T: Default>(src: *mut u8, dst: *mut u8) {
         let moved = core::ptr::replace(s, T::default());
         core::ptr::drop_in_place(d);
         core::ptr::write(d, moved);
+    }
+}
+
+/// Compare the bare-`T` key slots at `lhs` and `rhs` for equality. A
+/// key is always set, so this is a plain value comparison.
+///
+/// # Safety
+///
+/// `lhs` and `rhs` must each point to a valid `T`.
+pub unsafe fn key_eq<T: DotsFieldOps>(lhs: *const u8, rhs: *const u8) -> bool {
+    // SAFETY: caller-upheld.
+    unsafe { (*(lhs as *const T)).dots_eq(&*(rhs as *const T)) }
+}
+
+/// Order the bare-`T` key slots at `lhs` and `rhs`.
+///
+/// # Safety
+///
+/// `lhs` and `rhs` must each point to a valid `T`.
+pub unsafe fn key_cmp<T: DotsFieldOps>(lhs: *const u8, rhs: *const u8) -> core::cmp::Ordering {
+    // SAFETY: caller-upheld.
+    unsafe { (*(lhs as *const T)).dots_cmp(&*(rhs as *const T)) }
+}
+
+/// Swap the bare-`T` key slots at `a` and `b` in place.
+///
+/// # Safety
+///
+/// `a` and `b` must each point to a valid `T`, and must not alias.
+pub unsafe fn key_swap<T>(a: *mut u8, b: *mut u8) {
+    // SAFETY: caller-upheld; `swap` moves both values without dropping.
+    unsafe {
+        core::ptr::swap(a as *mut T, b as *mut T);
+    }
+}
+
+/// Merge the bare-`T` key slot at `src` into `dst`. A key is always
+/// set on both sides, so this is [`DotsFieldOps::dots_merge`] on the
+/// values — a clone-assign for every key-eligible type.
+///
+/// # Safety
+///
+/// `src` and `dst` must each point to a valid `T` and must not alias.
+pub unsafe fn key_merge<T: DotsFieldOps>(src: *const u8, dst: *mut u8) {
+    // SAFETY: caller-upheld.
+    unsafe {
+        (*(dst as *mut T)).dots_merge(&*(src as *const T));
     }
 }

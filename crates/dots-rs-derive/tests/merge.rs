@@ -1,4 +1,4 @@
-//! `AnyStruct::merge_from` — the flat, masked partial-update overlay
+//! `AnyStruct::copy_from` — the flat, masked partial-update overlay
 //! that backs the cache's update path (matching dots-cpp
 //! `Container::updateWithoutKeys`).
 //!
@@ -47,19 +47,19 @@ fn mask(tags: &[u32]) -> PropertySet {
 
 /// Merge `src` (as a typed value) into `base` over `m`, returning the
 /// merged `Rec` read back out of the buffer.
-fn merge(base: &Rec, src: &Rec, m: PropertySet) -> Rec {
+fn copy(base: &Rec, src: &Rec, m: PropertySet) -> Rec {
     let mut target = AnyStruct::from_struct_value(base);
-    target.merge_from(src, m);
+    target.copy_from(src, m);
     target.as_typed::<Rec>().unwrap().clone()
 }
 
-/// `merge_take` counterpart of [`merge`]: builds an owned `AnyStruct`
+/// `copy_take` counterpart of [`copy`]: builds an owned `AnyStruct`
 /// for `src`, moves its masked properties into `base`, and returns both
 /// the merged target and what remains of the (drained) source.
-fn merge_take(base: &Rec, src: &Rec, m: PropertySet) -> (Rec, Rec) {
+fn copy_take(base: &Rec, src: &Rec, m: PropertySet) -> (Rec, Rec) {
     let mut target = AnyStruct::from_struct_value(base);
     let mut source = AnyStruct::from_struct_value(src);
-    target.merge_take(&mut source, m);
+    target.copy_take(&mut source, m);
     (
         target.as_typed::<Rec>().unwrap().clone(),
         source.as_typed::<Rec>().unwrap().clone(),
@@ -80,7 +80,7 @@ fn overlays_set_property_and_preserves_out_of_mask() {
         ..Default::default()
     };
     // Mask names only tag 2 (`label`).
-    let merged = merge(&base, &update, mask(&[2]));
+    let merged = copy(&base, &update, mask(&[2]));
     assert_eq!(merged.label.as_deref(), Some("new")); // overlaid
     assert_eq!(merged.count, Some(10)); // out of mask → preserved
     assert_eq!(merged.id, Some(1)); // key untouched
@@ -100,7 +100,7 @@ fn clears_property_in_mask_but_unset_in_source() {
         id: Some(1),
         ..Default::default()
     };
-    let merged = merge(&base, &update, mask(&[2, 3]));
+    let merged = copy(&base, &update, mask(&[2, 3]));
     assert_eq!(merged.label, None);
     assert_eq!(merged.count, None);
     assert_eq!(merged.id, Some(1));
@@ -120,7 +120,7 @@ fn clearing_bool_yields_none_not_some_false() {
         id: Some(1),
         ..Default::default()
     };
-    let merged = merge(&base, &update, mask(&[4]));
+    let merged = copy(&base, &update, mask(&[4]));
     assert_eq!(merged.flag, None);
 }
 
@@ -136,7 +136,7 @@ fn overlaying_false_bool_is_distinct_from_clearing() {
         flag: Some(false),
         ..Default::default()
     };
-    let merged = merge(&base, &update, mask(&[4]));
+    let merged = copy(&base, &update, mask(&[4]));
     assert_eq!(merged.flag, Some(false));
 }
 
@@ -153,7 +153,7 @@ fn key_properties_are_never_modified() {
         ..Default::default()
     };
     // Full mask — even so, the key (tag 1) must stay as it was.
-    let merged = merge(&base, &update, PropertySet::from_bits(u32::MAX));
+    let merged = copy(&base, &update, PropertySet::from_bits(u32::MAX));
     assert_eq!(merged.id, Some(5));
     assert_eq!(merged.label.as_deref(), Some("b"));
 }
@@ -171,7 +171,7 @@ fn owned_vec_overwrite_then_clear() {
         items: Some(vec![9]),
         ..Default::default()
     };
-    let merged = merge(&base, &overwrite, mask(&[5]));
+    let merged = copy(&base, &overwrite, mask(&[5]));
     assert_eq!(merged.items, Some(vec![9]));
 
     // Clear the Vec (drops the owned allocation soundly).
@@ -179,11 +179,11 @@ fn owned_vec_overwrite_then_clear() {
         id: Some(1),
         ..Default::default()
     };
-    let cleared = merge(&base, &clear, mask(&[5]));
+    let cleared = copy(&base, &clear, mask(&[5]));
     assert_eq!(cleared.items, None);
 }
 
-// ===== merge_take (move instead of clone) =====
+// ===== copy_take (move instead of clone) =====
 
 #[test]
 fn take_moves_owned_field_and_drains_source() {
@@ -199,7 +199,7 @@ fn take_moves_owned_field_and_drains_source() {
         ..Default::default()
     };
     // Mask names only `label` (tag 2).
-    let (merged, drained) = merge_take(&base, &update, mask(&[2]));
+    let (merged, drained) = copy_take(&base, &update, mask(&[2]));
 
     // Target received the moved value; out-of-mask `count` preserved.
     assert_eq!(merged.label.as_deref(), Some("moved"));
@@ -224,7 +224,7 @@ fn take_clears_property_in_mask_but_unset_in_source() {
         id: Some(1),
         ..Default::default()
     };
-    let (merged, _drained) = merge_take(&base, &update, mask(&[2, 3]));
+    let (merged, _drained) = copy_take(&base, &update, mask(&[2, 3]));
     assert_eq!(merged.label, None);
     assert_eq!(merged.count, None);
 }
@@ -240,7 +240,7 @@ fn take_clearing_bool_yields_none_not_some_false() {
         id: Some(1),
         ..Default::default()
     };
-    let (merged, _) = merge_take(&base, &update, mask(&[4]));
+    let (merged, _) = copy_take(&base, &update, mask(&[4]));
     assert_eq!(merged.flag, None);
 }
 
@@ -256,7 +256,7 @@ fn take_moves_vec_without_cloning_then_drains() {
         items: Some(vec![9, 9]),
         ..Default::default()
     };
-    let (merged, drained) = merge_take(&base, &update, mask(&[5]));
+    let (merged, drained) = copy_take(&base, &update, mask(&[5]));
     assert_eq!(merged.items, Some(vec![9, 9]));
     assert_eq!(drained.items, None); // moved out of the source
 }
@@ -273,7 +273,7 @@ fn take_never_modifies_key_or_source_key() {
         label: Some("b".into()),
         ..Default::default()
     };
-    let (merged, drained) = merge_take(&base, &update, PropertySet::from_bits(u32::MAX));
+    let (merged, drained) = copy_take(&base, &update, PropertySet::from_bits(u32::MAX));
     assert_eq!(merged.id, Some(5)); // target key unchanged
     assert_eq!(merged.label.as_deref(), Some("b"));
     assert_eq!(drained.id, Some(999)); // source key not moved out
@@ -287,12 +287,12 @@ fn dyn_of(r: &Rec) -> DynamicStruct {
     DynamicStruct::decode(desc, &encode_to_vec(r)).unwrap()
 }
 
-/// `merge_take` two `DynamicStruct`s and decode the result back to a
+/// `copy_take` two `DynamicStruct`s and decode the result back to a
 /// `Rec`, plus the drained source.
-fn dyn_merge_take(base: &Rec, src: &Rec, m: PropertySet) -> (Rec, Rec) {
+fn dyn_copy_take(base: &Rec, src: &Rec, m: PropertySet) -> (Rec, Rec) {
     let mut b = dyn_of(base);
     let mut s = dyn_of(src);
-    b.merge_take(&mut s, m);
+    b.copy_take(&mut s, m);
     (
         decode_typed_from_slice::<Rec>(&b.encode()).unwrap(),
         // The drained source keeps its key (tag 1), so it's still a
@@ -314,7 +314,7 @@ fn dyn_overlays_set_and_preserves_out_of_mask() {
         label: Some("new".into()),
         ..Default::default()
     };
-    let (merged, drained) = dyn_merge_take(&base, &update, mask(&[2]));
+    let (merged, drained) = dyn_copy_take(&base, &update, mask(&[2]));
     assert_eq!(merged.label.as_deref(), Some("new")); // overlaid
     assert_eq!(merged.count, Some(10)); // out of mask → preserved
     assert_eq!(merged.id, Some(1)); // key kept
@@ -333,7 +333,7 @@ fn dyn_clears_property_in_mask_but_unset_in_source() {
         id: Some(1),
         ..Default::default()
     };
-    let (merged, _) = dyn_merge_take(&base, &update, mask(&[2, 3]));
+    let (merged, _) = dyn_copy_take(&base, &update, mask(&[2, 3]));
     assert_eq!(merged.label, None);
     assert_eq!(merged.count, None);
     assert_eq!(merged.id, Some(1));
@@ -353,7 +353,7 @@ fn dyn_merge_from_clones_without_draining_source() {
     };
     let mut b = dyn_of(&base);
     let s = dyn_of(&update);
-    b.merge_from(&s, mask(&[2]));
+    b.copy_from(&s, mask(&[2]));
     let merged = decode_typed_from_slice::<Rec>(&b.encode()).unwrap();
     assert_eq!(merged.label.as_deref(), Some("added"));
     assert_eq!(merged.count, Some(5)); // preserved
@@ -377,7 +377,7 @@ fn valid_set_tracks_overlay_and_clear() {
         flag: Some(true),
         ..Default::default()
     };
-    target.merge_from(&update, mask(&[2, 4]));
+    target.copy_from(&update, mask(&[2, 4]));
     let valid: Vec<u32> = target.valid_set().iter().collect();
     // tag 1 (key) + 3 (untouched) + 4 (overlaid); tag 2 cleared.
     assert_eq!(valid, [1, 3, 4]);

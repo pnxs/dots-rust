@@ -132,6 +132,28 @@ impl DynamicStructDescriptor {
         self.properties.iter().find(|p| p.tag == tag)
     }
 
+    /// Bitmask of all `is_key` property tags — dynamic counterpart of
+    /// [`StructDescriptor::key_mask`].
+    pub fn key_mask(&self) -> PropertySet {
+        let mut set = PropertySet::EMPTY;
+        for prop in &self.properties {
+            if prop.is_key {
+                set = set.with_tag(prop.tag);
+            }
+        }
+        set
+    }
+
+    /// Bitmask of *all* property tags — dynamic counterpart of
+    /// [`StructDescriptor::property_mask`].
+    pub fn property_mask(&self) -> PropertySet {
+        let mut set = PropertySet::EMPTY;
+        for prop in &self.properties {
+            set = set.with_tag(prop.tag);
+        }
+        set
+    }
+
     /// Project a static descriptor into the dynamic shape, recursively
     /// walking nested struct fields.
     ///
@@ -250,15 +272,96 @@ pub struct DynamicStruct {
 }
 
 impl PartialEq for DynamicStruct {
-    /// Compares descriptors by `Arc` pointer identity, then valid set,
-    /// then properties. Same-descriptor struct values compare on their
-    /// data alone; values built from different descriptor instances
-    /// (even if structurally identical) compare unequal.
+    /// Compares descriptors by `Arc` pointer identity, then property-
+    /// wise validity and values. Same-descriptor struct values compare
+    /// on their data alone; values built from different descriptor
+    /// instances (even if structurally identical) compare unequal.
+    ///
+    /// Value comparison uses the same total-order semantics as the
+    /// static path ([`crate::layout::equal`]): floats compare via
+    /// `total_cmp`, so a NaN equals a bit-identical NaN.
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.descriptor, &other.descriptor)
-            && self.valid == other.valid
-            && self.properties == other.properties
+            && self.equal(other, PropertySet::ALL)
     }
+}
+
+/// Total-order comparison of two same-kind [`DynamicValue`]s.
+///
+/// `kind` supplies the schema context the value representation lacks —
+/// most importantly the enum descriptor, so enums order by their
+/// `int32` `value` (matching the static path and dots-cpp) rather than
+/// by wire tag. Floats compare via `total_cmp`, structs property-wise
+/// in descriptor order, vectors lexicographically.
+///
+/// Panics when the two values are of different variants — same-kind
+/// values decoded through the same descriptor can't disagree, so a
+/// mismatch is a caller bug.
+pub fn value_cmp(
+    kind: &DynamicFieldKind,
+    a: &DynamicValue,
+    b: &DynamicValue,
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    use crate::DotsFieldOps;
+    match (a, b) {
+        (DynamicValue::Bool(x), DynamicValue::Bool(y)) => x.cmp(y),
+        (DynamicValue::U8(x), DynamicValue::U8(y)) => x.cmp(y),
+        (DynamicValue::U16(x), DynamicValue::U16(y)) => x.cmp(y),
+        (DynamicValue::U32(x), DynamicValue::U32(y)) => x.cmp(y),
+        (DynamicValue::U64(x), DynamicValue::U64(y)) => x.cmp(y),
+        (DynamicValue::I8(x), DynamicValue::I8(y)) => x.cmp(y),
+        (DynamicValue::I16(x), DynamicValue::I16(y)) => x.cmp(y),
+        (DynamicValue::I32(x), DynamicValue::I32(y)) => x.cmp(y),
+        (DynamicValue::I64(x), DynamicValue::I64(y)) => x.cmp(y),
+        (DynamicValue::F32(x), DynamicValue::F32(y)) => x.total_cmp(y),
+        (DynamicValue::F64(x), DynamicValue::F64(y)) => x.total_cmp(y),
+        (DynamicValue::String(x), DynamicValue::String(y)) => x.cmp(y),
+        (DynamicValue::PropertySet(x), DynamicValue::PropertySet(y)) => x.dots_cmp(y),
+        (DynamicValue::Uuid(x), DynamicValue::Uuid(y)) => x.cmp(y),
+        (DynamicValue::Timepoint(x), DynamicValue::Timepoint(y)) => x.total_cmp(y),
+        (DynamicValue::Duration(x), DynamicValue::Duration(y)) => x.total_cmp(y),
+        (DynamicValue::Enum(x), DynamicValue::Enum(y)) => {
+            // Order by the enumerator's `int32` value, like the static
+            // path. Tags the descriptor doesn't know fall back to tag
+            // order so the comparison stays total.
+            if let DynamicFieldKind::Enum(descriptor) = kind {
+                let vx = descriptor.element_by_tag(*x).map(|e| e.value);
+                let vy = descriptor.element_by_tag(*y).map(|e| e.value);
+                if let (Some(vx), Some(vy)) = (vx, vy) {
+                    return vx.cmp(&vy);
+                }
+            }
+            x.cmp(y)
+        }
+        (DynamicValue::Vec(xs), DynamicValue::Vec(ys)) => {
+            let elem_kind = match kind {
+                DynamicFieldKind::Vec(inner) => inner,
+                _ => panic!("vector value with non-vector field kind"),
+            };
+            for (x, y) in xs.iter().zip(ys) {
+                match value_cmp(elem_kind, x, y) {
+                    Ordering::Equal => continue,
+                    non_eq => return non_eq,
+                }
+            }
+            xs.len().cmp(&ys.len())
+        }
+        (DynamicValue::Struct(x), DynamicValue::Struct(y)) => x.cmp_masked(y, PropertySet::ALL),
+        (DynamicValue::Any(x), DynamicValue::Any(y)) => x.dots_cmp(y),
+        _ => panic!("DynamicValue kind mismatch in value_cmp"),
+    }
+}
+
+/// Equality companion of [`value_cmp`] — `Ordering::Equal` ⇔ equal,
+/// except that nested struct values built from *different* descriptor
+/// `Arc`s compare unequal here (where [`value_cmp`] would panic), so
+/// equality never panics on structurally-odd but well-typed data.
+pub fn value_eq(kind: &DynamicFieldKind, a: &DynamicValue, b: &DynamicValue) -> bool {
+    if let (DynamicValue::Struct(x), DynamicValue::Struct(y)) = (a, b) {
+        return Arc::ptr_eq(&x.descriptor, &y.descriptor) && x.equal(y, PropertySet::ALL);
+    }
+    value_cmp(kind, a, b) == core::cmp::Ordering::Equal
 }
 
 impl DynamicStruct {
@@ -341,19 +444,30 @@ impl DynamicStruct {
         buf
     }
 
-    /// Flat masked overlay of `src` onto `self`, mirroring
-    /// [`AnyStruct::merge_from`](crate::AnyStruct::merge_from) — the
-    /// partial-update merge the cache performs on every non-create
+    /// Look up the value stored for `tag`, if that property is set.
+    pub fn get(&self, tag: u32) -> Option<&DynamicValue> {
+        self.properties
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, v)| v)
+    }
+
+    /// Flat masked mirror of `src` onto `self` — dots-cpp `_copy`
+    /// semantics restricted to non-key properties, mirroring
+    /// [`AnyStruct::copy_from`](crate::AnyStruct::copy_from) — the
+    /// partial-update operation the cache performs on every non-create
     /// transmission.
     ///
     /// For each **non-key** property whose tag is in `mask`: present in
     /// `src` → its value is cloned into `self`; absent in `src` →
-    /// cleared in `self`. Properties whose tag is **outside** `mask`,
-    /// and all key properties, are left as-is. The overlay is flat — a
+    /// cleared in `self` (this is how a publish invalidates a single
+    /// field). Properties whose tag is **outside** `mask`, and all key
+    /// properties, are left as-is. The overlay is flat — a
     /// nested-struct property is replaced wholesale, matching dots-cpp's
-    /// `Container::updateWithoutKeys`.
-    pub fn merge_from(&mut self, src: &DynamicStruct, mask: PropertySet) {
-        self.merge_impl(mask, |tag| {
+    /// `Container::updateWithoutKeys`. (The recursive, non-destructive
+    /// overlay is [`merge_from`](Self::merge_from).)
+    pub fn copy_from(&mut self, src: &DynamicStruct, mask: PropertySet) {
+        self.copy_impl(mask, |tag| {
             src.valid
                 .has(tag)
                 .then(|| src.properties.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone()))
@@ -361,14 +475,14 @@ impl DynamicStruct {
         });
     }
 
-    /// Like [`merge_from`](Self::merge_from), but **moves** each set
+    /// Like [`copy_from`](Self::copy_from), but **moves** each set
     /// property out of `src` instead of cloning it — `src`'s owned data
     /// is handed over. After the call the moved-out slots of `src` are
     /// gone and its `valid` set is updated, so `src` stays consistent.
     /// Use this on the cache update path when the incoming value is
     /// owned and about to be dropped.
-    pub fn merge_take(&mut self, src: &mut DynamicStruct, mask: PropertySet) {
-        self.merge_impl(mask, |tag| {
+    pub fn copy_take(&mut self, src: &mut DynamicStruct, mask: PropertySet) {
+        self.copy_impl(mask, |tag| {
             if src.valid.has(tag) {
                 src.valid = src.valid.without_tag(tag);
                 src.properties
@@ -381,12 +495,12 @@ impl DynamicStruct {
         });
     }
 
-    /// Shared core of [`merge_from`]/[`merge_take`]. `take` yields the
+    /// Shared core of [`copy_from`]/[`copy_take`]. `take` yields the
     /// source value for a masked tag (cloned or moved); returning
     /// `None` for a tag in the mask means "clear it". Rebuilds
     /// `self.properties` in descriptor order so the encode stays
     /// deterministic.
-    fn merge_impl(&mut self, mask: PropertySet, mut take: impl FnMut(u32) -> Option<DynamicValue>) {
+    fn copy_impl(&mut self, mask: PropertySet, mut take: impl FnMut(u32) -> Option<DynamicValue>) {
         // Clone the `Arc` so iterating the descriptor doesn't borrow
         // `self` while we mutate `self.properties`.
         let descriptor = self.descriptor.clone();
@@ -410,6 +524,246 @@ impl DynamicStruct {
         }
         self.properties = merged;
         self.valid = valid;
+    }
+
+    /// Masked property-wise equality — dots-cpp `Struct::_equal`,
+    /// mirroring [`crate::layout::equal`] on the static path. A
+    /// property in `mask` is equal when unset on both sides, or set on
+    /// both with equal values (floats via `total_cmp`). Panics when
+    /// the descriptors aren't the same `Arc`.
+    pub fn equal(&self, other: &DynamicStruct, mask: PropertySet) -> bool {
+        self.assert_shared_descriptor(other);
+        for prop in &self.descriptor.properties {
+            if !mask.has(prop.tag) {
+                continue;
+            }
+            match (self.get(prop.tag), other.get(prop.tag)) {
+                (None, None) => {}
+                (Some(a), Some(b)) => {
+                    if !value_eq(&prop.kind, a, b) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Key-property equality — dots-cpp `Struct::_same`: do the two
+    /// values identify the same instance? Panics when the descriptors
+    /// aren't the same `Arc`.
+    pub fn same(&self, other: &DynamicStruct) -> bool {
+        self.equal(other, self.descriptor.key_mask())
+    }
+
+    /// Masked total order — lexicographic over the properties in
+    /// `mask` in descriptor order, unset before set, mirroring
+    /// [`crate::layout::cmp_masked`]. Panics when the descriptors
+    /// aren't the same `Arc`.
+    pub fn cmp_masked(&self, other: &DynamicStruct, mask: PropertySet) -> core::cmp::Ordering {
+        use core::cmp::Ordering;
+        self.assert_shared_descriptor(other);
+        for prop in &self.descriptor.properties {
+            if !mask.has(prop.tag) {
+                continue;
+            }
+            let ord = match (self.get(prop.tag), other.get(prop.tag)) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (Some(a), Some(b)) => value_cmp(&prop.kind, a, b),
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// The set of properties on which the two values differ — dots-cpp
+    /// `Struct::_diffProperties`, mirroring
+    /// [`crate::layout::diff_properties`]. A tag is in the result when
+    /// it is set on exactly one side or set on both with unequal
+    /// values. Panics when the descriptors aren't the same `Arc`.
+    pub fn diff_properties(&self, other: &DynamicStruct, mask: PropertySet) -> PropertySet {
+        self.assert_shared_descriptor(other);
+        let mut diff = (self.valid ^ other.valid) & mask;
+        for prop in &self.descriptor.properties {
+            if !((self.valid & other.valid) & mask).has(prop.tag) {
+                continue;
+            }
+            if let (Some(a), Some(b)) = (self.get(prop.tag), other.get(prop.tag)) {
+                if !value_eq(&prop.kind, a, b) {
+                    diff = diff.with_tag(prop.tag);
+                }
+            }
+        }
+        diff
+    }
+
+    /// True when every property named in `mask` is set — dots-cpp
+    /// `Struct::_hasProperties` (subset flavor).
+    pub fn has_properties(&self, mask: PropertySet) -> bool {
+        mask.is_subset_of(self.valid)
+    }
+
+    /// Validate that every property named in `mask` is set, returning
+    /// a [`MissingProperties`](crate::layout::MissingProperties) error
+    /// naming the absent ones — mirrors
+    /// [`crate::layout::expect_properties`].
+    pub fn expect_properties(
+        &self,
+        mask: PropertySet,
+    ) -> Result<(), crate::layout::MissingProperties> {
+        let missing = mask - self.valid;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(crate::layout::MissingProperties {
+            type_name: self.descriptor.name.clone(),
+            missing: self
+                .descriptor
+                .properties
+                .iter()
+                .filter(|p| missing.has(p.tag))
+                .map(|p| p.name.clone())
+                .collect(),
+        })
+    }
+
+    /// Make `self` an exact masked copy of `src` — dots-cpp `_assign`
+    /// semantics, minus keys: every **non-key** property in `mask`
+    /// that is set on `src` is cloned in; every other non-key property
+    /// is cleared, including those outside `mask`. Key properties are
+    /// never modified. Panics when the descriptors aren't the same
+    /// `Arc`.
+    pub fn assign_from(&mut self, src: &DynamicStruct, mask: PropertySet) {
+        self.assert_shared_descriptor(src);
+        let effective = mask & src.valid;
+        self.copy_impl(PropertySet::ALL, |tag| {
+            effective.has(tag).then(|| src.get(tag).cloned()).flatten()
+        });
+    }
+
+    /// Like [`assign_from`](Self::assign_from), but **moves** each
+    /// assigned property out of `src`. Panics when the descriptors
+    /// aren't the same `Arc`.
+    pub fn assign_take(&mut self, src: &mut DynamicStruct, mask: PropertySet) {
+        self.assert_shared_descriptor(src);
+        self.copy_impl(PropertySet::ALL, |tag| {
+            if mask.has(tag) && src.valid.has(tag) {
+                src.valid = src.valid.without_tag(tag);
+                src.properties
+                    .iter()
+                    .position(|(t, _)| *t == tag)
+                    .map(|pos| src.properties.swap_remove(pos).1)
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Non-destructive recursive overlay of `src` onto `self` —
+    /// dots-cpp `Struct::_merge` semantics, minus keys, mirroring
+    /// [`AnyStruct::merge_from`](crate::AnyStruct::merge_from).
+    ///
+    /// Only **non-key** properties in `mask` that are set on `src` are
+    /// touched; nothing is ever cleared. A nested-struct property
+    /// present on both sides is merged recursively (fields the source
+    /// sub-struct doesn't carry survive); everything else is replaced
+    /// wholesale. Panics when the descriptors aren't the same `Arc`.
+    pub fn merge_from(&mut self, src: &DynamicStruct, mask: PropertySet) {
+        self.assert_shared_descriptor(src);
+        let descriptor = self.descriptor.clone();
+        for prop in &descriptor.properties {
+            if prop.is_key || !mask.has(prop.tag) {
+                continue;
+            }
+            let Some(src_val) = src.get(prop.tag) else {
+                continue;
+            };
+            let merged = match (self.take_value(prop.tag), src_val) {
+                (Some(DynamicValue::Struct(mut dst_sub)), DynamicValue::Struct(src_sub)) => {
+                    dst_sub.merge_from(src_sub, PropertySet::ALL);
+                    DynamicValue::Struct(dst_sub)
+                }
+                _ => src_val.clone(),
+            };
+            self.insert_value(prop.tag, merged);
+        }
+    }
+
+    /// Swap the masked **non-key** properties of `self` and `other` —
+    /// dots-cpp `Struct::_swap`, minus keys. Panics when the
+    /// descriptors aren't the same `Arc`.
+    pub fn swap(&mut self, other: &mut DynamicStruct, mask: PropertySet) {
+        self.assert_shared_descriptor(other);
+        let descriptor = self.descriptor.clone();
+        for prop in &descriptor.properties {
+            if prop.is_key || !mask.has(prop.tag) {
+                continue;
+            }
+            let mine = self.take_value(prop.tag);
+            let theirs = other.take_value(prop.tag);
+            if let Some(v) = theirs {
+                self.insert_value(prop.tag, v);
+            }
+            if let Some(v) = mine {
+                other.insert_value(prop.tag, v);
+            }
+        }
+    }
+
+    /// Clear the masked **non-key** properties — dots-cpp
+    /// `Struct::_clear`, minus keys.
+    pub fn clear(&mut self, mask: PropertySet) {
+        let key_mask = self.descriptor.key_mask();
+        let cleared = (mask - key_mask) & self.valid;
+        self.properties.retain(|(tag, _)| !cleared.has(*tag));
+        self.valid = self.valid - cleared;
+    }
+
+    fn assert_shared_descriptor(&self, other: &DynamicStruct) {
+        assert!(
+            Arc::ptr_eq(&self.descriptor, &other.descriptor),
+            "struct value operation requires matching descriptors: `{}` vs `{}`",
+            self.descriptor.name,
+            other.descriptor.name,
+        );
+    }
+
+    /// Remove and return the value stored for `tag`, clearing its
+    /// valid bit. Internal helper for the mutating operations.
+    fn take_value(&mut self, tag: u32) -> Option<DynamicValue> {
+        let pos = self.properties.iter().position(|(t, _)| *t == tag)?;
+        self.valid = self.valid.without_tag(tag);
+        Some(self.properties.remove(pos).1)
+    }
+
+    /// Insert `value` for `tag`, keeping `self.properties` in
+    /// descriptor order and setting the valid bit. Internal helper for
+    /// the mutating operations.
+    fn insert_value(&mut self, tag: u32, value: DynamicValue) {
+        debug_assert!(self.get(tag).is_none(), "insert_value on an occupied tag");
+        // Descriptor order, not tag order: find where `tag` sits in
+        // the descriptor's property list and insert before the first
+        // stored property that comes later.
+        let order_of = |t: u32| {
+            self.descriptor
+                .properties
+                .iter()
+                .position(|p| p.tag == t)
+                .unwrap_or(usize::MAX)
+        };
+        let my_order = order_of(tag);
+        let pos = self
+            .properties
+            .iter()
+            .position(|(t, _)| order_of(*t) > my_order)
+            .unwrap_or(self.properties.len());
+        self.properties.insert(pos, (tag, value));
+        self.valid = self.valid.with_tag(tag);
     }
 
     /// Project any `&dyn StructValue` (typed or `AnyStruct`) into a

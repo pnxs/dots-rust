@@ -151,7 +151,7 @@ async fn event_exposes_cpp_style_create_update_remove() {
 
 /// End-to-end check of the move-capable guest dispatch path: a partial
 /// update routed through the real `GuestDriver` loop (which owns the
-/// transmission and hands it to the container via `merge_take`) must
+/// transmission and hands it to the container via `copy_take`) must
 /// preserve a field the update didn't carry.
 #[tokio::test]
 async fn container_partial_update_preserves_unsent_field_through_driver() {

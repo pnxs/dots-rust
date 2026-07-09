@@ -25,6 +25,7 @@ extern crate self as dots_rs_core;
 mod any;
 mod descriptor;
 pub mod dynamic;
+pub mod field_ops;
 pub mod layout;
 mod property_set;
 mod registration;
@@ -44,11 +45,14 @@ pub use descriptor::{
 pub use dynamic::{
     DynamicEnumDescriptor, DynamicEnumElement, DynamicFieldKind, DynamicPropertyDescriptor,
     DynamicPublishable, DynamicStruct, DynamicStructDescriptor, DynamicValue, NotPublishable,
+    value_cmp, value_eq,
 };
+pub use field_ops::DotsFieldOps;
 pub use layout::{
-    AnyStruct, DecodeError, DotsField, EncodeError, decode_typed_from_decoder,
-    decode_typed_from_slice, encode_into_encoder, encode_into_encoder_with_mask, encode_into_vec,
-    encode_into_vec_with_mask, encode_key_bytes, encode_key_into, encode_to_vec, key_set,
+    AnyStruct, DecodeError, DotsField, EncodeError, MissingProperties, cmp_masked,
+    decode_typed_from_decoder, decode_typed_from_slice, diff_properties, encode_into_encoder,
+    encode_into_encoder_with_mask, encode_into_vec, encode_into_vec_with_mask, encode_key_bytes,
+    encode_key_into, encode_to_vec, equal, expect_properties, has_properties, key_set, same,
 };
 pub use property_set::PropertySet;
 pub use registration::{GlobalRegistration, PUBLISHED_TYPES, SUBSCRIBED_TYPES};

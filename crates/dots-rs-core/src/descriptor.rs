@@ -147,9 +147,9 @@ pub struct PropertyVtable {
     /// For `Option<T>` fields this drops the old value and writes a
     /// real `None` (never relying on a zero bit-pattern — niche layouts
     /// like `Option<bool>` or `Option<AnyObject>` don't put `None` at
-    /// zero). For bare-`T` key fields — which `AnyStruct::merge_from`
+    /// zero). For bare-`T` key fields — which `AnyStruct::copy_from`
     /// never clears — it restores `T::default()` so the slot stays a
-    /// valid, droppable `T`. Used by `AnyStruct::merge_from` to apply
+    /// valid, droppable `T`. Used by `AnyStruct::copy_from` to apply
     /// the "property named in the update mask but absent from the
     /// payload" (explicit-clear) case.
     pub set_none: unsafe fn(*mut u8),
@@ -161,10 +161,36 @@ pub struct PropertyVtable {
     /// buffers, nested allocations) without deep-cloning it — the
     /// allocation is handed over, not copied.
     ///
-    /// Used by `AnyStruct::merge_take` on the cache's update path when
+    /// Used by `AnyStruct::copy_take` on the cache's update path when
     /// the incoming value is owned and about to be dropped, so its
     /// fields are moved into the stored entry instead of cloned.
     pub take_in_place: unsafe fn(src: *mut u8, dst: *mut u8),
+
+    /// Compares the full slots at `lhs` and `rhs` — validity *and*
+    /// value. Two `None`s are equal, `None` ≠ `Some(_)`, and two
+    /// `Some`s compare their inner values via
+    /// [`DotsFieldOps::dots_eq`](crate::DotsFieldOps::dots_eq).
+    /// Coherent with `cmp_in_place`: equal ⇔ `Ordering::Equal`.
+    pub eq_in_place: unsafe fn(lhs: *const u8, rhs: *const u8) -> bool,
+
+    /// Total order over the full slots at `lhs` and `rhs`. `None`
+    /// sorts before any `Some(_)` — the same convention dots-cpp uses
+    /// (an invalid property is less than any valid one). Floats use
+    /// `total_cmp`, so the order is total even in the presence of NaN
+    /// (a deliberate divergence from C++'s IEEE `<`).
+    pub cmp_in_place: unsafe fn(lhs: *const u8, rhs: *const u8) -> core::cmp::Ordering,
+
+    /// Swaps the two slots in place (validity and value). Both slots
+    /// stay valid; owned heap data changes sides without cloning.
+    pub swap_in_place: unsafe fn(a: *mut u8, b: *mut u8),
+
+    /// Merges the slot at `src` into `dst` with dots-cpp `_merge`
+    /// semantics: `src` unset → `dst` untouched; `src` set and `dst`
+    /// unset → deep-clone; both set → recursive
+    /// [`DotsFieldOps::dots_merge`](crate::DotsFieldOps::dots_merge)
+    /// (property-wise for struct-typed fields, clone-assign for
+    /// everything else).
+    pub merge_in_place: unsafe fn(src: *const u8, dst: *mut u8),
 }
 
 impl core::fmt::Debug for PropertyVtable {
@@ -309,6 +335,18 @@ impl StructDescriptor {
             if prop.is_key {
                 set = set.with_tag(prop.tag);
             }
+        }
+        set
+    }
+
+    /// Bitmask of *all* property tags this type declares — the
+    /// analogue of dots-cpp's `Struct::_properties()`. Intersect a
+    /// caller-supplied mask with this to trim bits that don't name a
+    /// real property.
+    pub fn property_mask(&self) -> crate::PropertySet {
+        let mut set = crate::PropertySet::EMPTY;
+        for prop in self.properties {
+            set = set.with_tag(prop.tag);
         }
         set
     }

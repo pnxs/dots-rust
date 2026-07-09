@@ -115,22 +115,22 @@ impl Payload {
         }
     }
 
-    /// Flat masked partial-update merge: overlay `incoming`'s masked
+    /// Flat masked partial-update copy: overlay `incoming`'s masked
     /// properties onto `self` in place, **moving** the values in (no
     /// deep clone), mirroring dots-cpp `Container::updateWithoutKeys`.
-    /// See [`dots_rs_core::AnyStruct::merge_take`] /
-    /// [`dots_rs_core::DynamicStruct::merge_take`] for the semantics.
+    /// See [`dots_rs_core::AnyStruct::copy_take`] /
+    /// [`dots_rs_core::DynamicStruct::copy_take`] for the semantics.
     ///
     /// When the two payloads use different representations (one
-    /// `Typed`, one `Wire`) there's no shared in-memory form to merge
+    /// `Typed`, one `Wire`) there's no shared in-memory form to copy
     /// into, so `self` is replaced by `incoming` wholesale — the same
-    /// outcome as before merge existed. In practice a given type is
-    /// published in one representation, so this fallback is not hit on
-    /// the hot path.
-    pub fn merge_take(&mut self, mask: PropertySet, incoming: Payload) {
+    /// outcome as before the copy path existed. In practice a given
+    /// type is published in one representation, so this fallback is
+    /// not hit on the hot path.
+    pub fn copy_take(&mut self, mask: PropertySet, incoming: Payload) {
         match (self, incoming) {
-            (Self::Typed(dst), Self::Typed(mut src)) => dst.merge_take(&mut src, mask),
-            (Self::Wire(dst), Self::Wire(mut src)) => dst.merge_take(&mut src, mask),
+            (Self::Typed(dst), Self::Typed(mut src)) => dst.copy_take(&mut src, mask),
+            (Self::Wire(dst), Self::Wire(mut src)) => dst.copy_take(&mut src, mask),
             (slot, other) => *slot = other,
         }
     }

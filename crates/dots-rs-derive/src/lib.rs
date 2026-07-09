@@ -8,6 +8,13 @@
 //! The struct itself may carry `#[dots(name = "WireName", cached, ...)]`
 //! to override the wire name and set struct-level flags.
 //!
+//! Both derives additionally require `Clone` on the type (derive it
+//! alongside): the emitted [`DotsFieldOps`] impl — value equality,
+//! total order, and the recursive merge — needs it, and every DOTS
+//! field type is `Clone` by contract anyway.
+//!
+//! [`DotsFieldOps`]: dots_rs_core::DotsFieldOps
+//!
 //! # What's emitted
 //!
 //! For each derived struct, the macro produces:
@@ -23,6 +30,11 @@
 //!    `fn with_field(value)`, `fn clear_field()`).
 //! 4. A `StructValue` impl exposing the descriptor, valid set, type
 //!    erasure, and a layout-compatible `data_ptr` for the codec.
+//! 5. A `DotsFieldOps` impl: property-wise equality and total order
+//!    (unset < set, floats via `total_cmp`, enums by `value`) plus the
+//!    recursive dots-cpp-`_merge`-style overlay — shared by the typed
+//!    path and, through the vtable thunks, by `AnyStruct`'s
+//!    `equal`/`cmp_masked`/`diff_properties`/`merge_from`.
 //!
 //! No `minicbor::Encode`/`Decode` impls are produced for the struct
 //! itself — encoding goes through the descriptor's vtable thunks so
@@ -138,7 +150,7 @@ pub fn derive_dots_enum(input: TokenStream) -> TokenStream {
 /// use dots_rs_core::dots;
 /// mod model {
 ///     use dots_rs_derive::DotsStruct;
-///     #[derive(DotsStruct)]
+///     #[derive(DotsStruct, Clone)]
 ///     #[dots(name = "Foo")]
 ///     pub struct Foo {
 ///         #[dots(tag = 1, key)]
@@ -158,7 +170,7 @@ pub fn derive_dots_enum(input: TokenStream) -> TokenStream {
 /// use dots_rs_core::dots;
 /// mod model {
 ///     use dots_rs_derive::DotsStruct;
-///     #[derive(DotsStruct)]
+///     #[derive(DotsStruct, Clone)]
 ///     #[dots(name = "Foo")]
 ///     pub struct Foo {
 ///         #[dots(tag = 1, key)]
@@ -601,6 +613,42 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     });
 
+    // Property-wise value operations, in declaration (= descriptor)
+    // order — the same order the dynamic path and dots-cpp use, so all
+    // three agree on struct ordering.
+    let field_eq_terms = fields.iter().map(|f| {
+        let ident = f.ident;
+        if f.bare_key {
+            quote! { #dots_rt::DotsFieldOps::dots_eq(&self.#ident, &other.#ident) }
+        } else {
+            quote! { #dots_rt::field_ops::opt_field_eq(&self.#ident, &other.#ident) }
+        }
+    });
+
+    let field_cmp_stmts = fields.iter().map(|f| {
+        let ident = f.ident;
+        let cmp_expr = if f.bare_key {
+            quote! { #dots_rt::DotsFieldOps::dots_cmp(&self.#ident, &other.#ident) }
+        } else {
+            quote! { #dots_rt::field_ops::opt_field_cmp(&self.#ident, &other.#ident) }
+        };
+        quote! {
+            match #cmp_expr {
+                ::core::cmp::Ordering::Equal => {}
+                __non_eq => return __non_eq,
+            }
+        }
+    });
+
+    let field_merge_stmts = fields.iter().map(|f| {
+        let ident = f.ident;
+        if f.bare_key {
+            quote! { #dots_rt::DotsFieldOps::dots_merge(&mut self.#ident, &other.#ident); }
+        } else {
+            quote! { #dots_rt::field_ops::opt_field_merge(&mut self.#ident, &other.#ident); }
+        }
+    });
+
     let descriptor_const_ident = Ident::new(
         &format!(
             "_DOTS_DESCRIPTOR_{}",
@@ -746,6 +794,25 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
 
+        // Value-level operations: property-wise equality/order (invalid
+        // sorts before valid, matching dots-cpp) and the recursive
+        // `_merge`-style overlay. Requires `Clone` on the struct — the
+        // same bound every DOTS field type already carries.
+        impl #dots_rt::DotsFieldOps for #struct_ident {
+            fn dots_eq(&self, other: &Self) -> bool {
+                #( #field_eq_terms && )* true
+            }
+
+            fn dots_cmp(&self, other: &Self) -> ::core::cmp::Ordering {
+                #( #field_cmp_stmts )*
+                ::core::cmp::Ordering::Equal
+            }
+
+            fn dots_merge(&mut self, other: &Self) {
+                #( #field_merge_stmts )*
+            }
+        }
+
         #companion
     };
 
@@ -777,6 +844,10 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>, dots_rt: &TokenStream
                 clone_in_place: #dots_rt::layout::key_clone::<#inner_ty>,
                 set_none: #dots_rt::layout::key_set_none::<#inner_ty>,
                 take_in_place: #dots_rt::layout::key_take::<#inner_ty>,
+                eq_in_place: #dots_rt::layout::key_eq::<#inner_ty>,
+                cmp_in_place: #dots_rt::layout::key_cmp::<#inner_ty>,
+                swap_in_place: #dots_rt::layout::key_swap::<#inner_ty>,
+                merge_in_place: #dots_rt::layout::key_merge::<#inner_ty>,
             };
         };
     }
@@ -794,6 +865,10 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>, dots_rt: &TokenStream
                 clone_in_place: #dots_rt::layout::opt_clone_vec::<#elem_ty>,
                 set_none: #dots_rt::layout::opt_set_none::<#inner_ty>,
                 take_in_place: #dots_rt::layout::opt_take::<#inner_ty>,
+                eq_in_place: #dots_rt::layout::opt_eq::<#inner_ty>,
+                cmp_in_place: #dots_rt::layout::opt_cmp::<#inner_ty>,
+                swap_in_place: #dots_rt::layout::opt_swap::<#inner_ty>,
+                merge_in_place: #dots_rt::layout::opt_merge::<#inner_ty>,
             };
         };
     }
@@ -809,6 +884,10 @@ fn property_decl(_struct_ident: &Ident, f: &DotsField<'_>, dots_rt: &TokenStream
             clone_in_place: #dots_rt::layout::opt_clone::<#inner_ty>,
             set_none: #dots_rt::layout::opt_set_none::<#inner_ty>,
             take_in_place: #dots_rt::layout::opt_take::<#inner_ty>,
+            eq_in_place: #dots_rt::layout::opt_eq::<#inner_ty>,
+            cmp_in_place: #dots_rt::layout::opt_cmp::<#inner_ty>,
+            swap_in_place: #dots_rt::layout::opt_swap::<#inner_ty>,
+            merge_in_place: #dots_rt::layout::opt_merge::<#inner_ty>,
         };
     }
 }
@@ -1404,6 +1483,16 @@ fn expand_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
         quote! { Self::#ident => #tag }
     });
 
+    let value_arms = variants
+        .iter()
+        .map(|v| {
+            let ident = v.ident;
+            let value = v.value;
+            quote! { Self::#ident => #value }
+        })
+        .collect::<Vec<_>>();
+    let value_arms_rhs = value_arms.clone();
+
     let decode_arms = variants.iter().map(|v| {
         let ident = v.ident;
         let tag = v.tag;
@@ -1470,6 +1559,24 @@ fn expand_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
                         ),
                     ),
                 }
+            }
+        }
+
+        // Value-level operations: enums order by their `int32` `value`
+        // (dots-cpp compares the underlying enumerator value, which is
+        // exactly this metadata field — the wire tag is not the sort
+        // key). Requires `Clone` on the enum.
+        impl #dots_rt::DotsFieldOps for #enum_ident {
+            #[inline]
+            fn dots_eq(&self, other: &Self) -> bool {
+                ::core::mem::discriminant(self) == ::core::mem::discriminant(other)
+            }
+
+            #[inline]
+            fn dots_cmp(&self, other: &Self) -> ::core::cmp::Ordering {
+                let lhs: i32 = match self { #( #value_arms ),* };
+                let rhs: i32 = match other { #( #value_arms_rhs ),* };
+                ::core::cmp::Ord::cmp(&lhs, &rhs)
             }
         }
     };

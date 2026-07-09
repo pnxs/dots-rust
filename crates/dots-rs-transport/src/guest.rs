@@ -703,6 +703,33 @@ impl GuestTransceiver {
     /// in the union of `included | key_set(value)` make it onto the
     /// wire. Useful for partial updates where some non-key fields
     /// are populated locally but should not be propagated yet.
+    ///
+    /// **Invalidating a single field:** the full mask — not just the
+    /// set∩included part — travels as `DotsHeader.attributes`, and a
+    /// property that is named in the mask but **unset** on `value` is
+    /// an *explicit clear*: every receiver's cache drops that property
+    /// from its instance (see [`AnyStruct::copy_from`]). So
+    ///
+    /// ```no_run
+    /// # use dots_rs::{DotsStruct, PropertySet, dots};
+    /// # #[derive(DotsStruct, Default, Debug, Clone)]
+    /// # #[dots(name = "Sensor", cached)]
+    /// # struct Sensor {
+    /// #     #[dots(tag = 1, key)] id: Option<u32>,
+    /// #     #[dots(tag = 2)] temperature: Option<f64>,
+    /// # }
+    /// # let guest: dots_rs_transport::GuestTransceiver = unimplemented!();
+    /// const TEMPERATURE_TAG: u32 = 2;
+    /// guest.publish_with_mask(
+    ///     &dots!(Sensor { id: 42_u32 }), // temperature unset
+    ///     PropertySet::EMPTY.with_tag(TEMPERATURE_TAG),
+    /// );
+    /// ```
+    ///
+    /// clears `temperature` on the instance identified by the value's
+    /// keys, leaving all other properties untouched.
+    ///
+    /// [`AnyStruct::copy_from`]: dots_rs_core::AnyStruct::copy_from
     pub fn publish_with_mask<P: Publishable>(&self, value: &P, included: PropertySet) {
         P::register_as_published();
         if let Some(d) = value.static_descriptor() {

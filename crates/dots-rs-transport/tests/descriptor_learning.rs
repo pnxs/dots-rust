@@ -24,7 +24,7 @@ use dots_rs_model::{
     StructDescriptorData, encode_transmission, registry_with_internal_types,
 };
 use dots_rs_transport::{Connection, GuestDriver, GuestTransceiver, TransmissionCodec};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{StreamExt};
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::time::timeout;
 use tokio_util::codec::Framed;

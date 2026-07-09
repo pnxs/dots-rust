@@ -1314,7 +1314,7 @@ impl HostTransceiver {
                     match map.entry(key) {
                         std::collections::btree_map::Entry::Occupied(mut slot) => {
                             let e = slot.get_mut();
-                            e.payload.merge_take(mask, p);
+                            e.payload.copy_take(mask, p);
                             // `created_from` is set once, on the first
                             // publish (dots-cpp `createdFrom`).
                             e.last_update_sender = header.sender;

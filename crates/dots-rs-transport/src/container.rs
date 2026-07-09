@@ -246,26 +246,26 @@ impl ContainerValue {
         }
     }
 
-    /// Masked partial-update merge, cloning the addressed properties
+    /// Masked partial-update copy, cloning the addressed properties
     /// in. Both sides are same-variant by the container's
     /// representation invariant; a cross-variant call is a library bug
     /// and degrades to a no-op.
-    fn merge_from(&mut self, src: &ContainerValue, mask: PropertySet) {
+    fn copy_from(&mut self, src: &ContainerValue, mask: PropertySet) {
         match (self, src) {
-            (Self::Typed(dst), Self::Typed(s)) => dst.merge_from(s, mask),
-            (Self::Dynamic(dst), Self::Dynamic(s)) => dst.merge_from(s, mask),
-            _ => debug_assert!(false, "container representation invariant violated in merge_from"),
+            (Self::Typed(dst), Self::Typed(s)) => dst.copy_from(s, mask),
+            (Self::Dynamic(dst), Self::Dynamic(s)) => dst.copy_from(s, mask),
+            _ => debug_assert!(false, "container representation invariant violated in copy_from"),
         }
     }
 
-    /// Masked partial-update merge that **moves** the addressed
+    /// Masked partial-update copy that **moves** the addressed
     /// properties out of `src`. Same-variant invariant as
-    /// [`merge_from`](Self::merge_from).
-    fn merge_take(&mut self, src: &mut ContainerValue, mask: PropertySet) {
+    /// [`copy_from`](Self::copy_from).
+    fn copy_take(&mut self, src: &mut ContainerValue, mask: PropertySet) {
         match (self, src) {
-            (Self::Typed(dst), Self::Typed(s)) => dst.merge_take(s, mask),
-            (Self::Dynamic(dst), Self::Dynamic(s)) => dst.merge_take(s, mask),
-            _ => debug_assert!(false, "container representation invariant violated in merge_take"),
+            (Self::Typed(dst), Self::Typed(s)) => dst.copy_take(s, mask),
+            (Self::Dynamic(dst), Self::Dynamic(s)) => dst.copy_take(s, mask),
+            _ => debug_assert!(false, "container representation invariant violated in copy_take"),
         }
     }
 }
@@ -285,9 +285,9 @@ impl Converted<'_> {
     /// Merge this payload's masked properties into an existing entry.
     fn merge_into(&self, dst: &mut ContainerValue, mask: PropertySet) {
         match (dst, self) {
-            (ContainerValue::Typed(d), Self::BorrowedTyped(s)) => d.merge_from(*s, mask),
-            (ContainerValue::Dynamic(d), Self::BorrowedDynamic(s)) => d.merge_from(s, mask),
-            (d, Self::Owned(s)) => d.merge_from(s, mask),
+            (ContainerValue::Typed(d), Self::BorrowedTyped(s)) => d.copy_from(*s, mask),
+            (ContainerValue::Dynamic(d), Self::BorrowedDynamic(s)) => d.copy_from(s, mask),
+            (d, Self::Owned(s)) => d.copy_from(s, mask),
             _ => debug_assert!(false, "container representation invariant violated in merge_into"),
         }
     }
@@ -780,7 +780,7 @@ impl DynContainer {
                 // Move the changed properties out of the owned incoming
                 // value; whatever isn't moved drops with `value`.
                 let entry = slot.get_mut();
-                entry.value.merge_take(&mut value, mask);
+                entry.value.copy_take(&mut value, mask);
                 entry.clone_info.last_operation = Operation::Update;
                 entry.clone_info.last_update_time = now_time;
                 entry.clone_info.last_update_sender = now_sender;
