@@ -6,17 +6,29 @@
 //! contains a static that the linker collects into [`PUBLISHED_TYPES`]
 //! or [`SUBSCRIBED_TYPES`] respectively.
 //!
-//! The transport's `publish::<T>` / `subscribe::<T>` entry points call
-//! the matching registration method; monomorphization for any `T` that
-//! appears at one of those entry points causes the static to be
-//! emitted. With LTO, types the binary never publishes or subscribes
-//! to don't appear in the corresponding slice, so the runtime view
-//! exactly matches the binary's link-time intent.
+//! The transport's `publish::<T>` / `subscribe::<T>` / `container::<T>`
+//! entry points call the matching registration method. The methods are
+//! non-generic, so rustc emits their statics for every derived type; on
+//! ELF targets the derive therefore emits the entry *without* `#[used]`,
+//! kept alive solely by a `black_box` reference from the method body. An
+//! entry then survives dead-code elimination exactly when its method is
+//! reachable from one of those entry points: with LTO (and, more
+//! coarsely, plain `--gc-sections`) types the binary never publishes or
+//! subscribes to are culled from the slice, so the runtime view matches
+//! the binary's actual use. Builds without LTO retain more entries —
+//! merely conservative, never wrong. On non-ELF targets the derive falls
+//! back to linkme's `#[used]` entries (every derived type, no culling).
+//!
+//! Note the coupling: the derive's ELF path hard-codes the section names
+//! `linkme_PUBLISHED_TYPES` / `linkme_SUBSCRIBED_TYPES` — linkme's ELF
+//! naming for the two slice idents below. Renaming a slice requires
+//! updating the derive.
 //!
 //! This mirrors C++ DOTS's `io::register_global_subscribe_type<T>` /
-//! `register_global_publish_type<T>` mechanism — the linker-collected
-//! slice is the per-binary list the broker handshake feeds during
-//! preload.
+//! `register_global_publish_type<T>` mechanism, where the registration
+//! statics are template members that only exist for instantiated types —
+//! the linker-collected slice is the per-binary list the broker
+//! handshake feeds during preload.
 
 use crate::StructDescriptor;
 
@@ -36,9 +48,11 @@ pub static SUBSCRIBED_TYPES: [&'static StructDescriptor];
 /// `#[derive(DotsStruct)]`; not intended for hand-written impls.
 ///
 /// The two methods exist solely so that calling them from
-/// `publish::<T>` / `subscribe::<T>` pulls the static-with-link-section
-/// inside each fn body into the linker's view of the binary. Their
-/// bodies do nothing at runtime — the work happens at link time.
+/// `publish::<T>` / `subscribe::<T>` keeps the slice entry inside each
+/// fn body alive through dead-code elimination (the entry is anchored by
+/// a `black_box` reference, not `#[used]`, so it is culled together with
+/// the method when the binary never uses the type). Their bodies do no
+/// meaningful work at runtime — membership is decided at link time.
 pub trait GlobalRegistration {
     /// Mark this type as published by the current binary. Idempotent
     /// at runtime; the underlying link-time slot is set once.

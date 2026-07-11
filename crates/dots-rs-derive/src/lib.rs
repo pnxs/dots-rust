@@ -674,25 +674,45 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     };
 
-    // Link-time registration hooks. Each fn body contains a static
-    // tagged with the linkme distributed-slice attribute. The transport's
-    // generic `publish::<T>` / `subscribe::<T>` entry points call these
-    // methods, so monomorphization for a given `T` causes the static
-    // to be emitted and linked into the slice. Types the binary never
-    // publishes or subscribes to don't appear in the slice (with LTO).
+    // Link-time registration hooks. Each fn body contains a static placed
+    // in the PUBLISHED_TYPES / SUBSCRIBED_TYPES slice section.
+    //
+    // On ELF targets the entry is a plain `link_section` static *without*
+    // `#[used]`, anchored only by the `black_box` reference in the fn body.
+    // These fns are non-generic, so rustc emits the statics for every
+    // derived type unconditionally — but because nothing else references
+    // them, the entry lives exactly as long as its fn is reachable: the
+    // `publish::<T>` / `subscribe::<T>` / `container::<T>` call sites keep
+    // it alive, and LTO / `--gc-sections` drop it together with the fn
+    // when the binary never uses the type. This mirrors dots-cpp, where
+    // the template registration statics only exist for instantiated types.
+    // The `black_box` is load-bearing: a plain `let _ = &REG;` is optimized
+    // out, and the entry would then be dropped even for *used* types.
+    //
+    // On non-ELF targets (different section naming schemes) fall back to
+    // linkme's own entry macro, whose `#[used]` retains every derived type
+    // unconditionally — correct, just without the culling.
     let global_registration_impl = quote! {
         impl #dots_rt::GlobalRegistration for #struct_ident {
             fn register_as_published() {
+                #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+                #[unsafe(link_section = "linkme_PUBLISHED_TYPES")]
+                static REG: &'static #dots_rt::StructDescriptor = #struct_ident::DESCRIPTOR;
+                #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
                 #[#dots_rt::linkme::distributed_slice(#dots_rt::PUBLISHED_TYPES)]
                 #[linkme(crate = #dots_rt::linkme)]
                 static REG: &'static #dots_rt::StructDescriptor = #struct_ident::DESCRIPTOR;
-                let _ = &REG;
+                ::core::hint::black_box(&REG);
             }
             fn register_as_subscribed() {
+                #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+                #[unsafe(link_section = "linkme_SUBSCRIBED_TYPES")]
+                static REG: &'static #dots_rt::StructDescriptor = #struct_ident::DESCRIPTOR;
+                #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
                 #[#dots_rt::linkme::distributed_slice(#dots_rt::SUBSCRIBED_TYPES)]
                 #[linkme(crate = #dots_rt::linkme)]
                 static REG: &'static #dots_rt::StructDescriptor = #struct_ident::DESCRIPTOR;
-                let _ = &REG;
+                ::core::hint::black_box(&REG);
             }
         }
     };

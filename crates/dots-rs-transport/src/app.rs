@@ -507,11 +507,12 @@ where
 
     // Hand the link-time `PUBLISHED_TYPES` / `SUBSCRIBED_TYPES`
     // slices to the transceiver. The `#[derive(DotsStruct)]` macro
-    // emits `linkme` entries inside `register_as_published` /
-    // `register_as_subscribed`; each `publish::<T>` /
-    // `subscribe::<T>` / `container::<T>` monomorphization pulls
-    // those entries into the binary, so these slices reflect the
-    // binary's actual link-time intent. The driver's Phase 1
+    // emits slice entries inside `register_as_published` /
+    // `register_as_subscribed`, anchored by the `publish::<T>` /
+    // `subscribe::<T>` / `container::<T>` call sites so dead-code
+    // elimination culls entries for types the binary never uses (on
+    // ELF with LTO; conservative otherwise — see
+    // `dots_rs_core::registration`). The driver's Phase 1
     // walks them transitively (registering and shipping every
     // nested struct/enum descriptor in declaration order) and
     // Phase 1b emits `DotsMember(Join, T.name)` for each
