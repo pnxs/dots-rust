@@ -695,9 +695,12 @@ pub(crate) fn import_wire_descriptors(registry: &Registry, txn: &Transmission) {
 /// call we'd deadlock. The take-out-put-back pattern lets handlers
 /// freely lock dispatch.
 ///
-/// New subscribers registered during a dispatch don't see this
+/// New subscribers registered during a dispatch aren't handed this
 /// transmission (they're put back behind the entries we just
-/// processed and only see future events). Subscriptions dropped
+/// processed and only see future events) — but registration replays
+/// the container's current state, which by the subscriber phase
+/// already includes this transmission, so the observable outcome
+/// matches dots-cpp's invoke-for-the-current-event. Subscriptions dropped
 /// during a dispatch of their own type are recorded in
 /// `DispatchState::pending_unregister` (the type's entries vec is
 /// momentarily out of the map): the loop skips them for the current
@@ -977,6 +980,16 @@ impl<T> Event<T> {
             operation,
             clone_info,
         }
+    }
+
+    /// True when this event replays cached state rather than reporting a
+    /// live transmission: `header.from_cache` carries the replay
+    /// countdown, set by the broker on its cache replay and by the guest
+    /// for the subscription-time replay of the local container. "Wait
+    /// for my own publish to echo back" barriers must skip such events;
+    /// `from_cache == Some(0)` marks the last one.
+    pub fn is_from_cache(&self) -> bool {
+        self.header.from_cache.is_some()
     }
 
     /// The header of the transmission that triggered this event.

@@ -535,8 +535,10 @@ where
     // every subscribed type, finish_preload) before returning, so
     // the connection is in `Connected` state by the time the caller
     // receives the transceiver. Cache events that arrive during this
-    // phase have no user-side subscribers yet — they're dropped.
-    // Live events flow normally once the driver runs.
+    // phase have no user-side subscribers yet — they populate the
+    // pre-created containers, and later subscribers get that state via
+    // replay-on-subscribe. Live events flow normally once the driver
+    // runs.
     driver.early_subscribe().await?;
     // Install the transceiver as the process-wide singleton so
     // `dots_rs_transport::global::{publish, subscribe, container, …}`

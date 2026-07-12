@@ -390,16 +390,16 @@ async fn remove_other_handler_during_dispatch_prevents_its_invocation() {
 
 // ----- 5. Add-handler during dispatch -----
 
-/// Ports `dispatch_AddEventHandlerDuringDispatch` — with a deliberate,
-/// documented divergence: dots-cpp invokes a handler added during
-/// dispatch for the CURRENT event, while dots-rust defers it (per the
-/// `dispatch_external` docs in connection.rs, "new subscribers
-/// registered during a dispatch don't see this transmission ... and
-/// only see future events"). This test pins the documented Rust
-/// behavior: C sees nothing for the event that registered it, and sees
-/// the next one.
+/// Ports `dispatch_AddEventHandlerDuringDispatch`. dots-cpp invokes a
+/// handler added during dispatch for the CURRENT event; dots-rust does
+/// not hand it the in-flight transmission (per the `dispatch_external`
+/// docs in connection.rs), but replay-on-subscribe closes the gap: the
+/// container was updated before the subscriber phase, so registering C
+/// replays the post-update state to it synchronously. Observable
+/// outcome matches dots-cpp — C sees the current event's state (as a
+/// replayed create) and every later event live.
 #[tokio::test]
-async fn add_handler_during_dispatch_sees_next_event_not_current() {
+async fn add_handler_during_dispatch_sees_current_state_via_replay() {
     let (transceiver, driver, mut server) = connect_guest().await;
 
     let a_count = Arc::new(AtomicUsize::new(0));
@@ -425,24 +425,25 @@ async fn add_handler_during_dispatch_sees_next_event_not_current() {
     let mut barrier = transceiver.subscribe_stream::<Pinger>();
     let driver_handle = tokio::spawn(driver.run());
 
-    // Event 1: A registers C mid-dispatch.
+    // Event 1: A registers C mid-dispatch; the subscribe replays the
+    // already-updated container to C before returning.
     push_pinger(&mut server, &dots!(Pinger { id: 1_u32 }), false).await;
     recv_timeout(&mut barrier, GENEROUS).await.expect("event 1 dispatched");
     tokio::time::sleep(SETTLE).await;
     assert_eq!(
         c_count.load(Ordering::SeqCst),
-        0,
-        "documented Rust behavior: a handler added during dispatch does NOT see the current event (cpp would invoke it)"
+        1,
+        "cpp-parity via replay: a handler added during dispatch sees the current event's state"
     );
 
-    // Event 2: C is now installed and fires.
+    // Event 2: C is installed and fires live.
     push_pinger(&mut server, &dots!(Pinger { id: 2_u32 }), false).await;
     recv_timeout(&mut barrier, GENEROUS).await.expect("event 2 dispatched");
     // C was appended to the entry list after the barrier, so its
     // event-2 invocation may complete just after the barrier's — poll.
     let c_count_for_wait = c_count.clone();
     wait_until("handler C to fire for the next event", move || {
-        c_count_for_wait.load(Ordering::SeqCst) == 1
+        c_count_for_wait.load(Ordering::SeqCst) == 2
     })
     .await;
     assert_eq!(a_count.load(Ordering::SeqCst), 2);

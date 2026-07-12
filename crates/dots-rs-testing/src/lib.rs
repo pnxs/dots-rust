@@ -286,12 +286,18 @@ impl TestHarness {
     {
         let mut sub = self.subscribe_stream::<T>();
         publisher.publish(obj);
-        self.recv(&mut sub)
-            .await
-            .expect("primary observes published object");
+        // The fresh subscription starts with the container's replayed
+        // state; only a live event proves the publish round-tripped.
+        loop {
+            let event = self.recv(&mut sub).await.expect("primary observes published object");
+            if !event.is_from_cache() {
+                break;
+            }
+        }
     }
 
-    /// Receive the next event on `sub` and assert it is a *publish* whose
+    /// Receive the next *live* event on `sub` (skipping any
+    /// subscription-time cache replay) and assert it is a *publish* whose
     /// payload matches `expected` on every field `expected` sets (see
     /// [`assert_fields_match`]). Returns the event so a test can make extra
     /// assertions — e.g. on a field whose exact value it doesn't want to pin,
@@ -307,7 +313,14 @@ impl TestHarness {
     where
         T: StructValue + Clone + Send + 'static,
     {
-        let event = self.recv(sub).await.expect("expected a published event");
+        // Skip subscription-time replay — the expectation is about a live
+        // publish, not the state the subscription started from.
+        let event = loop {
+            let event = self.recv(sub).await.expect("expected a published event");
+            if !event.is_from_cache() {
+                break event;
+            }
+        };
         assert_ne!(
             event.header.remove_obj,
             Some(true),
@@ -331,7 +344,13 @@ impl TestHarness {
     where
         T: StructValue + Clone + Send + 'static,
     {
-        let event = self.recv(sub).await.expect("expected a removal event");
+        // Skip subscription-time replay — a removal is always a live event.
+        let event = loop {
+            let event = self.recv(sub).await.expect("expected a removal event");
+            if !event.is_from_cache() {
+                break event;
+            }
+        };
         assert_eq!(
             event.header.remove_obj,
             Some(true),

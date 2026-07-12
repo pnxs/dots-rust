@@ -339,6 +339,12 @@ impl GuestTransceiver {
     /// The callback fires from the [`GuestDriver`]'s read loop on
     /// every transmission whose `header.type_name` matches `T`.
     ///
+    /// The container's current state is replayed first: the handler
+    /// receives a create event for every already-cached instance of `T`
+    /// (delivered synchronously, before this method returns) and live
+    /// events after that — matching dots-cpp, where a subscription to a
+    /// cached type always starts with the cached set.
+    ///
     /// Drop the returned [`SubscriptionHandle`] to detach the handler;
     /// call [`SubscriptionHandle::discard`] to keep it installed for
     /// the rest of the connection. When the last subscriber of a
@@ -364,6 +370,11 @@ impl GuestTransceiver {
 
     /// Subscribe to typed events as an async [`crate::Subscription<T>`]
     /// stream.
+    ///
+    /// The container's current state is replayed first: the stream
+    /// yields a create event for every already-cached instance of `T`
+    /// before any live event — matching dots-cpp, where a subscription
+    /// to a cached type always starts with the cached set.
     pub fn subscribe_stream<T>(self: &Arc<Self>) -> crate::Subscription<T>
     where
         T: StructValue + Send + Sync + Clone + 'static + dots_rs_core::GlobalRegistration,
@@ -378,6 +389,9 @@ impl GuestTransceiver {
     /// overlap (a single in-flight handler at any moment). This is the
     /// async-handler counterpart of [`subscribe`](Self::subscribe), whose
     /// callback is synchronous and so cannot `.await`.
+    ///
+    /// Built on [`subscribe_stream`](Self::subscribe_stream), so the
+    /// handler starts with the replayed container state.
     ///
     /// `state` is shared context — commonly the actor/manager that owns the
     /// behaviour — handed to each invocation (cloned per event), which keeps
@@ -924,8 +938,11 @@ where
     /// the `App`. Cache events that arrive during this phase are
     /// dispatched against whatever subscribers are installed at the
     /// time — when called from `App::new`, no user-side subscribers
-    /// exist yet, so cache events are dropped. Live (post-cache) events
-    /// flow normally once [`run`](Self::run) starts.
+    /// exist yet, so they only populate the pre-created containers.
+    /// Subscribers installed later receive that state anyway: every
+    /// subscribe flavour replays the container's contents as create
+    /// events on registration. Live (post-cache) events flow normally
+    /// once [`run`](Self::run) starts.
     pub async fn early_subscribe(&mut self) -> Result<(), GuestError> {
         if self.early_subscribe_done {
             return Ok(());
@@ -1299,6 +1316,40 @@ impl Drop for SubscriptionHandle {
     }
 }
 
+/// Synthetic create-events for every instance currently cached in
+/// `container`, in container order. Replayed to a newly registered
+/// subscriber so all subscribe flavours match dots-cpp, where subscribing
+/// to a cached type first delivers a create event per cached instance
+/// before any live event. The fabricated header carries the entry's
+/// clone-info timestamps/sender, and `from_cache` counts down `N-1 … 0`
+/// over the snapshot — the broker's cache-replay convention (also used
+/// by `View::subscribe`), so `Event::is_from_cache` distinguishes these
+/// from live events and `from_cache == 0` marks the last one.
+fn replay_events<T>(container: &Arc<DynContainer>) -> Vec<Event<T>>
+where
+    T: StructValue + Send + Sync + Clone + 'static,
+{
+    let snapshot = Container::<T>::from_dyn(container.clone()).snapshot();
+    let total = snapshot.len();
+    snapshot
+        .into_iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let header = DotsHeader {
+                type_name: Some(container.name().to_string()),
+                attributes: Some(StructValue::valid_set(&entry.value)),
+                sender: entry.clone_info.last_update_sender,
+                sent_time: entry.clone_info.last_update_time,
+                server_sent_time: entry.clone_info.last_update_time,
+                from_cache: Some((total - 1 - i) as u32),
+                ..Default::default()
+            };
+            let updated = Arc::new(entry.value.clone());
+            Event::from_parts(header, entry.value, updated, Operation::Create, entry.clone_info)
+        })
+        .collect()
+}
+
 fn register_callback<T, F>(
     dispatch: &Arc<Mutex<DispatchState>>,
     container: Arc<DynContainer>,
@@ -1308,9 +1359,19 @@ where
     T: StructValue + Send + Sync + Clone + 'static,
     F: FnMut(&Event<T>) + Send + 'static,
 {
+    // The handler is shared between the dispatch entry and this
+    // registration path so the container's current state can be replayed
+    // into it. Holding its lock across register + replay means live
+    // dispatch of any transmission processed after registration blocks
+    // until the replay has been delivered — replay events always come
+    // first, and a transmission landing between registration and the
+    // snapshot is delivered twice (same state both times, but the
+    // handler does observe the extra invocation), never lost.
+    let handler = Arc::new(Mutex::new(handler));
+    let mut replaying = handler.lock().expect("fresh handler mutex");
     let entry: CallbackDispatchEntry<T, F> = CallbackDispatchEntry {
-        handler,
-        _container: container,
+        handler: handler.clone(),
+        _container: container.clone(),
         _phantom: PhantomData,
     };
     let type_name = T::type_descriptor().name.to_string();
@@ -1318,6 +1379,10 @@ where
         .lock()
         .expect("dispatch mutex poisoned")
         .register(type_name.clone(), Box::new(entry));
+    for event in replay_events::<T>(&container) {
+        (*replaying)(&event);
+    }
+    drop(replaying);
     SubscriptionHandle {
         type_name,
         id,
@@ -1327,7 +1392,9 @@ where
 }
 
 struct CallbackDispatchEntry<T, F> {
-    handler: F,
+    /// Shared with [`register_callback`], which locks it across
+    /// registration + replay so replayed events precede live ones.
+    handler: Arc<Mutex<F>>,
     /// Kept to pin the type's [`DynContainer`] alive for as long as this
     /// subscription exists, so its (weakly-held) container dispatch entry
     /// keeps applying updates and producing the post-update outcome this
@@ -1352,7 +1419,7 @@ where
         // Callback subscribers are always cache-backed; a suppressed
         // dispatch (remove of an absent key) fires no handler.
         if let Some(event) = Event::from_shared(txn.header.clone(), value, true, shared) {
-            (self.handler)(&event);
+            (self.handler.lock().expect("handler mutex poisoned"))(&event);
         }
         Ok(true)
     }
@@ -1483,16 +1550,28 @@ where
     T: StructValue + Send + Sync + Clone + 'static,
 {
     let (tx, rx) = mpsc::unbounded_channel();
-    let entry = StreamDispatchEntry::<T> {
-        sender: tx,
-        container,
-        _phantom: PhantomData,
-    };
     let type_name = T::type_descriptor().name.to_string();
-    let id = dispatch
-        .lock()
-        .expect("dispatch mutex poisoned")
-        .register(type_name.clone(), Box::new(entry));
+    let id = {
+        let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+        // Replay the container's current state, then register — both
+        // under the dispatch lock. The new entry can only be taken for
+        // dispatch after the lock is released, so every replayed event
+        // is queued strictly before any live one. A transmission already
+        // mid-dispatch while we snapshot is missed unless its container
+        // update has already landed (then the replay carries it) — the
+        // same window an un-replayed subscribe has always had.
+        if let Some(container) = &container {
+            for event in replay_events::<T>(container) {
+                let _ = tx.send(event);
+            }
+        }
+        let entry = StreamDispatchEntry::<T> {
+            sender: tx,
+            container,
+            _phantom: PhantomData,
+        };
+        state.register(type_name.clone(), Box::new(entry))
+    };
     crate::Subscription::<T>::from_parts(rx, type_name, id, Arc::downgrade(dispatch))
 }
 

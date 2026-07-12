@@ -278,3 +278,78 @@ async fn harness_teardown_allows_reconstruction() {
     let event = h2.recv(&mut sub).await.expect("second harness works");
     assert_eq!(event.updated().id, Some(2));
 }
+
+/// Subscribing to a cached type replays the container: a value published
+/// (and settled) before the subscription exists arrives as the stream's
+/// first event — a create carrying the cached instance (dots-cpp parity).
+#[tokio::test]
+async fn stream_subscribe_replays_cached_state() {
+    let harness = TestHarness::new().await;
+
+    // Join + local mirror first, then publish with nobody subscribed.
+    dots::container::<Greeting>();
+    dots::publish(&dots!(Greeting { id: 7_u32, text: "cached" }));
+    harness.settle().await;
+
+    let mut sub = dots::subscribe_stream::<Greeting>();
+    let event = harness.recv(&mut sub).await.expect("replayed event");
+    assert_eq!(event.operation, dots_rs_transport::Operation::Create);
+    assert_eq!(event.updated().id, Some(7));
+    assert_eq!(event.updated().text.as_deref(), Some("cached"));
+    // Replay is marked with the broker's cache-replay convention; the
+    // last (here: only) replayed instance carries `from_cache == 0`.
+    assert!(event.is_from_cache());
+    assert_eq!(event.header.from_cache, Some(0));
+
+    // Live events still follow the replay, unmarked.
+    dots::publish(&dots!(Greeting { id: 7_u32, text: "live" }));
+    let event = harness.recv(&mut sub).await.expect("live event");
+    assert_eq!(event.updated().text.as_deref(), Some("live"));
+    assert!(!event.is_from_cache());
+}
+
+/// The synchronous-callback subscribe delivers the replay before it
+/// returns: the handler has already seen the cached instance when
+/// `subscribe` hands back its handle.
+#[tokio::test]
+async fn callback_subscribe_replays_before_returning() {
+    let harness = TestHarness::new().await;
+
+    dots::container::<Counter>();
+    dots::publish(&dots!(Counter { id: 1_u32, value: 42_u64 }));
+    harness.settle().await;
+
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<(dots_rs_transport::Operation, u64)>>> =
+        Default::default();
+    let sink = seen.clone();
+    let _sub = dots::subscribe::<Counter>(move |evt| {
+        sink.lock().unwrap().push((evt.operation, evt.updated().value.unwrap()));
+    });
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.as_slice(), &[(dots_rs_transport::Operation::Create, 42)]);
+}
+
+/// `subscribe_tasked` is built on the stream subscription, so its async
+/// handler also starts with the replayed cached state.
+#[tokio::test]
+async fn tasked_subscribe_replays_cached_state() {
+    let harness = TestHarness::new().await;
+
+    dots::container::<Greeting>();
+    dots::publish(&dots!(Greeting { id: 3_u32, text: "seed" }));
+    harness.settle().await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    dots::subscribe_tasked(
+        std::sync::Arc::new(tx),
+        |tx, evt: dots_rs_transport::Event<Greeting>| async move {
+            let _ = tx.send(evt.updated().clone());
+        },
+    );
+    let value = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("replay within 2s")
+        .expect("channel open");
+    assert_eq!(value.text.as_deref(), Some("seed"));
+}
