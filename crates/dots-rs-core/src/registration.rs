@@ -22,7 +22,9 @@
 //! Note the coupling: the derive's ELF path hard-codes the section names
 //! `linkme_PUBLISHED_TYPES` / `linkme_SUBSCRIBED_TYPES` — linkme's ELF
 //! naming for the two slice idents below. Renaming a slice requires
-//! updating the derive.
+//! updating the derive. The `dots-inspect` CLI also reads these sections
+//! (and the `repr(C)` [`StructDescriptor`]s behind them) straight out of
+//! compiled binaries, so it must be kept in sync too.
 //!
 //! This mirrors C++ DOTS's `io::register_global_subscribe_type<T>` /
 //! `register_global_publish_type<T>` mechanism, where the registration

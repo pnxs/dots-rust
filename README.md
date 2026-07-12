@@ -46,6 +46,7 @@ building blocks and are pulled in transitively.
 | `dots-rs-build`     | Compile `.dots` files into Rust source from a `build.rs` (build-dependency)      |
 | `dots-build-test`   | Compile-test fixture for `dots-rs-build`                                         |
 | `dotsd`             | Broker daemon binary — listens on `tcp://` and/or `uds://` endpoints             |
+| `dots-inspect`      | CLI: statically list the DOTS types an ELF binary publishes/subscribes to       |
 | `dots-demo-client`  | Sample guest that publishes and subscribes to `Pinger`                           |
 | `dots-example`      | Minimal `#[derive(DotsStruct)]` demonstration                                    |
 

@@ -29,33 +29,40 @@ use crate::layout::{CborDecoder, CborEncoder, DecodeError, EncodeError};
 ///
 /// Equality compares structs by descriptor pointer identity, since
 /// descriptors are `'static` and unique per type.
+///
+/// `repr(C, u8)` with explicit discriminants because — like
+/// [`StructDescriptor`] — the layout is an external contract read by
+/// `dots-inspect` straight out of compiled binaries: discriminant byte
+/// at offset 0, variant payload (if any) at offset 8. The discriminant
+/// values are ABI; only append new variants, never renumber.
 #[derive(Debug, Clone, Copy)]
+#[repr(C, u8)]
 pub enum FieldKind {
-    Bool,
-    U8, U16, U32, U64,
-    I8, I16, I32, I64,
-    F32, F64,
-    PropertySet,
+    Bool = 0,
+    U8 = 1, U16 = 2, U32 = 3, U64 = 4,
+    I8 = 5, I16 = 6, I32 = 7, I64 = 8,
+    F32 = 9, F64 = 10,
+    PropertySet = 11,
 
     /// Wall-clock time (`f64` seconds since Unix epoch on the wire).
-    Timepoint,
+    Timepoint = 12,
 
     /// Fractional-second duration (`f64` seconds on the wire).
-    Duration,
-    
-    String,
+    Duration = 13,
+
+    String = 14,
     /// DOTS `uuid` — exactly 16 raw bytes (CBOR ByteString of length
     /// 16 on the wire). The *only* fixed-byte type in DOTS; arbitrary
     /// binary blobs should use `Vec(U8)` (DOTS `vector<uint8>`),
     /// matching dots-cpp.
-    Uuid,
+    Uuid = 15,
 
     /// Homogeneous array of `inner`.
-    Vec(&'static FieldKind),
+    Vec(&'static FieldKind) = 16,
     /// Nested DOTS struct, statically known at compile time.
-    Struct(&'static StructDescriptor),
+    Struct(&'static StructDescriptor) = 17,
     /// DOTS enum, statically known at compile time.
-    Enum(&'static EnumDescriptor),
+    Enum(&'static EnumDescriptor) = 18,
 
     /// Open `any` — an arbitrary DOTS object stored inside a single
     /// property as a self-describing, opaque CBOR envelope
@@ -65,7 +72,7 @@ pub enum FieldKind {
     /// representation is [`crate::AnyObject`]; recovering the stored
     /// object is an explicit, registry-resolved decode step
     /// (`crate::AnyObject` + the broker's `Registry::from_any`).
-    Any,
+    Any = 19,
 }
 
 impl PartialEq for FieldKind {
@@ -202,7 +209,11 @@ impl core::fmt::Debug for PropertyVtable {
 }
 
 /// Compile-time metadata about a single DOTS property (one struct field).
+///
+/// `repr(C)` for the same reason as [`StructDescriptor`]: `dots-inspect`
+/// reads these out of compiled binaries.
 #[derive(Debug)]
+#[repr(C)]
 pub struct PropertyDescriptor {
     /// Field name in the source struct.
     pub name: &'static str,
@@ -233,6 +244,19 @@ impl StructFlags {
     const SUBSTRUCT_ONLY: u8 = 1 << 5;
 
     pub const NONE: Self = Self(0);
+
+    /// Union of all defined flag bits. Bits outside this mask are
+    /// unknown to this version of dots-rs — `dots-inspect` uses that
+    /// as a layout-mismatch signal when reading descriptors out of
+    /// compiled binaries.
+    pub const ALL_KNOWN: Self = Self(
+        Self::CACHED
+            | Self::INTERNAL
+            | Self::PERSISTENT
+            | Self::CLEANUP
+            | Self::LOCAL
+            | Self::SUBSTRUCT_ONLY,
+    );
 
     #[inline]
     pub const fn from_bits(bits: u8) -> Self {
@@ -301,7 +325,16 @@ impl StructFlags {
 /// (e.g. `MyType::DESCRIPTOR`). The `(size, align)` pair lets dynamic
 /// `AnyStruct` instances allocate buffers whose layout matches the typed
 /// struct exactly — so `&AnyStruct.data` is bit-identical with `&Foo`.
+///
+/// `repr(C)` because the layout is an external contract: `dots-inspect`
+/// reads these statics out of compiled ELF binaries (following the
+/// pointers in the `linkme_PUBLISHED_TYPES` / `linkme_SUBSCRIBED_TYPES`
+/// sections) without running them, so field offsets must not shift with
+/// compiler versions. `dots-inspect` derives its offsets via
+/// `offset_of!` on this very type, so adding or reordering fields stays
+/// safe as long as both sides are built from the same source.
 #[derive(Debug)]
+#[repr(C)]
 pub struct StructDescriptor {
     pub name: &'static str,
     pub flags: StructFlags,
@@ -363,7 +396,11 @@ impl StructDescriptor {
 }
 
 /// Compile-time metadata about a single DOTS enum variant.
+///
+/// `repr(C)` for the same reason as [`StructDescriptor`]: `dots-inspect`
+/// reads these out of compiled binaries.
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct EnumElement {
     /// Variant name in the source enum.
     pub name: &'static str,
@@ -384,7 +421,11 @@ pub struct EnumElement {
 /// Held as a `&'static EnumDescriptor` constant on each generated enum
 /// (e.g. `MyEnum::DESCRIPTOR`). Enums are encoded on the wire as their
 /// `u32` `tag`; the descriptor maps wire tags back to variants.
+///
+/// `repr(C)` for the same reason as [`StructDescriptor`]: `dots-inspect`
+/// reads these out of compiled binaries.
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct EnumDescriptor {
     pub name: &'static str,
     pub elements: &'static [EnumElement],
