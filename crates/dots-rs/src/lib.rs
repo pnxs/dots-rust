@@ -61,11 +61,11 @@ pub use dots_rs_model::*;
 pub use dots_rs_transport::{
     AllTypesSubscription, App, AppError, Client, CloneInfo, ColorSchema, Connection,
     ConnectionBuilder, ConnectionError, ConnectionTransition, Container, ContainerEntry,
-    DEFAULT_ENDPOINT_URI, DOTS_ENDPOINT_ENV, Endpoint, EndpointError, EndpointHandle, Event,
-    GuestDriver, GuestError, GuestStats, GuestTransceiver, HOST_ID, HostTransceiver, Operation,
-    RawTransmissionCodec, StructDisplay, Subscription, SubscriptionHandle, TransmissionCodec,
-    TransportError, View, ViewError, ViewEvent, ViewOp, ViewSubscription, connect_over_stream,
-    new_uuid, now_timepoint, parse_endpoint,
+    DEFAULT_ENDPOINT_URI, DEFAULT_TCP_PORT, DOTS_ENDPOINT_ENV, Endpoint, EndpointError,
+    EndpointHandle, Event, GuestDriver, GuestError, GuestStats, GuestTransceiver, HOST_ID,
+    HostTransceiver, Operation, RawTransmissionCodec, StructDisplay, Subscription,
+    SubscriptionHandle, TransmissionCodec, TransportError, View, ViewError, ViewEvent, ViewOp,
+    ViewSubscription, connect_over_stream, new_uuid, now_timepoint, parse_endpoint,
 };
 
 /// The global, process-wide DOTS API (`publish` / `subscribe` /

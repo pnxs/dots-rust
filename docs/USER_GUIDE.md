@@ -378,7 +378,8 @@ let app = App::connect_tcp("127.0.0.1:11235", "my-client").await?;
 // Unix domain socket.
 let app = App::connect_unix("/tmp/dotsd.sock", "my-client").await?;
 
-// Parsed endpoint URI ("tcp://host:port" or "uds:///path").
+// Parsed endpoint URI ("tcp://host[:port]" or "uds:///path"; a missing
+// TCP port defaults to 11235).
 let app = App::connect(endpoint, "my-client").await?;
 ```
 
@@ -644,7 +645,9 @@ cargo run -p dotsd -- uds:///tmp/dotsd.sock
 cargo run -p dotsd -- tcp://0.0.0.0:11235 uds:///tmp/dotsd.sock
 ```
 
-`dotsd` accepts `tcp://addr:port` and `uds:///path` URIs. It maintains the
+`dotsd` accepts `tcp://addr[:port]` and `uds:///path` URIs; an omitted TCP
+port defaults to `11235`, so `tcp://0.0.0.0` binds `0.0.0.0:11235` (same rule
+as dots-cpp). It maintains the
 per-type caches, replays them to new subscribers, routes publications, and
 cleans up a disconnected client's `[cleanup]` instances. It also publishes
 its own observability types (`DotsClient`, `DotsClientStatistics`) that you

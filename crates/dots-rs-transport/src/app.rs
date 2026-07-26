@@ -136,7 +136,8 @@ impl App {
     /// Resolution order, matching dots-cpp's `Application(name)`:
     ///
     /// 1. `DOTS_ENDPOINT` environment variable (parsed as a URI such
-    ///    as `tcp://host:port` or `uds:///path/to/sock`).
+    ///    as `tcp://host[:port]` or `uds:///path/to/sock`). A `tcp://`
+    ///    URI without a port gets [`crate::DEFAULT_TCP_PORT`].
     /// 2. Fallback: [`crate::DEFAULT_ENDPOINT_URI`]
     ///    (`tcp://127.0.0.1:11235`).
     ///

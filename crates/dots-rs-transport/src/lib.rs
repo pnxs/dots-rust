@@ -44,7 +44,8 @@ pub use container::{
     DynContainerEntry, Operation,
 };
 pub use endpoint::{
-    DEFAULT_ENDPOINT_URI, DOTS_ENDPOINT_ENV, Endpoint, EndpointError, parse_endpoint,
+    DEFAULT_ENDPOINT_URI, DEFAULT_TCP_PORT, DOTS_ENDPOINT_ENV, Endpoint, EndpointError,
+    parse_endpoint,
 };
 pub use dots_rs_core::PropertySet;
 pub use error::TransportError;
