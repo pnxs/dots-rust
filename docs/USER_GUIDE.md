@@ -386,8 +386,11 @@ let app = App::connect(endpoint, "my-client").await?;
 The second argument is the **client name** — how this guest is identified to
 the broker and other clients (it shows up in `DotsClient` records).
 
-`DOTS_ENDPOINT` accepts the same URI forms as `dotsd`: `tcp://addr:port` or
-`uds:///path`. A malformed value makes `App::new` return `AppError::Endpoint`.
+`DOTS_ENDPOINT` accepts the same URI forms as `dotsd`: `tcp://addr[:port]`
+(port defaults to `11235`) or `uds:///path`. A malformed value makes
+`App::new` return `AppError::Endpoint`. Unlike dots-cpp, credentials in the
+URI (`tcp://user:password@host`) are rejected — pass them to
+`connect_with_auth` instead.
 
 **Authentication.** Each constructor has a `_with_auth` variant that takes a
 shared secret for SHA-256 challenge–response:

@@ -41,12 +41,21 @@ pub const DEFAULT_TCP_PORT: u16 = 11235;
 
 /// Environment variable consulted by [`Endpoint::from_env_or_default`].
 /// Same name as dots-cpp, so a value set in a mixed-language deployment
-/// is honoured by both clients.
+/// is honoured by both clients — with one divergence: dots-cpp reads
+/// broker credentials from a `user:password@host` authority, whereas
+/// dots-rust takes them via [`crate::App::connect_with_auth`] and
+/// rejects such a URI ([`EndpointError::UserInfoUnsupported`]). A
+/// shared value must therefore be credential-free.
 pub const DOTS_ENDPOINT_ENV: &str = "DOTS_ENDPOINT";
 
 impl Endpoint {
     /// `tcp://addr:port` form. Borrowed so callers can pass `&str`
     /// without allocating.
+    ///
+    /// `addr` is used verbatim, so the port is **not** optional here —
+    /// this constructor takes a resolvable `addr:port`, not a URI.
+    /// Use [`parse_endpoint`] for the URI syntax and its
+    /// [`DEFAULT_TCP_PORT`] inference.
     pub fn tcp(addr: impl Into<String>) -> Self {
         Self::Tcp(addr.into())
     }
@@ -75,7 +84,15 @@ impl Endpoint {
 }
 
 /// Errors produced by [`parse_endpoint`].
+///
+/// Every variant carries the offending URI so the message can name it.
+/// Any `user[:password]@` userinfo is redacted to `***@` first — these
+/// errors get logged (`dotsd` and the examples print the `Debug` form
+/// straight out of `main`), and a dots-cpp-style
+/// `tcp://user:password@host` would otherwise put the password in the
+/// log.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EndpointError {
     /// The string didn't start with a recognised scheme.
     UnknownScheme { input: String },
@@ -107,7 +124,7 @@ impl core::fmt::Display for EndpointError {
             ),
             Self::InvalidPort { input, port } => write!(
                 f,
-                "endpoint URI {input:?} has a non-numeric port {port:?}; expected 0..=65535"
+                "endpoint URI {input:?} has an invalid port {port:?}; expected 0..=65535"
             ),
             Self::MalformedAuthority { input } => write!(
                 f,
@@ -136,7 +153,26 @@ pub fn parse_endpoint(s: &str) -> Result<Endpoint, EndpointError> {
         // slash is intentional. We pass it through verbatim.
         return Ok(Endpoint::Uds(PathBuf::from(rest)));
     }
-    Err(EndpointError::UnknownScheme { input: s.into() })
+    Err(EndpointError::UnknownScheme {
+        input: redact_userinfo(s),
+    })
+}
+
+/// Copy of `input` with any `user[:password]@` userinfo in the
+/// authority replaced by `***@`.
+///
+/// dots-cpp carries broker credentials there, so a `DOTS_ENDPOINT`
+/// value can hold a password. Since [`EndpointError`] messages end up
+/// in logs, the raw URI must never reach one.
+fn redact_userinfo(input: &str) -> String {
+    let Some((scheme, rest)) = input.split_once("://") else {
+        return input.to_string();
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => format!("{scheme}://***@{host}{path}"),
+        None => input.to_string(),
+    }
 }
 
 /// Normalize the part after `tcp://` into the `host:port` form that
@@ -153,7 +189,7 @@ fn tcp_authority(rest: &str, input: &str) -> Result<String, EndpointError> {
 
     if authority.contains('@') {
         return Err(EndpointError::UserInfoUnsupported {
-            input: input.into(),
+            input: redact_userinfo(input),
         });
     }
 
@@ -163,7 +199,7 @@ fn tcp_authority(rest: &str, input: &str) -> Result<String, EndpointError> {
         let close = authority
             .find(']')
             .ok_or_else(|| EndpointError::MalformedAuthority {
-                input: input.into(),
+                input: redact_userinfo(input),
             })?;
         let (host, tail) = authority.split_at(close + 1);
         let port = match tail {
@@ -171,7 +207,7 @@ fn tcp_authority(rest: &str, input: &str) -> Result<String, EndpointError> {
             _ => Some(
                 tail.strip_prefix(':')
                     .ok_or_else(|| EndpointError::MalformedAuthority {
-                        input: input.into(),
+                        input: redact_userinfo(input),
                     })?,
             ),
         };
@@ -184,7 +220,7 @@ fn tcp_authority(rest: &str, input: &str) -> Result<String, EndpointError> {
 
     if host.is_empty() || host == "[]" {
         return Err(EndpointError::MissingHost {
-            input: input.into(),
+            input: redact_userinfo(input),
         });
     }
 
@@ -194,7 +230,7 @@ fn tcp_authority(rest: &str, input: &str) -> Result<String, EndpointError> {
         Some(port) => {
             port.parse::<u16>()
                 .map_err(|_| EndpointError::InvalidPort {
-                    input: input.into(),
+                    input: redact_userinfo(input),
                     port: port.into(),
                 })?;
             Ok(format!("{host}:{port}"))
@@ -348,9 +384,50 @@ mod tests {
 
     /// The hard-coded default URI must itself be parseable; otherwise
     /// `Endpoint::from_env_or_default` would error in the
-    /// no-env-var branch.
+    /// no-env-var branch. It also spells out the port that
+    /// [`DEFAULT_TCP_PORT`] would supply — this pins the two together
+    /// so editing one without the other fails here rather than
+    /// silently advertising a port we don't dial.
     #[test]
-    fn default_uri_parses() {
-        assert!(parse_endpoint(DEFAULT_ENDPOINT_URI).is_ok());
+    fn default_uri_parses_and_matches_default_port() {
+        let ep = parse_endpoint(DEFAULT_ENDPOINT_URI).unwrap();
+        assert_eq!(ep, Endpoint::Tcp(format!("127.0.0.1:{DEFAULT_TCP_PORT}")));
+    }
+
+    /// A password in the authority must not survive into the error, as
+    /// those get logged. dots-cpp accepts credentials there, so a
+    /// shared `DOTS_ENDPOINT` really can carry one.
+    #[test]
+    fn userinfo_is_redacted_from_errors() {
+        let err = parse_endpoint("tcp://svc:s3cr3t@broker.internal").unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains("s3cr3t"), "leaked password: {rendered}");
+        assert!(rendered.contains("***@broker.internal"), "{rendered}");
+    }
+
+    /// Redaction also covers the other variants, which stash the same
+    /// URI — an unknown scheme is the reachable one.
+    #[test]
+    fn userinfo_is_redacted_for_unknown_scheme() {
+        let err = parse_endpoint("ws://svc:s3cr3t@broker.internal:8080").unwrap_err();
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains("s3cr3t"), "leaked password: {rendered}");
+        assert!(rendered.contains("***@broker.internal:8080"), "{rendered}");
+    }
+
+    /// Redaction is a no-op for the overwhelmingly common
+    /// credential-free URI, including one with a path.
+    #[test]
+    fn redaction_leaves_credential_free_uris_alone() {
+        for uri in [
+            "tcp://1.2.3.4:11235",
+            "uds:///tmp/dotsd.sock",
+            "127.0.0.1:11235",
+            // An `@` in the path is not userinfo and must be left alone.
+            "uds:///tmp/a@b.sock",
+        ] {
+            assert_eq!(redact_userinfo(uri), uri);
+        }
+        assert_eq!(redact_userinfo("tcp://svc@h/p"), "tcp://***@h/p");
     }
 }
