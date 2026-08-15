@@ -1765,11 +1765,18 @@ async fn subscribe_new_struct_type_fires_for_wire_descriptor_arrivals() {
     let _handle = gt.subscribe_new_struct_type(move |desc: &Arc<DynamicStructDescriptor>| {
         captured_clone.lock().unwrap().push(desc.name.clone());
     });
-    // Catch-up sees the DOTS-internal types but not Pinger — the
-    // guest hasn't learned about Pinger yet.
+    // Catch-up covers every compiled-in type — `from_connection`
+    // seeds the registry from the link-time slices (dots-cpp
+    // `StaticTypePolicy::All`), so Pinger is known before any wire
+    // traffic. A genuinely *new* type therefore has to be one this
+    // binary doesn't compile in: the hand-built descriptor below.
     assert!(
-        !captured.lock().unwrap().iter().any(|n| n == "Pinger"),
-        "Pinger should not be in catch-up — guest hasn't seen it yet"
+        captured.lock().unwrap().iter().any(|n| n == "Pinger"),
+        "compiled-in Pinger should be in catch-up"
+    );
+    assert!(
+        !captured.lock().unwrap().iter().any(|n| n == "WirePinger"),
+        "WirePinger must be unknown before its descriptor arrives"
     );
 
     // Wait for the guest's DotsMember(Join, "StructDescriptorData")
@@ -1783,25 +1790,36 @@ async fn subscribe_new_struct_type_fires_for_wire_descriptor_arrivals() {
     }
     assert!(host.group_size("StructDescriptorData") >= 1);
 
-    // Host publishes Pinger's descriptor data — the broker will
-    // route it to every guest subscribed to StructDescriptorData
-    // (which our subscribe_new_struct_type just installed).
-    host.publish(&StructDescriptorData::from_static(Pinger::DESCRIPTOR));
+    // Host publishes descriptor data for a type this guest binary
+    // does NOT compile in — the broker routes it to every guest
+    // subscribed to StructDescriptorData (which our
+    // subscribe_new_struct_type just installed).
+    host.publish(&StructDescriptorData {
+        name: Some("WirePinger".into()),
+        properties: Some(vec![dots_rs_model::StructPropertyData {
+            name: Some("id".into()),
+            tag: Some(1),
+            is_key: Some(true),
+            type_name: Some("uint32".into()),
+            type_id: None,
+        }]),
+        ..Default::default()
+    });
 
     let mut names: Vec<String> = Vec::new();
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(20)).await;
         names = captured.lock().unwrap().clone();
-        if names.iter().any(|n| n == "Pinger") {
+        if names.iter().any(|n| n == "WirePinger") {
             break;
         }
     }
     assert!(
-        names.iter().any(|n| n == "Pinger"),
-        "wire arrival should fire handler for Pinger; got {names:?}"
+        names.iter().any(|n| n == "WirePinger"),
+        "wire arrival should fire handler for WirePinger; got {names:?}"
     );
-    // Registry should now know Pinger.
-    assert!(registry.lookup("Pinger").is_some());
+    // Registry should now know WirePinger.
+    assert!(registry.lookup("WirePinger").is_some());
 
     gt.exit();
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;

@@ -231,6 +231,63 @@ fn registering_static_then_looking_up_works() {
     }
 }
 
+/// Re-registering the same `&'static StructDescriptor` must keep the
+/// existing dynamic projection: `DynamicStruct` operations compare
+/// descriptors by `Arc` identity, so a fresh Arc per registration
+/// would make values decoded before the re-registration incomparable
+/// with values decoded after (observed as a `copy_from`/`equal` panic
+/// when `container::<T>()` re-registers on every call).
+#[test]
+fn re_registering_same_static_descriptor_is_idempotent() {
+    let reg = Registry::new();
+    reg.register_struct_static(Address::DESCRIPTOR);
+    let first = match reg.lookup("Address").unwrap() {
+        dots_rs_model::DescriptorEntry::Struct(d) => d,
+        _ => panic!("wrong entry kind"),
+    };
+
+    reg.register_struct_static(Address::DESCRIPTOR);
+    let second = match reg.lookup("Address").unwrap() {
+        dots_rs_model::DescriptorEntry::Struct(d) => d,
+        _ => panic!("wrong entry kind"),
+    };
+
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "repeated static registration must not mint a new descriptor Arc"
+    );
+}
+
+/// A wire-learned dynamic entry is still replaced when the static
+/// descriptor for the same name shows up (promotion to static), and
+/// the promoted entry then stays stable.
+#[test]
+fn static_registration_promotes_over_dynamic_entry() {
+    let reg = Registry::new();
+    let data = StructDescriptorData::from_static(Address::DESCRIPTOR);
+    let wire = Arc::new(reg.build_dynamic_struct(&data).unwrap());
+    reg.register_struct_dynamic(wire.clone());
+    assert!(reg.lookup_static_struct("Address").is_none());
+
+    reg.register_struct_static(Address::DESCRIPTOR);
+    assert!(reg.lookup_static_struct("Address").is_some());
+    let promoted = match reg.lookup("Address").unwrap() {
+        dots_rs_model::DescriptorEntry::Struct(d) => d,
+        _ => panic!("wrong entry kind"),
+    };
+    assert!(
+        !Arc::ptr_eq(&promoted, &wire),
+        "static registration must replace the wire-learned entry"
+    );
+
+    reg.register_struct_static(Address::DESCRIPTOR);
+    let after = match reg.lookup("Address").unwrap() {
+        dots_rs_model::DescriptorEntry::Struct(d) => d,
+        _ => panic!("wrong entry kind"),
+    };
+    assert!(Arc::ptr_eq(&promoted, &after));
+}
+
 #[test]
 fn enum_descriptor_data_reverse_conversion() {
     let reg = Registry::new();

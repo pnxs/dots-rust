@@ -25,7 +25,7 @@ use std::sync::{Arc, RwLock};
 
 use dots_rs_core::{
     AnyObject, AnyStruct, DynamicEnumDescriptor, DynamicEnumElement, DynamicFieldKind,
-    DynamicPropertyDescriptor, DynamicStruct, DynamicStructDescriptor, EnumDescriptor,
+    DynamicPropertyDescriptor, DynamicStruct, DynamicStructDescriptor, EnumDescriptor, FieldKind,
     StructDescriptor, StructFlags,
 };
 
@@ -134,8 +134,29 @@ impl Registry {
     /// descriptor is projected into its dynamic form once and stored
     /// behind an `Arc` — subsequent lookups are cheap.
     ///
-    /// Existing entries with the same name are silently overwritten.
-    pub fn register_struct_static(&self, d: &'static StructDescriptor) {
+    /// Idempotent when `d` is already the registered static descriptor
+    /// for its name: `DynamicStruct` operations compare descriptors by
+    /// `Arc` identity, so the existing dynamic projection (and every
+    /// value decoded against it) must remain the canonical one across
+    /// repeated registrations (`subscribe::<T>`, `container::<T>`, …).
+    ///
+    /// Entries for the same name registered from a *different*
+    /// descriptor — a wire-learned dynamic entry being promoted to
+    /// static, or a conflicting static definition — are silently
+    /// overwritten.
+    ///
+    /// Returns `true` if the descriptor was (re-)inserted, `false` if
+    /// `d` was already the registered static descriptor for its name.
+    /// Since registration always walks a descriptor's full property
+    /// tree, `false` also implies every type reachable from `d` is
+    /// registered — callers use this to prune recursive walks.
+    pub fn register_struct_static(&self, d: &'static StructDescriptor) -> bool {
+        if self
+            .lookup_static_struct(d.name)
+            .is_some_and(|prev| core::ptr::eq(prev, d))
+        {
+            return false;
+        }
         let arc = Arc::new(DynamicStructDescriptor::from_static(d));
         self.entries
             .write()
@@ -145,6 +166,7 @@ impl Registry {
             .write()
             .expect("registry poisoned")
             .insert(d.name.into(), d);
+        true
     }
 
     /// Look up the static descriptor for a registered type, if one
@@ -166,6 +188,70 @@ impl Registry {
             .write()
             .expect("registry poisoned")
             .insert(d.name.into(), DescriptorEntry::Enum(arc));
+    }
+
+    /// Register `d` and every struct/enum descriptor reachable through
+    /// its property tree.
+    ///
+    /// The registry itself is the visited set: [`register_struct_static`]
+    /// returns `false` when this exact descriptor is already registered,
+    /// which — because this walk always covers the full tree — means its
+    /// subtree is registered too, so recursion stops there. Repeated
+    /// calls cost one root lookup.
+    ///
+    /// [`register_struct_static`]: Self::register_struct_static
+    pub fn register_struct_static_recursive(&self, d: &'static StructDescriptor) {
+        // Register-before-recurse is what terminates cycles in recursive
+        // types (`Node { children: Vec<Node> }`): by the time the walk
+        // loops back to `d`, it is already registered.
+        if !self.register_struct_static(d) {
+            return;
+        }
+        for prop in d.properties {
+            self.register_field_kind_static(&prop.kind);
+        }
+    }
+
+    fn register_field_kind_static(&self, kind: &FieldKind) {
+        match kind {
+            FieldKind::Struct(d) => self.register_struct_static_recursive(d),
+            FieldKind::Enum(e) => self.register_enum_static(e),
+            FieldKind::Vec(inner) => self.register_field_kind_static(inner),
+            _ => {}
+        }
+    }
+
+    /// Register every compile-time type the binary declared publish or
+    /// subscribe intent for — the link-time [`PUBLISHED_TYPES`] /
+    /// [`SUBSCRIBED_TYPES`] slices — plus their transitive struct/enum
+    /// closures.
+    ///
+    /// Mirrors dots-cpp `type::Registry` with
+    /// `StaticTypePolicy::All` (the default for both `GuestTransceiver`
+    /// and `HostTransceiver` there), where the registry constructor
+    /// copies the process-global static descriptor map so every
+    /// compiled-in type is decodable before any traffic flows. With
+    /// this called at connection setup, the per-call codec
+    /// registration in `container::<T>` / `publish` / `view::<T>`
+    /// becomes unnecessary: any `T` those APIs are invoked on has its
+    /// slice entry anchored by that same call site.
+    ///
+    /// Over-approximation caveat: without LTO the slices retain every
+    /// derived type linked into the binary, not just the ones actually
+    /// used. That is harmless here — extra registry entries only widen
+    /// what the codec can decode — and the broker-facing descriptor
+    /// announcements stay governed by the explicit publish/subscribe
+    /// lists, unaffected by this call.
+    ///
+    /// [`PUBLISHED_TYPES`]: dots_rs_core::PUBLISHED_TYPES
+    /// [`SUBSCRIBED_TYPES`]: dots_rs_core::SUBSCRIBED_TYPES
+    pub fn register_global_types(&self) {
+        for d in dots_rs_core::PUBLISHED_TYPES
+            .iter()
+            .chain(dots_rs_core::SUBSCRIBED_TYPES.iter())
+        {
+            self.register_struct_static_recursive(d);
+        }
     }
 
     /// Register a runtime-received struct descriptor.

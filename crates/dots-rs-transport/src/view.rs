@@ -236,8 +236,9 @@ where
             return Err(ViewError::Unsupported);
         }
 
+        // Runtime no-op: anchors T's SUBSCRIBED_TYPES slice entry so
+        // `register_global_types` (run in `from_connection`) covered T.
         T::register_as_subscribed();
-        transceiver.ensure_struct_descriptor::<T>();
 
         let type_name = T::type_descriptor().name.to_string();
         let subscription_id = transceiver.allocate_subscription_id();
