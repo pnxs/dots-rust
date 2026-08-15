@@ -14,6 +14,7 @@
 //! ```text
 //! dotsd                                              # default tcp://0.0.0.0:11235
 //! dotsd tcp://127.0.0.1:11236                        # custom TCP address
+//! dotsd tcp://0.0.0.0                                # port omitted -> 11235
 //! dotsd uds:///tmp/dotsd.sock                        # UDS only
 //! dotsd tcp://0.0.0.0:11235 uds:///tmp/dotsd.sock    # both at once
 //! dotsd --name my-host tcp://0.0.0.0:11235           # custom daemon name
@@ -307,9 +308,10 @@ fn print_help() {
            -h, --help                   Show this help\n\
          \n\
          ENDPOINTS:\n    \
-           tcp://<addr>:<port>    Listen on TCP\n    \
+           tcp://<addr>[:<port>]  Listen on TCP (port defaults to {tcp_port})\n    \
            uds:///<path>          Listen on Unix domain socket\n    \
            (default: {DEFAULT_ENDPOINT})\n",
+        tcp_port = dots_rs_transport::DEFAULT_TCP_PORT,
         stats_secs = DEFAULT_STATS_INTERVAL.as_secs(),
         cleanup_secs = DEFAULT_CLEANUP_INTERVAL.as_secs(),
     );
