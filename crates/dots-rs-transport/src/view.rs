@@ -236,8 +236,8 @@ where
             return Err(ViewError::Unsupported);
         }
 
-        // Runtime no-op: anchors T's SUBSCRIBED_TYPES slice entry so
-        // `register_global_types` (run in `from_connection`) covered T.
+        // Runtime no-op: anchors T's SUBSCRIBED_TYPES slice entry so a
+        // registry built with `StaticTypePolicy::All` covered T.
         T::register_as_subscribed();
 
         let type_name = T::type_descriptor().name.to_string();

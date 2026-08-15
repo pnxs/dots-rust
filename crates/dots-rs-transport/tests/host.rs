@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dots_rs_core::dots;
-use dots_rs_model::{DotsClientStatistics, DotsStatistics, Registry, registry_with_internal_types};
+use dots_rs_model::{DotsClientStatistics, DotsStatistics, Registry, StaticTypePolicy};
 #[allow(unused_imports)]
 use dots_rs_model::*;
 use dots_rs_transport::{Connection, ConnectionBuilder, GuestTransceiver, HostTransceiver};
@@ -41,7 +41,7 @@ mod model {
 use model::*;
 
 fn registry() -> Arc<Registry> {
-    Arc::new(registry_with_internal_types())
+    Arc::new(Registry::with_static_types(StaticTypePolicy::All))
 }
 
 #[tokio::test]
@@ -1141,7 +1141,7 @@ async fn host_serve_unix_routes_pinger_round_trip() {
 
     // Client side: connect via UDS, run handshake, subscribe to Pinger.
     let stream = UnixStream::connect(&sock_path).await.expect("uds connect");
-    let registry = Arc::new(registry_with_internal_types());
+    let registry = Arc::new(Registry::with_static_types(StaticTypePolicy::All));
     registry.register_struct_static(Pinger::DESCRIPTOR);
     let conn = ConnectionBuilder::new(stream, "uds-client", registry.clone())
         .preload(false)
@@ -1564,7 +1564,7 @@ async fn dynamic_subscribe_receives_event_with_runtime_descriptor() {
     // Guest connects without compiling-in `Pinger` (we register
     // a DynamicStructDescriptor built from the static one to simulate
     // a guest that learned the type at runtime).
-    let guest_registry = Arc::new(registry_with_internal_types());
+    let guest_registry = Arc::new(Registry::with_static_types(StaticTypePolicy::All));
     let conn = ConnectionBuilder::new(guest_io, "dyn-guest", guest_registry.clone())
         .preload(false)
         .connect()
@@ -1658,7 +1658,7 @@ async fn dynamic_publish_routes_through_broker_to_typed_subscriber() {
     assert_eq!(host.group_size("Pinger"), 1);
 
     // Publisher: dynamic — knows Pinger only as a runtime descriptor.
-    let pub_registry = Arc::new(registry_with_internal_types());
+    let pub_registry = Arc::new(Registry::with_static_types(StaticTypePolicy::All));
     let (host_io_pub, guest_io_pub) = tokio::io::duplex(8192);
     host.accept(host_io_pub);
     let conn_pub = ConnectionBuilder::new(guest_io_pub, "dyn-pub", pub_registry.clone())
@@ -1765,9 +1765,8 @@ async fn subscribe_new_struct_type_fires_for_wire_descriptor_arrivals() {
     let _handle = gt.subscribe_new_struct_type(move |desc: &Arc<DynamicStructDescriptor>| {
         captured_clone.lock().unwrap().push(desc.name.clone());
     });
-    // Catch-up covers every compiled-in type — `from_connection`
-    // seeds the registry from the link-time slices (dots-cpp
-    // `StaticTypePolicy::All`), so Pinger is known before any wire
+    // The registry is built with `StaticTypePolicy::All`, so catch-up
+    // covers every compiled-in type — Pinger is known before any wire
     // traffic. A genuinely *new* type therefore has to be one this
     // binary doesn't compile in: the hand-built descriptor below.
     assert!(

@@ -160,6 +160,15 @@ impl GuestTransceiver {
     /// `preloadPublishTypes` / `preloadSubscribeTypes` arguments of
     /// dots-cpp's `GuestTransceiver::open`.
     ///
+    /// `registry` should normally be built with
+    /// [`StaticTypePolicy::All`](dots_rs_model::StaticTypePolicy):
+    /// `container::<T>` / `publish` / `view::<T>` perform no codec
+    /// registration of their own — they rely on every compiled-in
+    /// type having been seeded at registry construction. With a
+    /// leaner policy, only the types passed in the two lists here
+    /// (registered during EarlySubscribe) and types learned from wire
+    /// descriptors are decodable.
+    ///
     /// The driver must be polled (typically via
     /// [`GuestDriver::run`]) to actually exchange traffic with the
     /// broker — until then, publishes will queue and incoming
@@ -175,15 +184,6 @@ impl GuestTransceiver {
         P: IntoIterator<Item = &'static StructDescriptor>,
         U: IntoIterator<Item = &'static StructDescriptor>,
     {
-        // dots-cpp parity (`Registry{ StaticTypePolicy::All }`, the
-        // GuestTransceiver default): seed the codec registry with every
-        // compiled-in type the binary declared publish/subscribe intent
-        // for, so all of them are decodable before any traffic flows.
-        // This replaces per-call codec registration in `container::<T>`
-        // / `publish` / `view::<T>` — those APIs anchor their type's
-        // slice entry, so it is guaranteed to be covered here.
-        registry.register_global_types();
-
         let dispatch = conn.dispatch_handle();
         let client_id = conn.client_id();
         let peer_capabilities = conn.peer_capabilities().cloned();
@@ -478,20 +478,14 @@ impl GuestTransceiver {
     /// whose `StructDescriptorData` arrives on the wire, as the
     /// [`DynamicStructDescriptor`] the codec registry holds for it.
     /// (Registration itself happens unconditionally in the receive
-    /// path — the mirror of dots-cpp `Channel::importDependencies` —
-    /// before the transmission is dispatched here, so the handler
+    /// path before the transmission is dispatched here, so the handler
     /// always sees the same `Arc` the codec decodes against.)
     ///
     /// A re-arriving descriptor for a known name — e.g. the broker
     /// echoing back a compiled-in type this guest announced — does
-    /// **not** re-fire the handler, matching dots-cpp, where the
-    /// `Registry`'s `newTypeHandler` runs only on genuine insertion.
-    /// Without this, [`subscribe_all_types`](Self::subscribe_all_types)
-    /// would install duplicate per-type subscriptions and deliver
-    /// every event twice.
+    /// **not** re-fire the handler.
     ///
-    /// Mirrors dots-cpp's `subscribe<StructDescriptor>` /
-    /// `DynamicTypeReceiver` pattern. Combine with
+    /// Combine with
     /// [`subscribe_dynamic`](Self::subscribe_dynamic) and
     /// [`publish`](Self::publish) (with
     /// [`DynamicStruct::try_as_publishable`](dots_rs_core::DynamicStruct::try_as_publishable))
@@ -598,8 +592,8 @@ impl GuestTransceiver {
         T: StructValue + Send + Sync + 'static + dots_rs_core::GlobalRegistration,
     {
         // Runtime no-op: anchors T's SUBSCRIBED_TYPES slice entry
-        // against dead-code elimination, so `register_global_types`
-        // (run in `from_connection`) is guaranteed to have covered T.
+        // against dead-code elimination, so a registry built with
+        // `StaticTypePolicy::All` is guaranteed to have covered T.
         T::register_as_subscribed();
         let descriptor = T::type_descriptor();
         let dyn_container = self.get_or_create_dyn_container(descriptor);
@@ -707,9 +701,9 @@ impl GuestTransceiver {
     ///
     pub fn publish<P: Publishable>(&self, value: &P) {
         // Anchors P's PUBLISHED_TYPES slice entry (runtime no-op); the
-        // codec registration itself happened in `from_connection` via
-        // `register_global_types`. For runtime-described values this is
-        // the default no-op impl and the caller is responsible for
+        // codec registration itself happens at registry construction
+        // (`StaticTypePolicy::All`). For runtime-described values this
+        // is the default no-op impl and the caller is responsible for
         // having the type registered.
         P::register_as_published();
         let header = dots!(DotsHeader {

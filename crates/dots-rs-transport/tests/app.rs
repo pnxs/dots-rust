@@ -29,7 +29,7 @@ use dots_rs_model::*;
 use dots_rs_model::{
     DotsHeader, DotsMember, DotsMemberEvent, DotsMsgConnect, DotsMsgConnectResponse,
     DotsMsgHello, Registry, StructDescriptorData, Transmission, encode_transmission,
-    registry_with_internal_types,
+    StaticTypePolicy,
 };
 use dots_rs_transport::{App, TransmissionCodec};
 use futures_util::{SinkExt, StreamExt};
@@ -66,7 +66,7 @@ mod model {
 use model::*;
 
 fn registry() -> Arc<Registry> {
-    let reg = registry_with_internal_types();
+    let reg = Registry::with_static_types(StaticTypePolicy::InternalOnly);
     reg.register_struct_static(Pinger::DESCRIPTOR);
     Arc::new(reg)
 }

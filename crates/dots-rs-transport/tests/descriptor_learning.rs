@@ -21,7 +21,7 @@ use dots_rs_core::{Transmittable, dots};
 use dots_rs_model::*;
 use dots_rs_model::{
     DotsHeader, DotsMsgConnectResponse, DotsMsgHello, EnumDescriptorData, Registry,
-    StructDescriptorData, encode_transmission, registry_with_internal_types,
+    StructDescriptorData, encode_transmission, StaticTypePolicy,
 };
 use dots_rs_transport::{Connection, GuestDriver, GuestTransceiver, TransmissionCodec};
 use futures_util::{StreamExt};
@@ -96,7 +96,7 @@ async fn connect_guest() -> (
 ) {
     let (client_io, server_io) = tokio::io::duplex(65536);
     // Internal types only — TraceMood / TracePerson stay unknown.
-    let reg = Arc::new(registry_with_internal_types());
+    let reg = Arc::new(Registry::with_static_types(StaticTypePolicy::All));
 
     let server_reg = reg.clone();
     let server = tokio::spawn(async move {

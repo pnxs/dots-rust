@@ -109,6 +109,29 @@ impl core::fmt::Display for FromAnyError {
 
 impl std::error::Error for FromAnyError {}
 
+/// Which compile-time types a [`Registry`] starts with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StaticTypePolicy {
+    /// Fundamental types only. Fundamentals are resolved natively by
+    /// the codec and never live in the registry, so this yields an
+    /// empty registry — same as [`Registry::new`].
+    FundamentalOnly,
+    /// The DOTS-internal types (handshake messages, [`DotsHeader`],
+    /// descriptor-data types, daemon records, …) but no user types.
+    /// For processes that learn every user type from the wire —
+    /// brokers and inspection tools.
+    ///
+    /// [`DotsHeader`]: crate::DotsHeader
+    InternalOnly,
+    /// Internal types plus every compiled-in user type this binary
+    /// declared publish/subscribe intent for — the link-time
+    /// `PUBLISHED_TYPES` / `SUBSCRIBED_TYPES` slices with their
+    /// transitive struct/enum closures. The default, and the right
+    /// choice for clients that publish or subscribe typed values.
+    #[default]
+    All,
+}
+
 /// A name-keyed registry of [`DescriptorEntry`]s.
 ///
 /// Uses interior `RwLock` mutability so registrations can happen via
@@ -126,8 +149,26 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// An empty registry. Prefer [`with_static_types`](Self::with_static_types)
+    /// for anything that talks to a broker — an empty registry cannot
+    /// even decode the handshake.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry pre-populated according to `policy`. See
+    /// [`StaticTypePolicy`] for what each level seeds.
+    pub fn with_static_types(policy: StaticTypePolicy) -> Self {
+        let reg = Self::new();
+        match policy {
+            StaticTypePolicy::FundamentalOnly => {}
+            StaticTypePolicy::InternalOnly => crate::register_dots_internal_types(&reg),
+            StaticTypePolicy::All => {
+                crate::register_dots_internal_types(&reg);
+                reg.register_global_types();
+            }
+        }
+        reg
     }
 
     /// Register a compile-time struct descriptor by name. The static
@@ -138,7 +179,7 @@ impl Registry {
     /// for its name: `DynamicStruct` operations compare descriptors by
     /// `Arc` identity, so the existing dynamic projection (and every
     /// value decoded against it) must remain the canonical one across
-    /// repeated registrations (`subscribe::<T>`, `container::<T>`, …).
+    /// repeated registrations.
     ///
     /// Entries for the same name registered from a *different*
     /// descriptor — a wire-learned dynamic entry being promoted to
@@ -224,24 +265,16 @@ impl Registry {
     /// Register every compile-time type the binary declared publish or
     /// subscribe intent for — the link-time [`PUBLISHED_TYPES`] /
     /// [`SUBSCRIBED_TYPES`] slices — plus their transitive struct/enum
-    /// closures.
+    /// closures. The seeding step behind [`StaticTypePolicy::All`];
+    /// normally invoked via
+    /// [`with_static_types`](Self::with_static_types).
     ///
-    /// Mirrors dots-cpp `type::Registry` with
-    /// `StaticTypePolicy::All` (the default for both `GuestTransceiver`
-    /// and `HostTransceiver` there), where the registry constructor
-    /// copies the process-global static descriptor map so every
-    /// compiled-in type is decodable before any traffic flows. With
-    /// this called at connection setup, the per-call codec
-    /// registration in `container::<T>` / `publish` / `view::<T>`
-    /// becomes unnecessary: any `T` those APIs are invoked on has its
-    /// slice entry anchored by that same call site.
-    ///
-    /// Over-approximation caveat: without LTO the slices retain every
-    /// derived type linked into the binary, not just the ones actually
-    /// used. That is harmless here — extra registry entries only widen
-    /// what the codec can decode — and the broker-facing descriptor
-    /// announcements stay governed by the explicit publish/subscribe
-    /// lists, unaffected by this call.
+    /// Without LTO the slices retain every derived type linked into
+    /// the binary, not just the ones actually used. That is harmless
+    /// here — extra registry entries only widen what the codec can
+    /// decode; broker-facing descriptor announcements are governed by
+    /// a transceiver's explicit publish/subscribe lists, unaffected by
+    /// this call.
     ///
     /// [`PUBLISHED_TYPES`]: dots_rs_core::PUBLISHED_TYPES
     /// [`SUBSCRIBED_TYPES`]: dots_rs_core::SUBSCRIBED_TYPES

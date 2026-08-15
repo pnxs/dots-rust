@@ -498,7 +498,9 @@ async fn build_parts<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let registry = Arc::new(dots_rs_model::registry_with_internal_types());
+    let registry = Arc::new(dots_rs_model::Registry::with_static_types(
+        dots_rs_model::StaticTypePolicy::All,
+    ));
     let mut builder =
         ConnectionBuilder::new(stream, client_name, registry.clone()).preload(preload);
     if let Some(s) = secret {

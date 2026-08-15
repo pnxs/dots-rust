@@ -22,7 +22,7 @@ use dots_rs_core::{StructValue, decode_typed_from_slice, dots, encode_to_vec};
 use dots_rs_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
     Registry, StructDescriptorData, Transmission, encode_transmission,
-    registry_with_internal_types,
+    StaticTypePolicy,
 };
 #[allow(unused_imports)]
 use dots_rs_model::*;
@@ -48,7 +48,7 @@ mod model {
 use model::*;
 
 fn registry() -> Arc<Registry> {
-    let reg = registry_with_internal_types();
+    let reg = Registry::with_static_types(StaticTypePolicy::All);
     reg.register_struct_static(Pinger::DESCRIPTOR);
     Arc::new(reg)
 }

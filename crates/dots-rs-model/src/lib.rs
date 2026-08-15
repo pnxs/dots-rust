@@ -58,7 +58,9 @@ pub use framing::{
     Transmission, decode_typed_transmission, encode_frame_with_header, encode_transmission,
     encode_transmission_into, encode_transmission_with_mask_into, parse_size_prefix,
 };
-pub use registry::{DecodedAny, DescriptorEntry, FromAnyError, Registry, RegistryError};
+pub use registry::{
+    DecodedAny, DescriptorEntry, FromAnyError, Registry, RegistryError, StaticTypePolicy,
+};
 
 /// Register the DOTS-internal types — the handshake messages, the
 /// per-transmission [`DotsHeader`], descriptor-data types, and
@@ -69,7 +71,10 @@ pub use registry::{DecodedAny, DescriptorEntry, FromAnyError, Registry, Registry
 /// since each `&'static StructDescriptor` already references its
 /// nested types directly; the registry just needs name → descriptor
 /// entries.
-pub fn register_dots_internal_types(reg: &mut Registry) {
+///
+/// Usually called via [`Registry::with_static_types`] with
+/// [`StaticTypePolicy::InternalOnly`] or [`StaticTypePolicy::All`].
+pub fn register_dots_internal_types(reg: &Registry) {
     // Connection / handshake.
     reg.register_struct_static(DotsHeader::DESCRIPTOR);
     reg.register_struct_static(DotsServerCapabilities::DESCRIPTOR);
@@ -118,11 +123,3 @@ pub fn register_dots_internal_types(reg: &mut Registry) {
     reg.register_struct_static(daemon::DotsDaemonStatus::DESCRIPTOR);
 }
 
-/// One-line constructor: a [`Registry`] pre-populated with the DOTS-
-/// internal types. Equivalent to `Registry::new()` followed by
-/// [`register_dots_internal_types`].
-pub fn registry_with_internal_types() -> Registry {
-    let mut reg = Registry::new();
-    register_dots_internal_types(&mut reg);
-    reg
-}

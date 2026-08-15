@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dots_rs_core::dots;
-use dots_rs_model::{Registry, filter::predicate, registry_with_internal_types};
+use dots_rs_model::{Registry, StaticTypePolicy, filter::predicate};
 use dots_rs_transport::{ConnectionBuilder, GuestTransceiver, HostTransceiver, ViewOp};
 
 mod model {
@@ -27,7 +27,7 @@ mod model {
 use model::*;
 
 fn registry() -> Arc<Registry> {
-    Arc::new(registry_with_internal_types())
+    Arc::new(Registry::with_static_types(StaticTypePolicy::All))
 }
 
 #[tokio::test]

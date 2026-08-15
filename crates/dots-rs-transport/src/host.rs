@@ -674,16 +674,21 @@ struct GuestRecord {
 }
 
 impl HostTransceiver {
-    /// Build a new host with a fresh registry pre-populated with the
-    /// DOTS-internal types.
+    /// Build a new host with a fresh registry seeded with
+    /// [`StaticTypePolicy::All`](dots_rs_model::StaticTypePolicy). A
+    /// broker that should learn user types exclusively from the wire
+    /// can use [`with_registry`](Self::with_registry) with
+    /// `StaticTypePolicy::InternalOnly` instead.
     pub fn new(self_name: impl Into<String>) -> Arc<Self> {
-        let registry = Arc::new(dots_rs_model::registry_with_internal_types());
+        let registry = Arc::new(dots_rs_model::Registry::with_static_types(
+            dots_rs_model::StaticTypePolicy::All,
+        ));
         Self::with_registry(self_name, registry)
     }
 
     /// Build a new host with a caller-supplied registry. The registry
     /// must already include the DOTS-internal types — e.g. via
-    /// [`dots_rs_model::registry_with_internal_types`].
+    /// [`Registry::with_static_types`](dots_rs_model::Registry::with_static_types).
     pub fn with_registry(self_name: impl Into<String>, registry: Arc<Registry>) -> Arc<Self> {
         Arc::new(HostTransceiver {
             self_name: self_name.into(),

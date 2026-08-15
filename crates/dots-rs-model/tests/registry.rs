@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use dots_rs_core::{DynamicStruct, DynamicStructDescriptor, decode_typed_from_slice, encode_to_vec};
 use dots_rs_model::{
-    EnumDescriptorData, Registry, RegistryError, StructDescriptorData,
+    EnumDescriptorData, Registry, RegistryError, StaticTypePolicy, StructDescriptorData,
 };
 
 // ----- Fixture types (the "sender" side has these compiled) -----
@@ -231,12 +231,41 @@ fn registering_static_then_looking_up_works() {
     }
 }
 
+/// The `StaticTypePolicy` levels: `FundamentalOnly` yields an empty
+/// registry (fundamentals are codec-native), `InternalOnly` seeds the
+/// DOTS-internal types but no user types, `All` additionally seeds
+/// every compiled-in type from the link-time slices.
+#[test]
+fn static_type_policy_levels() {
+    use dots_rs_core::GlobalRegistration;
+    // Runtime no-op, but its presence anchors Address's
+    // SUBSCRIBED_TYPES slice entry at link time — the same way
+    // `container::<T>` / `subscribe::<T>` call sites do.
+    Address::register_as_subscribed();
+
+    let fundamental = Registry::with_static_types(StaticTypePolicy::FundamentalOnly);
+    assert!(fundamental.is_empty());
+
+    let internal = Registry::with_static_types(StaticTypePolicy::InternalOnly);
+    assert!(internal.lookup("DotsHeader").is_some());
+    assert!(
+        internal.lookup("Address").is_none(),
+        "InternalOnly must not seed user types"
+    );
+
+    let all = Registry::with_static_types(StaticTypePolicy::All);
+    assert!(all.lookup("DotsHeader").is_some());
+    assert!(
+        all.lookup_static_struct("Address").is_some(),
+        "All must seed compiled-in user types from the slices"
+    );
+}
+
 /// Re-registering the same `&'static StructDescriptor` must keep the
 /// existing dynamic projection: `DynamicStruct` operations compare
 /// descriptors by `Arc` identity, so a fresh Arc per registration
 /// would make values decoded before the re-registration incomparable
-/// with values decoded after (observed as a `copy_from`/`equal` panic
-/// when `container::<T>()` re-registers on every call).
+/// with values decoded after.
 #[test]
 fn re_registering_same_static_descriptor_is_idempotent() {
     let reg = Registry::new();

@@ -22,7 +22,7 @@ use dots_rs_core::{DynamicStruct, Transmittable, dots, encode_to_vec};
 use dots_rs_model::*;
 use dots_rs_model::{
     DotsHeader, DotsMsgConnectResponse, DotsMsgHello, Registry, StructDescriptorData,
-    encode_transmission, registry_with_internal_types,
+    encode_transmission, StaticTypePolicy,
 };
 use dots_rs_transport::{
     Connection, GuestDriver, GuestTransceiver, Operation, TransmissionCodec,
@@ -119,7 +119,7 @@ async fn connect_guest() -> (
     let (client_io, server_io) = tokio::io::duplex(65536);
     // Internal types only — the foreign types stay unknown until
     // learned from the wire (or registered explicitly by a test).
-    let reg = Arc::new(registry_with_internal_types());
+    let reg = Arc::new(Registry::with_static_types(StaticTypePolicy::All));
 
     let server_reg = reg.clone();
     let server = tokio::spawn(async move {
