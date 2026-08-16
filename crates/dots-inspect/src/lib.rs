@@ -317,7 +317,7 @@ impl<'d> Image<'d> {
 }
 
 /// The `R_*_RELATIVE` relocation type for the given architecture.
-fn relative_reloc_type(arch: Architecture) -> Option<u32> {
+fn relative_reloc_type(arch: Architecture) -> Option<object::elf::RelocationType> {
     use object::elf;
     Some(match arch {
         Architecture::X86_64 => elf::R_X86_64_RELATIVE,

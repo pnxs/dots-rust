@@ -31,7 +31,7 @@ minicbor = { version = "2", default-features = false, features = ["alloc"] }
 
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2", features = ["full"] }
+syn = { version = "3", features = ["full"] }
 
 tokio = { version = "1", default-features = false }
 tokio-util = { version = "0.7", default-features = false }
@@ -46,7 +46,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 linkme = "0.3"
 
 # ELF reading for dots-inspect (static binary inspection).
-object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
+object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
 
 sha2 = { version = "0.11", default-features = false }
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "thread_rng"] }
