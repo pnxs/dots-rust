@@ -1187,24 +1187,20 @@ impl HostTransceiver {
             .get(type_name)
             .is_some_and(|g| !g.filtered_subs.is_empty());
 
-        // Pre-merge snapshot — only needed when at least one filtered
-        // sub exists. For the all-unfiltered case the four-cases
-        // branch is skipped entirely and we pay zero clone cost.
-        let pre_merge_payload: Option<dots_rs_model::Payload> = if is_cached && has_filtered_subs {
-            payload.as_ref().and_then(|p| {
-                let key = p.key_bytes();
-                inner.pool.get(type_name).and_then(|m| m.get(&key)).map(|e| e.payload.clone())
-            })
-        } else {
-            None
-        };
         let key_bytes_post = payload.as_ref().map(|p| p.key_bytes());
-        let key_bytes_pre = pre_merge_payload.as_ref().map(|p| p.key_bytes());
 
         // Filtered fan-out FIRST, while we can still borrow `payload`
         // (the cache mutation below *moves* it). Builds per-sub
         // outbound bytes; we mutate `sub.visible` under a mutable
         // borrow of the group.
+        //
+        // View membership is tracked by cache key-bytes, which are
+        // identical pre- and post-merge (keys are immutable under the
+        // DOTS contract), so the incoming payload's key indexes
+        // `sub.visible` directly — no pre-merge cache snapshot needed.
+        // The `visible` bookkeeping applies to cached types only:
+        // uncached instances have no identity beyond the single event,
+        // so they neither enter a view nor produce leave-view removes.
         let mut filtered_outbound: Vec<(u32, Bytes)> = Vec::new();
         if has_filtered_subs && payload.is_some() {
             let HostInner { groups, .. } = &mut *inner;
@@ -1214,17 +1210,14 @@ impl HostTransceiver {
                         continue;
                     }
                     let post = payload.as_ref().expect("checked above");
-                    let was_visible = key_bytes_pre
-                        .as_ref()
-                        .is_some_and(|k| sub.visible.contains(k));
+                    let key = key_bytes_post.as_ref().expect("checked above");
+                    let was_visible = is_cached && sub.visible.contains(key);
                     let now_matches = !is_remove && matches_payload(&sub.compiled, post);
 
                     match (now_matches, was_visible) {
                         (true, _) => {
-                            if !was_visible {
-                                if let Some(k) = &key_bytes_post {
-                                    sub.visible.insert(k.clone());
-                                }
+                            if is_cached && !was_visible {
+                                sub.visible.insert(key.clone());
                             }
                             let mask_proj = sub.filter.property_mask.unwrap_or(post.valid_set());
                             let attrs = header.attributes.unwrap_or(post.valid_set());
@@ -1242,24 +1235,14 @@ impl HostTransceiver {
                             filtered_outbound.push((*cid, Bytes::from(bytes)));
                         }
                         (false, true) => {
-                            if let Some(k) = &key_bytes_post {
-                                sub.visible.remove(k);
-                            }
-                            // Leave-view: synthesize a key-only remove
-                            // using the post-merge keys (which equal
-                            // pre-merge keys under the DOTS contract).
-                            // Use the post-merge payload if available;
-                            // otherwise fall back to pre-merge.
-                            let p = payload
-                                .as_ref()
-                                .or(pre_merge_payload.as_ref())
-                                .expect("checked above");
+                            sub.visible.remove(key);
+                            // Leave-view: synthesize a key-only remove.
                             let mut h = header.clone();
                             h.attributes = Some(key_set);
                             h.remove_obj = Some(true);
                             h.subscription_id = Some(*sub_id);
                             let mut bytes = Vec::with_capacity(64);
-                            encode_transmission_with_mask_into(&h, p, key_set, &mut bytes);
+                            encode_transmission_with_mask_into(&h, post, key_set, &mut bytes);
                             filtered_outbound.push((*cid, Bytes::from(bytes)));
                         }
                         (false, false) => {}
@@ -1279,13 +1262,23 @@ impl HostTransceiver {
         if is_cached {
             if let Some(p) = payload {
                 let key = key_bytes_post.expect("cached payload always has key bytes");
-                let map = inner.pool.entry(type_name.to_string()).or_default();
                 if is_remove {
-                    map.remove(&key);
-                    if map.is_empty() {
-                        inner.pool.remove(type_name);
+                    if let Some(map) = inner.pool.get_mut(type_name) {
+                        map.remove(&key);
+                        if map.is_empty() {
+                            inner.pool.remove(type_name);
+                        }
                     }
                 } else {
+                    // Allocate the pool key only for a type's first
+                    // instance; the steady state is a plain lookup.
+                    if !inner.pool.contains_key(type_name) {
+                        inner.pool.insert(type_name.to_string(), Default::default());
+                    }
+                    let map = inner
+                        .pool
+                        .get_mut(type_name)
+                        .expect("inserted above if absent");
                     let mask = header.attributes.unwrap_or_else(|| p.valid_set());
                     match map.entry(key) {
                         std::collections::btree_map::Entry::Occupied(mut slot) => {
@@ -1848,7 +1841,7 @@ where
             match stream_in.next().await {
                 Some(Ok(raw)) => {
                     writer.record_received(raw.frame_bytes);
-                    if handle_preload_message(&host, client_id, &raw, &writer)? {
+                    if handle_preload_message(&host, client_id, raw, &writer)? {
                         break;
                     }
                 }
@@ -1872,7 +1865,7 @@ where
         match stream_in.next().await {
             Some(Ok(raw)) => {
                 writer.record_received(raw.frame_bytes);
-                handle_connected_message(&host, client_id, &raw);
+                handle_connected_message(&host, client_id, raw);
             }
             Some(Err(e)) => return guest_read_error(client_id, e),
             None => return Ok(()),
@@ -1894,12 +1887,12 @@ where
 fn handle_preload_message(
     host: &Arc<HostTransceiver>,
     client_id: u32,
-    raw: &RawTransmission,
+    raw: RawTransmission,
     writer: &SharedWriter,
 ) -> Result<bool, HostError> {
     let type_name = raw.header.type_name.as_deref().unwrap_or("");
     if type_name == "DotsMsgConnect" {
-        let connect: DotsMsgConnect = decode_handshake(raw, "DotsMsgConnect")?;
+        let connect: DotsMsgConnect = decode_handshake(&raw, "DotsMsgConnect")?;
         if connect.preload_client_finished == Some(true) {
             let resp = dots!(DotsMsgConnectResponse {
                 server_name: host.self_name.clone(),
@@ -1930,70 +1923,71 @@ fn handle_preload_message(
 fn handle_connected_message(
     host: &Arc<HostTransceiver>,
     client_id: u32,
-    raw: &RawTransmission,
+    raw: RawTransmission,
 ) {
     let Some(type_name) = raw.header.type_name.as_deref() else {
         return;
     };
-    if type_name == "DotsMember" {
+
+    match type_name {
         // Group membership is for the broker; not fanned out.
-        handle_member(host, client_id, raw);
-        return;
-    }
-    if type_name == "DotsEcho" {
+        "DotsMember" => {
+            handle_member(host, client_id, &raw);
+            return;
+        }
         // Direct reply only; no fan-out.
-        handle_echo(host, client_id, raw);
-        return;
-    }
-    if type_name == "DotsDescriptorRequest" {
+        "DotsEcho" => {
+            handle_echo(host, client_id, &raw);
+            return;
+        }
         // Direct reply with all matching descriptors; no fan-out.
-        handle_descriptor_request(host, client_id, raw);
-        return;
-    }
-    if type_name == "DotsClearCache" {
+        "DotsDescriptorRequest" => {
+            handle_descriptor_request(host, client_id, &raw);
+            return;
+        }
         // Operates on the broker's pool; the resulting removals are
         // fanned out via the standard publish-with-remove_obj path.
-        handle_clear_cache(host, raw);
-        return;
-    }
-    if type_name == "StructDescriptorData" {
+        "DotsClearCache" => {
+            handle_clear_cache(host, &raw);
+            return;
+        }
         // Register locally so we can decode subsequent payloads of
         // the new type, then fall through to fan-out — other guests
         // subscribed to `StructDescriptorData` (e.g. dots-cpp guests
         // populating their own type registry) need to see it too.
-        register_incoming_struct(host, raw);
-    } else if type_name == "EnumDescriptorData" {
-        register_incoming_enum(host, raw);
-    } else if type_name == "DotsMsgError" {
+        "StructDescriptorData" => register_incoming_struct(host, &raw),
+        "EnumDescriptorData" => register_incoming_enum(host, &raw),
         // dots-cpp sends `DotsMsgError{ .errorCode = 0 }` from its
         // Connection destructor as part of graceful shutdown
         // (`Connection.cpp:60`), so code 0 is *not* an error — it's a
         // clean-close marker. Non-zero codes are real protocol errors;
         // either way the peer will close the socket and our reader
         // loop sees EOF.
-        match decode_typed_from_slice::<dots_rs_model::DotsMsgError>(&raw.payload) {
-            Ok(err) if err.error_code == Some(0) => tracing::debug!(
-                client_id,
-                "guest signalled graceful close via DotsMsgError(0)",
-            ),
-            Ok(err) => tracing::warn!(
-                client_id,
-                error_code = ?err.error_code,
-                error_text = ?err.error_text,
-                "guest reported protocol error",
-            ),
-            Err(e) => tracing::warn!(
-                client_id, error = %e, "received malformed DotsMsgError",
-            ),
+        "DotsMsgError" => {
+            match decode_typed_from_slice::<dots_rs_model::DotsMsgError>(&raw.payload) {
+                Ok(err) if err.error_code == Some(0) => tracing::debug!(
+                    client_id,
+                    "guest signalled graceful close via DotsMsgError(0)",
+                ),
+                Ok(err) => tracing::warn!(
+                    client_id,
+                    error_code = ?err.error_code,
+                    error_text = ?err.error_text,
+                    "guest reported protocol error",
+                ),
+                Err(e) => tracing::warn!(
+                    client_id, error = %e, "received malformed DotsMsgError",
+                ),
+            }
+            return;
         }
-        return;
-    } else if type_name == "DotsMsgConnect"
-        || type_name == "DotsMsgConnectResponse"
-        || type_name == "DotsMsgHello"
-    {
         // Handshake messages outside the handshake — log and drop.
-        tracing::warn!(client_id, type_name, "stray handshake message after preload");
-        return;
+        "DotsMsgConnect" | "DotsMsgConnectResponse" | "DotsMsgHello" => {
+            tracing::warn!(client_id, type_name, "stray handshake message after preload");
+            return;
+        }
+        // User type — falls through to cache + fan-out below.
+        _ => {}
     }
 
     // Build the outbound header: preserve `sender` if the guest set
@@ -2002,11 +1996,16 @@ fn handle_connected_message(
     // receiving guest computes it from `sender` vs. its own client id
     // (see `connection::stamp_is_from_myself`), so the broker is not
     // the authority on that flag.
-    let mut header = raw.header.clone();
+    let RawTransmission {
+        mut header,
+        payload: payload_bytes,
+        ..
+    } = raw;
     if header.sender.is_none() {
         header.sender = Some(client_id);
     }
     header.server_sent_time = Some(now_timepoint());
+    let type_name = header.type_name.as_deref().expect("checked above");
 
     // Decode the payload to `DynamicStruct` only if needed — i.e.
     // the type is cached (cache merge needs the dynamic form) or
@@ -2014,7 +2013,7 @@ fn handle_connected_message(
     // it). Non-cached types with no filtered subs skip the decode
     // entirely; their fan-out is purely byte-verbatim.
     let descriptor = match host.registry.lookup(type_name) {
-        Some(dots_rs_model::DescriptorEntry::Struct(d)) => Some(d.clone()),
+        Some(dots_rs_model::DescriptorEntry::Struct(d)) => Some(d),
         _ => None,
     };
     let is_cached = descriptor.as_ref().is_some_and(|d| d.flags.is_cached());
@@ -2026,9 +2025,9 @@ fn handle_connected_message(
             .is_some_and(|g| !g.filtered_subs.is_empty())
     };
     let dyn_payload: Option<dots_rs_model::Payload> = if needs_dynamic {
-        match (&descriptor, DynamicStruct::decode(descriptor.clone().unwrap_or_else(|| panic!("descriptor present")), &raw.payload)) {
-            (Some(_), Ok(p)) => Some(dots_rs_model::Payload::Wire(p)),
-            (Some(_), Err(e)) => {
+        descriptor.and_then(|d| match DynamicStruct::decode(d, &payload_bytes) {
+            Ok(p) => Some(dots_rs_model::Payload::Wire(p)),
+            Err(e) => {
                 tracing::warn!(
                     client_id,
                     type_name,
@@ -2037,8 +2036,7 @@ fn handle_connected_message(
                 );
                 None
             }
-            _ => None,
-        }
+        })
     } else {
         None
     };
@@ -2046,8 +2044,8 @@ fn handle_connected_message(
     // Encode the framed bytes for the unfiltered fast path: re-encode
     // the (small) header, splice in the payload bytes verbatim. No
     // DynamicStruct allocation needed, no CBOR walk over the payload.
-    let mut buf = Vec::with_capacity(FRAME_OVERHEAD_HINT + raw.payload.len());
-    encode_frame_with_header(&header, &raw.payload, &mut buf);
+    let mut buf = Vec::with_capacity(FRAME_OVERHEAD_HINT + payload_bytes.len());
+    encode_frame_with_header(&header, &payload_bytes, &mut buf);
 
     host.cache_and_fan_out(type_name, &header, Bytes::from(buf), dyn_payload, 0);
 }
