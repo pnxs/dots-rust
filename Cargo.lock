@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "dots-build-test"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dots-rs",
  "dots-rs-build",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "dots-demo-client"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dots-rs",
  "tokio",
@@ -247,14 +247,14 @@ dependencies = [
 
 [[package]]
 name = "dots-example"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dots-rs",
 ]
 
 [[package]]
 name = "dots-inspect"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dots-rs",
  "dots-rs-core",
@@ -263,7 +263,7 @@ dependencies = [
 
 [[package]]
 name = "dots-pinger-filtered"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dots-rs",
  "rand",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "dots-rs"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dots-rs-core",
  "dots-rs-derive",
@@ -283,11 +283,11 @@ dependencies = [
 
 [[package]]
 name = "dots-rs-build"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "dots-rs-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dots-rs-derive",
  "linkme",
@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "dots-rs-derive"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dots-rs",
  "dots-rs-core",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "dots-rs-model"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "dots-rs-core",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "dots-rs-testing"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dots-rs",
  "dots-rs-core",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "dots-rs-transport"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "dots-rs",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "dots-smarthome"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dots-rs",
  "dots-rs-build",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "dots-trace"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "dots-rs-core",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "dots-tui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crossterm",
  "dots-rs-model",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "dotsd"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dots-rs-core",
  "dots-rs-model",
