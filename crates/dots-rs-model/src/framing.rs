@@ -26,8 +26,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dots_rs_core::{
     AnyStruct, DecodeError, DynamicStruct, DynamicStructDescriptor, PropertySet, StructDescriptor,
-    StructValue, Transmittable, decode_typed_from_decoder, encode_into_vec, encode_key_bytes,
-    layout::CborEncoder,
+    StructFlags, StructValue, Transmittable, decode_typed_from_decoder, encode_into_vec,
+    encode_key_bytes, layout::CborEncoder,
 };
 
 use crate::{DotsHeader, Registry};
@@ -105,6 +105,37 @@ impl Payload {
             Self::Typed(a) => Some(a.descriptor()),
             Self::Wire(_) => None,
         }
+    }
+
+    /// Struct flags of this payload's type (`cached`, `cleanup`, …),
+    /// regardless of which variant produced it.
+    pub fn flags(&self) -> StructFlags {
+        match self {
+            Self::Typed(a) => a.descriptor().flags,
+            Self::Wire(d) => d.descriptor.flags,
+        }
+    }
+
+    /// Bitmask of this payload's `#[dots(key)]` property tags.
+    pub fn key_set(&self) -> PropertySet {
+        let mut s = PropertySet::EMPTY;
+        match self {
+            Self::Typed(a) => {
+                for p in a.descriptor().properties {
+                    if p.is_key {
+                        s = s.with_tag(p.tag);
+                    }
+                }
+            }
+            Self::Wire(d) => {
+                for p in &d.descriptor.properties {
+                    if p.is_key {
+                        s = s.with_tag(p.tag);
+                    }
+                }
+            }
+        }
+        s
     }
 
     /// Bitmask of the properties currently set on this payload.

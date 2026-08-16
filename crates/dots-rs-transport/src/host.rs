@@ -1079,19 +1079,7 @@ impl HostTransceiver {
     /// task. The actual socket I/O happens asynchronously in those
     /// drainer tasks.
     pub fn publish<P: Publishable + StructValue>(&self, value: &P) {
-        let type_name = Transmittable::type_name(value).to_string();
-        let mask = StructValue::valid_set(value);
-        let header = dots!(DotsHeader {
-            type_name: type_name.clone(),
-            attributes: mask,
-            sender: HOST_ID,
-            sent_time: now_timepoint(),
-            server_sent_time: now_timepoint(),
-        });
-        let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
-        let mut bytes = Vec::with_capacity(64);
-        encode_transmission_into(&header, value, &mut bytes);
-        self.cache_and_fan_out(&type_name, &header, Bytes::from(bytes), dyn_payload, HOST_ID);
+        self.publish_or_remove_with_mask(value, StructValue::valid_set(value), None);
     }
 
     /// Publish a partial update from the host. Same masking rules as
@@ -1099,6 +1087,22 @@ impl HostTransceiver {
     /// only properties that are both set on `value` and present in
     /// `included | key_set(value)` are emitted.
     pub fn publish_with_mask<P: Publishable + StructValue>(&self, value: &P, included: PropertySet) {
+        self.publish_or_remove_with_mask(value, included, None);
+    }
+
+    /// Publish a removal from the host. Routes to every guest
+    /// subscribed to the value's type-name group, with
+    /// `header.remove_obj = true` and only key fields in the payload.
+    /// Drops the entry from the host's cache pool.
+    pub fn remove<P: Publishable + StructValue>(&self, value: &P) {
+        self.publish_or_remove_with_mask(value, PropertySet::EMPTY, Some(true));
+    }
+
+    /// Publish a partial update from the host. Same masking rules as
+    /// [`GuestTransceiver::publish_with_mask`](crate::GuestTransceiver::publish_with_mask):
+    /// only properties that are both set on `value` and present in
+    /// `included | key_set(value)` are emitted.
+    fn publish_or_remove_with_mask<P: Publishable + StructValue>(&self, value: &P, included: PropertySet, remove: Option<bool>) {
         let type_name = Transmittable::type_name(value).to_string();
         let mask = (included | Transmittable::key_set(value)) & StructValue::valid_set(value);
         let header = dots!(DotsHeader {
@@ -1107,27 +1111,7 @@ impl HostTransceiver {
             sender: HOST_ID,
             sent_time: now_timepoint(),
             server_sent_time: now_timepoint(),
-        });
-        let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
-        let mut bytes = Vec::with_capacity(64);
-        encode_transmission_with_mask_into(&header, value, mask, &mut bytes);
-        self.cache_and_fan_out(&type_name, &header, Bytes::from(bytes), dyn_payload, HOST_ID);
-    }
-
-    /// Publish a removal from the host. Routes to every guest
-    /// subscribed to the value's type-name group, with
-    /// `header.remove_obj = true` and only key fields in the payload.
-    /// Drops the entry from the host's cache pool.
-    pub fn remove<P: Publishable + StructValue>(&self, value: &P) {
-        let type_name = Transmittable::type_name(value).to_string();
-        let mask = Transmittable::key_set(value);
-        let header = dots!(DotsHeader {
-            type_name: type_name.clone(),
-            attributes: mask,
-            sender: HOST_ID,
-            sent_time: now_timepoint(),
-            server_sent_time: now_timepoint(),
-            remove_obj: true,
+            remove_obj: remove
         });
         let dyn_payload = self.payload_as_dynamic(&type_name, value, mask);
         let mut bytes = Vec::with_capacity(64);
@@ -1176,12 +1160,12 @@ impl HostTransceiver {
     /// filtered subs exist for `type_name` — the per-fan-out
     /// overhead is one branch on `group.filtered_subs.is_empty()`.
     ///
-    /// `payload` is the post-merge `DynamicStruct` form of the
-    /// publish (`None` for non-cached types whose group has no
-    /// filtered subs, since no decode is needed in that case). The
-    /// host's own publish helpers pre-decode via CBOR round-trip;
-    /// the guest-fan-out path decodes from the raw payload bytes
-    /// when it sees a cached type or filtered subs.
+    /// `payload` is the structured form of the publish, carrying its
+    /// own descriptor — the source for the `cached` flag and the key
+    /// set here. `None` means "no structured work": the cache is left
+    /// untouched and filtered subscribers are skipped, so callers pass
+    /// `None` exactly when the type is non-cached and its group has no
+    /// filtered subs (no decode needed for pure byte fan-out).
     fn cache_and_fan_out(
         &self,
         type_name: &str,
@@ -1192,11 +1176,11 @@ impl HostTransceiver {
     ) {
         let mut inner = self.inner.lock().expect("host mutex poisoned");
 
-        let descriptor = match self.registry.lookup(type_name) {
-            Some(dots_rs_model::DescriptorEntry::Struct(d)) => Some(d.clone()),
-            _ => None,
-        };
-        let is_cached = descriptor.as_ref().is_some_and(|d| d.flags.is_cached());
+        let is_cached = payload.as_ref().is_some_and(|p| p.flags().is_cached());
+        let key_set = payload
+            .as_ref()
+            .map(|p| p.key_set())
+            .unwrap_or(PropertySet::EMPTY);
         let is_remove = header.remove_obj == Some(true);
         let has_filtered_subs = inner
             .groups
@@ -1214,19 +1198,6 @@ impl HostTransceiver {
         } else {
             None
         };
-
-        let key_set = descriptor
-            .as_ref()
-            .map(|d| {
-                let mut s = PropertySet::EMPTY;
-                for p in &d.properties {
-                    if p.is_key {
-                        s = s.with_tag(p.tag);
-                    }
-                }
-                s
-            })
-            .unwrap_or(PropertySet::EMPTY);
         let key_bytes_post = payload.as_ref().map(|p| p.key_bytes());
         let key_bytes_pre = pre_merge_payload.as_ref().map(|p| p.key_bytes());
 
