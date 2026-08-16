@@ -42,6 +42,9 @@ use object::{
 pub const PUBLISHED_SECTION: &str = "linkme_PUBLISHED_TYPES";
 /// ELF section holding the subscribed-types slice.
 pub const SUBSCRIBED_SECTION: &str = "linkme_SUBSCRIBED_TYPES";
+/// ELF section holding the filtered-subscribed-types slice (`View<T>`
+/// intent — descriptor announced, no unfiltered group join).
+pub const SUBSCRIBED_FILTERED_SECTION: &str = "linkme_SUBSCRIBED_FILTERED_TYPES";
 
 /// One DOTS struct type recovered from the binary.
 #[derive(Debug, Clone)]
@@ -122,6 +125,9 @@ pub struct Report {
     pub published: Vec<TypeInfo>,
     /// Types the binary subscribes to, sorted by name.
     pub subscribed: Vec<TypeInfo>,
+    /// Types the binary opens filtered subscriptions (`View<T>`) on,
+    /// sorted by name.
+    pub subscribed_filtered: Vec<TypeInfo>,
     /// Struct types that are not registered themselves but appear
     /// (transitively) as property types of registered ones. Sorted by
     /// name.
@@ -135,6 +141,7 @@ pub struct Report {
     /// drops empty sections).
     pub has_published_section: bool,
     pub has_subscribed_section: bool,
+    pub has_subscribed_filtered_section: bool,
 }
 
 #[derive(Debug)]
@@ -370,6 +377,7 @@ pub fn inspect(data: &[u8]) -> Result<Report, InspectError> {
     let mut report = Report::default();
     let mut published_addrs = Vec::new();
     let mut subscribed_addrs = Vec::new();
+    let mut subscribed_filtered_addrs = Vec::new();
     if let Some(section) = obj.section_by_name(PUBLISHED_SECTION) {
         report.has_published_section = true;
         published_addrs = read_slice(&image, section.address(), section.size())?;
@@ -377,6 +385,10 @@ pub fn inspect(data: &[u8]) -> Result<Report, InspectError> {
     if let Some(section) = obj.section_by_name(SUBSCRIBED_SECTION) {
         report.has_subscribed_section = true;
         subscribed_addrs = read_slice(&image, section.address(), section.size())?;
+    }
+    if let Some(section) = obj.section_by_name(SUBSCRIBED_FILTERED_SECTION) {
+        report.has_subscribed_filtered_section = true;
+        subscribed_filtered_addrs = read_slice(&image, section.address(), section.size())?;
     }
 
     let mut parser = Parser {
@@ -386,7 +398,11 @@ pub fn inspect(data: &[u8]) -> Result<Report, InspectError> {
         pending_structs: Vec::new(),
         pending_enums: Vec::new(),
     };
-    for &addr in published_addrs.iter().chain(&subscribed_addrs) {
+    for &addr in published_addrs
+        .iter()
+        .chain(&subscribed_addrs)
+        .chain(&subscribed_filtered_addrs)
+    {
         parser.parse_struct(addr)?;
     }
     // Property types of registered structs pull in further struct and
@@ -401,10 +417,12 @@ pub fn inspect(data: &[u8]) -> Result<Report, InspectError> {
     let registered: HashSet<u64> = published_addrs
         .iter()
         .chain(&subscribed_addrs)
+        .chain(&subscribed_filtered_addrs)
         .copied()
         .collect();
     report.published = collect(&parser.structs, &published_addrs);
     report.subscribed = collect(&parser.structs, &subscribed_addrs);
+    report.subscribed_filtered = collect(&parser.structs, &subscribed_filtered_addrs);
     report.referenced_structs = parser
         .structs
         .values()

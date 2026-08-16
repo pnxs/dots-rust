@@ -132,7 +132,7 @@ async fn connect_guest() -> (
         .await
         .expect("handshake succeeds");
     let framed = server.await.unwrap();
-    let (transceiver, driver) = GuestTransceiver::from_connection(reg.clone(), conn, [], []);
+    let (transceiver, driver) = GuestTransceiver::from_connection(reg.clone(), conn, [], [], []);
     (transceiver, driver, framed, reg)
 }
 

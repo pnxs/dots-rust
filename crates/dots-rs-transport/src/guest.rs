@@ -144,28 +144,38 @@ pub struct GuestTransceiver {
     /// `subscribe::<T>` / `container::<T>` doesn't emit a duplicate
     /// Join. Mirrors dots-cpp's `m_preloadSubscribeTypes`.
     subscribe_types: Mutex<Vec<&'static StructDescriptor>>,
+    /// Types this transceiver opens filtered subscriptions
+    /// (`View<T>`) on. Their descriptors ship during EarlySubscribe
+    /// like the other two lists, but no `DotsMember(Join)` is emitted
+    /// — routing is established per-`View`, with the filter, when the
+    /// view opens.
+    subscribe_filtered_types: Mutex<Vec<&'static StructDescriptor>>,
 }
 
 impl GuestTransceiver {
     /// Build a guest from an established [`Connection`]. Returns the
     /// shared transceiver and a separable I/O driver.
     ///
-    /// `published_types` and `subscribed_types` declare the static
-    /// types this guest will publish and subscribe to. The
-    /// [`GuestDriver`] ships their descriptors (and any transitively
-    /// referenced struct/enum descriptors) to the broker during the
-    /// EarlySubscribe phase, then publishes a `DotsMember(Join)` for
-    /// each subscribed type so the broker can start cache replay
-    /// before `preloadClientFinished`. Mirrors the
-    /// `preloadPublishTypes` / `preloadSubscribeTypes` arguments of
-    /// dots-cpp's `GuestTransceiver::open`.
+    /// `published_types`, `subscribed_types`, and
+    /// `subscribed_filtered_types` declare the static types this guest
+    /// will publish, subscribe to, and open filtered views on. The
+    /// [`GuestDriver`] ships all their descriptors (and any
+    /// transitively referenced struct/enum descriptors) to the broker
+    /// during the EarlySubscribe phase, then publishes a
+    /// `DotsMember(Join)` for each entry of `subscribed_types` — and
+    /// only those — so the broker can start cache replay before
+    /// `preloadClientFinished`. Filtered-view types get no unfiltered
+    /// join; each `View` announces its own filtered join when it
+    /// opens. Mirrors the `preloadPublishTypes` /
+    /// `preloadSubscribeTypes` arguments of dots-cpp's
+    /// `GuestTransceiver::open`.
     ///
     /// `registry` should normally be built with
     /// [`StaticTypePolicy::All`](dots_rs_model::StaticTypePolicy):
     /// `container::<T>` / `publish` / `view::<T>` perform no codec
     /// registration of their own — they rely on every compiled-in
     /// type having been seeded at registry construction. With a
-    /// leaner policy, only the types passed in the two lists here
+    /// leaner policy, only the types passed in the lists here
     /// (registered during EarlySubscribe) and types learned from wire
     /// descriptors are decodable.
     ///
@@ -173,16 +183,18 @@ impl GuestTransceiver {
     /// [`GuestDriver::run`]) to actually exchange traffic with the
     /// broker — until then, publishes will queue and incoming
     /// transmissions will not be observed.
-    pub fn from_connection<S, P, U>(
+    pub fn from_connection<S, P, U, V>(
         registry: Arc<Registry>,
         conn: Connection<S>,
         published_types: P,
         subscribed_types: U,
+        subscribed_filtered_types: V,
     ) -> (Arc<Self>, GuestDriver<S>)
     where
         S: AsyncRead + AsyncWrite + Unpin,
         P: IntoIterator<Item = &'static StructDescriptor>,
         U: IntoIterator<Item = &'static StructDescriptor>,
+        V: IntoIterator<Item = &'static StructDescriptor>,
     {
         let dispatch = conn.dispatch_handle();
         let client_id = conn.client_id();
@@ -193,6 +205,8 @@ impl GuestTransceiver {
             published_types.into_iter().collect();
         let subscribe_types: Vec<&'static StructDescriptor> =
             subscribed_types.into_iter().collect();
+        let subscribe_filtered_types: Vec<&'static StructDescriptor> =
+            subscribed_filtered_types.into_iter().collect();
 
         // Pre-bump joined_groups for every subscribed type so a later
         // user-side `subscribe::<T>` / `container::<T>` increments to 2
@@ -220,6 +234,7 @@ impl GuestTransceiver {
             next_subscription_id: AtomicU32::new(1),
             publish_types: Mutex::new(publish_types),
             subscribe_types: Mutex::new(subscribe_types),
+            subscribe_filtered_types: Mutex::new(subscribe_filtered_types),
         });
         let driver = GuestDriver {
             transceiver: transceiver.clone(),
@@ -271,12 +286,6 @@ impl GuestTransceiver {
     /// Allocate a fresh `subscription_id`. Process-local, monotonic.
     pub(crate) fn allocate_subscription_id(&self) -> u32 {
         self.next_subscription_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Shared handle on the dispatch state — used by `View<T>`'s
-    /// container construction.
-    pub(crate) fn dispatch_handle_ref(&self) -> &Arc<Mutex<DispatchState>> {
-        &self.dispatch
     }
 
     /// Insert a `Weak<dyn ViewDispatch>` into the demux table under
@@ -962,12 +971,23 @@ where
             .lock()
             .expect("subscribe_types mutex poisoned")
             .clone();
+        let subscribe_filtered_types = self
+            .transceiver
+            .subscribe_filtered_types
+            .lock()
+            .expect("subscribe_filtered_types mutex poisoned")
+            .clone();
         let mut structs_to_send: Vec<&'static StructDescriptor> = Vec::new();
         let mut enums_to_send: Vec<&'static EnumDescriptor> = Vec::new();
         {
             let mut seen_structs: HashSet<usize> = HashSet::new();
             let mut seen_enums: HashSet<usize> = HashSet::new();
-            for d in publish_types.iter().chain(subscribe_types.iter()).copied() {
+            for d in publish_types
+                .iter()
+                .chain(subscribe_types.iter())
+                .chain(subscribe_filtered_types.iter())
+                .copied()
+            {
                 collect_descriptor_send_order(
                     d,
                     &mut seen_structs,
@@ -1089,8 +1109,8 @@ where
                 maybe_in = stream.next() => match maybe_in {
                     Some(Ok(mut txn)) => {
                         tracing::trace!(
-                            type_name = ?txn.header.type_name,
-                            sender = ?txn.header.sender,
+                            header = ?txn.header,
+                            payload = ?txn.payload,
                             "dispatching incoming transmission"
                         );
                         // Decide `is_from_myself` on the receiving side

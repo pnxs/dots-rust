@@ -238,10 +238,11 @@ fn registering_static_then_looking_up_works() {
 #[test]
 fn static_type_policy_levels() {
     use dots_rs_core::GlobalRegistration;
-    // Runtime no-op, but its presence anchors Address's
-    // SUBSCRIBED_TYPES slice entry at link time — the same way
-    // `container::<T>` / `subscribe::<T>` call sites do.
+    // Runtime no-ops, but their presence anchors the slice entries at
+    // link time — the same way `container::<T>` / `subscribe::<T>` /
+    // `view::<T>` call sites do.
     Address::register_as_subscribed();
+    LogEntry::register_as_subscribed_filtered();
 
     let fundamental = Registry::with_static_types(StaticTypePolicy::FundamentalOnly);
     assert!(fundamental.is_empty());
@@ -258,6 +259,10 @@ fn static_type_policy_levels() {
     assert!(
         all.lookup_static_struct("Address").is_some(),
         "All must seed compiled-in user types from the slices"
+    );
+    assert!(
+        all.lookup_static_struct("LogEntry").is_some(),
+        "All must also seed view types (SUBSCRIBED_FILTERED_TYPES)"
     );
 }
 

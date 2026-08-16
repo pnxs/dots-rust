@@ -1181,8 +1181,7 @@ pub(crate) fn make_dyn_container(
 /// [`make_dyn_container`] and wraps it in a typed view.
 ///
 /// Used by [`crate::Connection::container`] (raw, no transceiver
-/// pool) and by [`crate::View`] (filtered subscriptions own a
-/// separate container per view).
+/// pool).
 pub(crate) fn make_container<T>(
     dispatch: &Arc<Mutex<DispatchState>>,
     leaver: Option<GroupLeaver>,
@@ -1192,6 +1191,20 @@ where
 {
     let inner = make_dyn_container(T::type_descriptor(), dispatch, leaver);
     Container::from_dyn(inner)
+}
+
+/// Build a typed [`Container<T>`] that is NOT registered for
+/// type-name dispatch: only its owner feeds it, via
+/// [`view_dispatch_update`]. Used by [`crate::View`], whose broker
+/// routes matching transmissions by `subscription_id` — the same
+/// guest may also hold an unfiltered subscription on `T`, and those
+/// byte-verbatim transmissions must never reach the view's container
+/// (they carry unfiltered, unprojected state).
+pub(crate) fn make_view_container<T>() -> Container<T>
+where
+    T: StructValue + Send + Sync + 'static,
+{
+    Container::from_dyn(Arc::new(DynContainer::new(T::type_descriptor(), None)))
 }
 
 /// Apply a transmission directly to a [`Container<T>`]'s underlying

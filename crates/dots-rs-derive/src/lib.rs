@@ -714,6 +714,16 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 static REG: &'static #dots_rt::StructDescriptor = #struct_ident::DESCRIPTOR;
                 ::core::hint::black_box(&REG);
             }
+            fn register_as_subscribed_filtered() {
+                #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+                #[unsafe(link_section = "linkme_SUBSCRIBED_FILTERED_TYPES")]
+                static REG: &'static #dots_rt::StructDescriptor = #struct_ident::DESCRIPTOR;
+                #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+                #[#dots_rt::linkme::distributed_slice(#dots_rt::SUBSCRIBED_FILTERED_TYPES)]
+                #[linkme(crate = #dots_rt::linkme)]
+                static REG: &'static #dots_rt::StructDescriptor = #struct_ident::DESCRIPTOR;
+                ::core::hint::black_box(&REG);
+            }
         }
     };
 

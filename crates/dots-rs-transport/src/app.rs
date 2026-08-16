@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use dots_rs_core::{
     DynamicStruct, DynamicStructDescriptor, PUBLISHED_TYPES, PropertySet, Publishable,
-    SUBSCRIBED_TYPES, StructValue,
+    SUBSCRIBED_FILTERED_TYPES, SUBSCRIBED_TYPES, StructValue,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -508,21 +508,21 @@ where
     }
     let conn: Connection<S> = builder.connect().await?;
 
-    // Hand the link-time `PUBLISHED_TYPES` / `SUBSCRIBED_TYPES`
-    // slices to the transceiver. The `#[derive(DotsStruct)]` macro
-    // emits slice entries inside `register_as_published` /
-    // `register_as_subscribed`, anchored by the `publish::<T>` /
-    // `subscribe::<T>` / `container::<T>` call sites so dead-code
-    // elimination culls entries for types the binary never uses (on
-    // ELF with LTO; conservative otherwise — see
+    // Hand the link-time `PUBLISHED_TYPES` / `SUBSCRIBED_TYPES` /
+    // `SUBSCRIBED_FILTERED_TYPES` slices to the transceiver. The
+    // `#[derive(DotsStruct)]` macro emits slice entries inside the
+    // `register_as_*` methods, anchored by the `publish::<T>` /
+    // `subscribe::<T>` / `container::<T>` / `view::<T>` call sites so
+    // dead-code elimination culls entries for types the binary never
+    // uses (on ELF with LTO; conservative otherwise — see
     // `dots_rs_core::registration`). The driver's Phase 1
-    // walks them transitively (registering and shipping every
-    // nested struct/enum descriptor in declaration order) and
-    // Phase 1b emits `DotsMember(Join, T.name)` for each
+    // walks all three lists transitively (registering and shipping
+    // every nested struct/enum descriptor in declaration order) and
+    // Phase 1b emits `DotsMember(Join, T.name)` for each *unfiltered*
     // subscribed type so the broker starts cache replay before
-    // `preloadClientFinished`. Mirrors dots-cpp's `Application`
-    // passing `io::global_subscribe_types()` into
-    // `GuestTransceiver::open`.
+    // `preloadClientFinished`; view types join per-`View`, with the
+    // filter. Mirrors dots-cpp's `Application` passing
+    // `io::global_subscribe_types()` into `GuestTransceiver::open`.
     let published_types = PUBLISHED_TYPES
         .iter()
         .copied()
@@ -531,9 +531,18 @@ where
         .iter()
         .copied()
         .filter(|d| !d.flags.is_internal());
+    let subscribed_filtered_types = SUBSCRIBED_FILTERED_TYPES
+        .iter()
+        .copied()
+        .filter(|d| !d.flags.is_internal());
 
-    let (transceiver, mut driver) =
-        GuestTransceiver::from_connection(registry, conn, published_types, subscribed_types);
+    let (transceiver, mut driver) = GuestTransceiver::from_connection(
+        registry,
+        conn,
+        published_types,
+        subscribed_types,
+        subscribed_filtered_types,
+    );
     // Run the EarlySubscribe phase (descriptor exchange, Join for
     // every subscribed type, finish_preload) before returning, so
     // the connection is in `Connected` state by the time the caller

@@ -59,7 +59,10 @@ fn usage() {
 }
 
 fn print_report(report: &Report, detail: bool) {
-    if !report.has_published_section && !report.has_subscribed_section {
+    if !report.has_published_section
+        && !report.has_subscribed_section
+        && !report.has_subscribed_filtered_section
+    {
         println!("no dots-rs registration sections — not a dots-rs binary?");
         return;
     }
@@ -68,6 +71,7 @@ fn print_report(report: &Report, detail: bool) {
     } else {
         print_names("published", &report.published);
         print_names("subscribed", &report.subscribed);
+        print_names("subscribed (filtered)", &report.subscribed_filtered);
     }
 }
 
@@ -86,6 +90,7 @@ fn print_detail(report: &Report) {
     let groups = [
         ("published", &report.published),
         ("subscribed", &report.subscribed),
+        ("subscribed (filtered)", &report.subscribed_filtered),
     ];
     for (label, types) in groups {
         if types.is_empty() {

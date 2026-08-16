@@ -125,10 +125,11 @@ pub enum StaticTypePolicy {
     /// [`DotsHeader`]: crate::DotsHeader
     InternalOnly,
     /// Internal types plus every compiled-in user type this binary
-    /// declared publish/subscribe intent for — the link-time
-    /// `PUBLISHED_TYPES` / `SUBSCRIBED_TYPES` slices with their
-    /// transitive struct/enum closures. The default, and the right
-    /// choice for clients that publish or subscribe typed values.
+    /// declared publish/subscribe/view intent for — the link-time
+    /// `PUBLISHED_TYPES` / `SUBSCRIBED_TYPES` /
+    /// `SUBSCRIBED_FILTERED_TYPES` slices with their transitive
+    /// struct/enum closures. The default, and the right choice for
+    /// clients that publish or subscribe typed values.
     #[default]
     All,
 }
@@ -263,10 +264,11 @@ impl Registry {
         }
     }
 
-    /// Register every compile-time type the binary declared publish or
-    /// subscribe intent for — the link-time [`PUBLISHED_TYPES`] /
-    /// [`SUBSCRIBED_TYPES`] slices — plus their transitive struct/enum
-    /// closures. The seeding step behind [`StaticTypePolicy::All`];
+    /// Register every compile-time type the binary declared publish,
+    /// subscribe, or view intent for — the link-time
+    /// [`PUBLISHED_TYPES`] / [`SUBSCRIBED_TYPES`] /
+    /// `SUBSCRIBED_FILTERED_TYPES` slices — plus their transitive
+    /// struct/enum closures. The seeding step behind [`StaticTypePolicy::All`];
     /// normally invoked via
     /// [`with_static_types`](Self::with_static_types).
     ///
@@ -283,6 +285,7 @@ impl Registry {
         for d in dots_rs_core::PUBLISHED_TYPES
             .iter()
             .chain(dots_rs_core::SUBSCRIBED_TYPES.iter())
+            .chain(dots_rs_core::SUBSCRIBED_FILTERED_TYPES.iter())
         {
             self.register_struct_static_recursive(d);
         }
