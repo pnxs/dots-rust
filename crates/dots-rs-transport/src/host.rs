@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, Bytes};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use tokio::sync::Mutex as AsyncMutex;
 
 use dots_rs_core::{
@@ -598,9 +598,11 @@ pub struct ConnectionTransition {
 /// `view::<T>(filter)` opens with distinct `subscription_id`s).
 #[derive(Default)]
 struct Group {
-    /// Guest ids that have unfiltered membership in this group.
-    /// Receives transmissions byte-verbatim from the publish path.
-    unfiltered_subs: FxHashSet<u32>,
+    /// Unfiltered members: guest id → writer handle. Receives
+    /// transmissions byte-verbatim from the publish path. Carrying
+    /// the writer here lets the per-frame fan-out enqueue directly,
+    /// without a `guests` lookup per subscriber.
+    unfiltered_subs: FxHashMap<u32, SharedWriter>,
     /// Filtered subscriptions keyed by `(client_id, subscription_id)`.
     /// One guest may hold multiple filtered subs distinguished by id.
     filtered_subs: FxHashMap<(u32, u32), FilteredSub>,
@@ -629,6 +631,9 @@ impl Group {
 struct FilteredSub {
     filter: DotsFilter,
     compiled: CompiledPredicate,
+    /// The subscribing guest's writer handle, so filtered fan-out
+    /// enqueues without a `guests` lookup.
+    writer: SharedWriter,
     /// Cache key-bytes of instances currently in this view. Mapped
     /// from the C++ side's `unordered_set<const Struct*>` to Rust's
     /// stable identity for cached instances (since BTreeMap nodes
@@ -1175,6 +1180,10 @@ impl HostTransceiver {
         exclude_client_id: u32,
     ) {
         let mut inner = self.inner.lock().expect("host mutex poisoned");
+        // One group resolution serves the filtered pass, the cache
+        // check, and the unfiltered pass; `pool` is a disjoint field.
+        let HostInner { groups, pool, .. } = &mut *inner;
+        let mut group = groups.get_mut(type_name);
 
         let is_cached = payload.as_ref().is_some_and(|p| p.flags().is_cached());
         let key_set = payload
@@ -1182,10 +1191,7 @@ impl HostTransceiver {
             .map(|p| p.key_set())
             .unwrap_or(PropertySet::EMPTY);
         let is_remove = header.remove_obj == Some(true);
-        let has_filtered_subs = inner
-            .groups
-            .get(type_name)
-            .is_some_and(|g| !g.filtered_subs.is_empty());
+        let has_filtered_subs = group.as_ref().is_some_and(|g| !g.filtered_subs.is_empty());
 
         let key_bytes_post = payload.as_ref().map(|p| p.key_bytes());
 
@@ -1201,10 +1207,9 @@ impl HostTransceiver {
         // The `visible` bookkeeping applies to cached types only:
         // uncached instances have no identity beyond the single event,
         // so they neither enter a view nor produce leave-view removes.
-        let mut filtered_outbound: Vec<(u32, Bytes)> = Vec::new();
+        let mut filtered_outbound: Vec<(SharedWriter, Bytes)> = Vec::new();
         if has_filtered_subs && payload.is_some() {
-            let HostInner { groups, .. } = &mut *inner;
-            if let Some(group) = groups.get_mut(type_name) {
+            if let Some(group) = group.as_deref_mut() {
                 for ((cid, sub_id), sub) in &mut group.filtered_subs {
                     if *cid == exclude_client_id {
                         continue;
@@ -1232,7 +1237,7 @@ impl HostTransceiver {
                             // payload encode below honours that mask.
                             let mut bytes = Vec::with_capacity(64);
                             encode_transmission_with_mask_into(&h, post, effective, &mut bytes);
-                            filtered_outbound.push((*cid, Bytes::from(bytes)));
+                            filtered_outbound.push((sub.writer.clone(), Bytes::from(bytes)));
                         }
                         (false, true) => {
                             sub.visible.remove(key);
@@ -1243,7 +1248,7 @@ impl HostTransceiver {
                             h.subscription_id = Some(*sub_id);
                             let mut bytes = Vec::with_capacity(64);
                             encode_transmission_with_mask_into(&h, post, key_set, &mut bytes);
-                            filtered_outbound.push((*cid, Bytes::from(bytes)));
+                            filtered_outbound.push((sub.writer.clone(), Bytes::from(bytes)));
                         }
                         (false, false) => {}
                     }
@@ -1263,22 +1268,19 @@ impl HostTransceiver {
             if let Some(p) = payload {
                 let key = key_bytes_post.expect("cached payload always has key bytes");
                 if is_remove {
-                    if let Some(map) = inner.pool.get_mut(type_name) {
+                    if let Some(map) = pool.get_mut(type_name) {
                         map.remove(&key);
                         if map.is_empty() {
-                            inner.pool.remove(type_name);
+                            pool.remove(type_name);
                         }
                     }
                 } else {
                     // Allocate the pool key only for a type's first
                     // instance; the steady state is a plain lookup.
-                    if !inner.pool.contains_key(type_name) {
-                        inner.pool.insert(type_name.to_string(), Default::default());
+                    if !pool.contains_key(type_name) {
+                        pool.insert(type_name.to_string(), Default::default());
                     }
-                    let map = inner
-                        .pool
-                        .get_mut(type_name)
-                        .expect("inserted above if absent");
+                    let map = pool.get_mut(type_name).expect("inserted above if absent");
                     let mask = header.attributes.unwrap_or_else(|| p.valid_set());
                     match map.entry(key) {
                         std::collections::btree_map::Entry::Occupied(mut slot) => {
@@ -1310,23 +1312,19 @@ impl HostTransceiver {
         // Unfiltered fan-out (byte-verbatim). All subscribers share
         // the same refcounted `Bytes`: `clone()` is an Arc bump, no
         // memcpy, so one published frame is one allocation regardless
-        // of subscriber count.
-        let HostInner { groups, guests, .. } = &mut *inner;
-        if let Some(group) = groups.get(type_name) {
-            for &id in &group.unfiltered_subs {
+        // of subscriber count. The group carries each member's writer,
+        // so no per-subscriber `guests` lookup.
+        if let Some(group) = group {
+            for (&id, writer) in &group.unfiltered_subs {
                 if id == exclude_client_id {
                     continue;
                 }
-                if let Some(record) = guests.get(&id) {
-                    record.write_half.enqueue(raw_frame.clone());
-                }
+                writer.enqueue(raw_frame.clone());
             }
         }
 
-        for (cid, bytes) in filtered_outbound {
-            if let Some(record) = guests.get(&cid) {
-                record.write_half.enqueue(bytes);
-            }
+        for (writer, bytes) in filtered_outbound {
+            writer.enqueue(bytes);
         }
     }
 
@@ -1348,13 +1346,11 @@ impl HostTransceiver {
         let Some(group) = inner.groups.get(type_name) else {
             return;
         };
-        for &id in &group.unfiltered_subs {
+        for (&id, writer) in &group.unfiltered_subs {
             if id == exclude_client_id {
                 continue;
             }
-            if let Some(record) = inner.guests.get(&id) {
-                record.write_half.enqueue(bytes.clone());
-            }
+            writer.enqueue(bytes.clone());
         }
     }
 
@@ -1367,12 +1363,16 @@ impl HostTransceiver {
 
     fn join_group(&self, client_id: u32, group_name: &str) {
         let mut inner = self.inner.lock().expect("host mutex poisoned");
-        inner
-            .groups
+        let HostInner { groups, guests, .. } = &mut *inner;
+        let Some(writer) = guests.get(&client_id).map(|r| r.write_half.clone()) else {
+            tracing::warn!(client_id, group_name, "join for unknown guest; dropping");
+            return;
+        };
+        groups
             .entry(group_name.to_string())
             .or_default()
             .unfiltered_subs
-            .insert(client_id);
+            .insert(client_id, writer);
     }
 
     /// Replay the cached entries for `type_name` to the guest with
@@ -1521,13 +1521,6 @@ impl HostTransceiver {
             }
         };
 
-        // Build the FilteredSub, populate `visible` during preload.
-        let mut sub = FilteredSub {
-            filter: filter.clone(),
-            compiled,
-            visible: HashSet::new(),
-        };
-
         // Compute the key-set + projection mask once.
         let mut key_set = PropertySet::EMPTY;
         for p in &descriptor.properties {
@@ -1546,7 +1539,7 @@ impl HostTransceiver {
             let mut out = Vec::new();
             if let Some(map) = inner.pool.get(group_name) {
                 for (k, e) in map.iter() {
-                    if matches_payload(&sub.compiled, &e.payload) {
+                    if matches_payload(&compiled, &e.payload) {
                         let attrs = e.attributes;
                         let effective = (project | key_set) & attrs;
                         // `from_cache` is assigned the descending
@@ -1567,7 +1560,21 @@ impl HostTransceiver {
             (writer, out)
         };
 
-        // Populate `visible` to reflect what we just preloaded.
+        // Guest already gone — nothing to subscribe or replay to.
+        // Bailing before the insert also means a disconnect racing
+        // this join can't leave a stale sub behind.
+        let Some(writer) = writer else {
+            return;
+        };
+
+        // Build the FilteredSub; `visible` reflects what we just
+        // preloaded.
+        let mut sub = FilteredSub {
+            filter: filter.clone(),
+            compiled,
+            writer: writer.clone(),
+            visible: HashSet::new(),
+        };
         for (_, _, k) in &matches {
             sub.visible.insert(k.clone());
         }
@@ -1587,10 +1594,6 @@ impl HostTransceiver {
                 .filtered_subs
                 .insert((client_id, subscription_id), sub);
         }
-
-        let Some(writer) = writer else {
-            return;
-        };
 
         // Stream matched entries with descending `from_cache`
         // countdown, terminated by `DotsCacheInfo{end_transmission}`.
