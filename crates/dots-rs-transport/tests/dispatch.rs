@@ -22,7 +22,7 @@ use dots_rs_core::{DynamicStructDescriptor, StructValue, dots};
 use dots_rs_model::*;
 use dots_rs_model::{
     DotsHeader, DotsMsgConnectResponse, DotsMsgHello, Registry, Transmission,
-    encode_transmission, registry_with_internal_types,
+    encode_transmission, StaticTypePolicy,
 };
 use dots_rs_transport::{
     Connection, Event, GuestDriver, GuestTransceiver, Operation, Subscription,
@@ -48,7 +48,7 @@ mod model {
 use model::*;
 
 fn registry() -> Arc<Registry> {
-    let reg = registry_with_internal_types();
+    let reg = Registry::with_static_types(StaticTypePolicy::All);
     reg.register_struct_static(Pinger::DESCRIPTOR);
     Arc::new(reg)
 }
@@ -115,7 +115,7 @@ async fn connect_guest() -> (
         .await
         .expect("handshake succeeds");
     let framed = server.await.unwrap();
-    let (transceiver, driver) = GuestTransceiver::from_connection(reg, conn, [], []);
+    let (transceiver, driver) = GuestTransceiver::from_connection(reg, conn, [], [], []);
     (transceiver, driver, framed)
 }
 

@@ -20,12 +20,13 @@
 //! `dotsd` use case: a process learns about user-defined types it has
 //! never compiled against, then routes their instances.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
+
+use rustc_hash::FxHashMap;
 
 use dots_rs_core::{
     AnyObject, AnyStruct, DynamicEnumDescriptor, DynamicEnumElement, DynamicFieldKind,
-    DynamicPropertyDescriptor, DynamicStruct, DynamicStructDescriptor, EnumDescriptor,
+    DynamicPropertyDescriptor, DynamicStruct, DynamicStructDescriptor, EnumDescriptor, FieldKind,
     StructDescriptor, StructFlags,
 };
 
@@ -109,6 +110,30 @@ impl core::fmt::Display for FromAnyError {
 
 impl std::error::Error for FromAnyError {}
 
+/// Which compile-time types a [`Registry`] starts with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StaticTypePolicy {
+    /// Fundamental types only. Fundamentals are resolved natively by
+    /// the codec and never live in the registry, so this yields an
+    /// empty registry — same as [`Registry::new`].
+    FundamentalOnly,
+    /// The DOTS-internal types (handshake messages, [`DotsHeader`],
+    /// descriptor-data types, daemon records, …) but no user types.
+    /// For processes that learn every user type from the wire —
+    /// brokers and inspection tools.
+    ///
+    /// [`DotsHeader`]: crate::DotsHeader
+    InternalOnly,
+    /// Internal types plus every compiled-in user type this binary
+    /// declared publish/subscribe/view intent for — the link-time
+    /// `PUBLISHED_TYPES` / `SUBSCRIBED_TYPES` /
+    /// `SUBSCRIBED_FILTERED_TYPES` slices with their transitive
+    /// struct/enum closures. The default, and the right choice for
+    /// clients that publish or subscribe typed values.
+    #[default]
+    All,
+}
+
 /// A name-keyed registry of [`DescriptorEntry`]s.
 ///
 /// Uses interior `RwLock` mutability so registrations can happen via
@@ -121,21 +146,60 @@ impl std::error::Error for FromAnyError {}
 /// layout-compatible decode path when one is available.
 #[derive(Debug, Default)]
 pub struct Registry {
-    entries: RwLock<BTreeMap<String, DescriptorEntry>>,
-    static_structs: RwLock<BTreeMap<String, &'static StructDescriptor>>,
+    entries: RwLock<FxHashMap<String, DescriptorEntry>>,
+    static_structs: RwLock<FxHashMap<String, &'static StructDescriptor>>,
 }
 
 impl Registry {
+    /// An empty registry. Prefer [`with_static_types`](Self::with_static_types)
+    /// for anything that talks to a broker — an empty registry cannot
+    /// even decode the handshake.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry pre-populated according to `policy`. See
+    /// [`StaticTypePolicy`] for what each level seeds.
+    pub fn with_static_types(policy: StaticTypePolicy) -> Self {
+        let reg = Self::new();
+        match policy {
+            StaticTypePolicy::FundamentalOnly => {}
+            StaticTypePolicy::InternalOnly => crate::register_dots_internal_types(&reg),
+            StaticTypePolicy::All => {
+                crate::register_dots_internal_types(&reg);
+                reg.register_global_types();
+            }
+        }
+        reg
     }
 
     /// Register a compile-time struct descriptor by name. The static
     /// descriptor is projected into its dynamic form once and stored
     /// behind an `Arc` — subsequent lookups are cheap.
     ///
-    /// Existing entries with the same name are silently overwritten.
-    pub fn register_struct_static(&self, d: &'static StructDescriptor) {
+    /// Idempotent when `d` is already the registered static descriptor
+    /// for its name: `DynamicStruct` operations compare descriptors by
+    /// `Arc` identity, so the existing dynamic projection (and every
+    /// value decoded against it) must remain the canonical one across
+    /// repeated registrations.
+    ///
+    /// Entries for the same name registered from a *different*
+    /// descriptor — a wire-learned dynamic entry being promoted to
+    /// static, or a conflicting static definition — are silently
+    /// overwritten.
+    ///
+    /// Returns `true` if the descriptor was (re-)inserted, `false` if
+    /// `d` was already the registered static descriptor for its name.
+    /// Since registration always walks a descriptor's full property
+    /// tree, `false` also implies every type reachable from `d` is
+    /// registered — callers use this to prune recursive walks.
+    pub fn register_struct_static(&self, d: &'static StructDescriptor) -> bool {
+        if self
+            .lookup_static_struct(d.name)
+            .is_some_and(|prev| core::ptr::eq(prev, d))
+        {
+            return false;
+        }
         let arc = Arc::new(DynamicStructDescriptor::from_static(d));
         self.entries
             .write()
@@ -145,6 +209,7 @@ impl Registry {
             .write()
             .expect("registry poisoned")
             .insert(d.name.into(), d);
+        true
     }
 
     /// Look up the static descriptor for a registered type, if one
@@ -166,6 +231,64 @@ impl Registry {
             .write()
             .expect("registry poisoned")
             .insert(d.name.into(), DescriptorEntry::Enum(arc));
+    }
+
+    /// Register `d` and every struct/enum descriptor reachable through
+    /// its property tree.
+    ///
+    /// The registry itself is the visited set: [`register_struct_static`]
+    /// returns `false` when this exact descriptor is already registered,
+    /// which — because this walk always covers the full tree — means its
+    /// subtree is registered too, so recursion stops there. Repeated
+    /// calls cost one root lookup.
+    ///
+    /// [`register_struct_static`]: Self::register_struct_static
+    pub fn register_struct_static_recursive(&self, d: &'static StructDescriptor) {
+        // Register-before-recurse is what terminates cycles in recursive
+        // types (`Node { children: Vec<Node> }`): by the time the walk
+        // loops back to `d`, it is already registered.
+        if !self.register_struct_static(d) {
+            return;
+        }
+        for prop in d.properties {
+            self.register_field_kind_static(&prop.kind);
+        }
+    }
+
+    fn register_field_kind_static(&self, kind: &FieldKind) {
+        match kind {
+            FieldKind::Struct(d) => self.register_struct_static_recursive(d),
+            FieldKind::Enum(e) => self.register_enum_static(e),
+            FieldKind::Vec(inner) => self.register_field_kind_static(inner),
+            _ => {}
+        }
+    }
+
+    /// Register every compile-time type the binary declared publish,
+    /// subscribe, or view intent for — the link-time
+    /// [`PUBLISHED_TYPES`] / [`SUBSCRIBED_TYPES`] /
+    /// `SUBSCRIBED_FILTERED_TYPES` slices — plus their transitive
+    /// struct/enum closures. The seeding step behind [`StaticTypePolicy::All`];
+    /// normally invoked via
+    /// [`with_static_types`](Self::with_static_types).
+    ///
+    /// Without LTO the slices retain every derived type linked into
+    /// the binary, not just the ones actually used. That is harmless
+    /// here — extra registry entries only widen what the codec can
+    /// decode; broker-facing descriptor announcements are governed by
+    /// a transceiver's explicit publish/subscribe lists, unaffected by
+    /// this call.
+    ///
+    /// [`PUBLISHED_TYPES`]: dots_rs_core::PUBLISHED_TYPES
+    /// [`SUBSCRIBED_TYPES`]: dots_rs_core::SUBSCRIBED_TYPES
+    pub fn register_global_types(&self) {
+        for d in dots_rs_core::PUBLISHED_TYPES
+            .iter()
+            .chain(dots_rs_core::SUBSCRIBED_TYPES.iter())
+            .chain(dots_rs_core::SUBSCRIBED_FILTERED_TYPES.iter())
+        {
+            self.register_struct_static_recursive(d);
+        }
     }
 
     /// Register a runtime-received struct descriptor.
@@ -234,7 +357,8 @@ impl Registry {
     /// owned `Vec` so callers don't have to hold the registry lock
     /// while iterating.
     pub fn iter_structs(&self) -> Vec<Arc<dots_rs_core::DynamicStructDescriptor>> {
-        self.entries
+        let mut v: Vec<_> = self
+            .entries
             .read()
             .expect("registry poisoned")
             .values()
@@ -242,12 +366,16 @@ impl Registry {
                 DescriptorEntry::Struct(d) => Some(d.clone()),
                 _ => None,
             })
-            .collect()
+            .collect();
+        // Deterministic name order — the entry map itself is unordered.
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
     }
 
     /// Snapshot of all registered enum descriptors.
     pub fn iter_enums(&self) -> Vec<Arc<dots_rs_core::DynamicEnumDescriptor>> {
-        self.entries
+        let mut v: Vec<_> = self
+            .entries
             .read()
             .expect("registry poisoned")
             .values()
@@ -255,7 +383,9 @@ impl Registry {
                 DescriptorEntry::Enum(d) => Some(d.clone()),
                 _ => None,
             })
-            .collect()
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
     }
 
     // ----- Reverse conversion -----

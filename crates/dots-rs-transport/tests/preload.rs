@@ -22,7 +22,7 @@ use dots_rs_core::{StructValue, decode_typed_from_slice, dots, encode_to_vec};
 use dots_rs_model::{
     DotsConnectionState, DotsHeader, DotsMsgConnect, DotsMsgConnectResponse, DotsMsgHello,
     Registry, StructDescriptorData, Transmission, encode_transmission,
-    registry_with_internal_types,
+    StaticTypePolicy,
 };
 #[allow(unused_imports)]
 use dots_rs_model::*;
@@ -48,7 +48,7 @@ mod model {
 use model::*;
 
 fn registry() -> Arc<Registry> {
-    let reg = registry_with_internal_types();
+    let reg = Registry::with_static_types(StaticTypePolicy::All);
     reg.register_struct_static(Pinger::DESCRIPTOR);
     Arc::new(reg)
 }
@@ -237,6 +237,7 @@ async fn builder_with_preload_lands_in_early_subscribe_then_finishes() {
         conn,
         [Pinger::DESCRIPTOR],
         [Pinger::DESCRIPTOR],
+        [],
     );
     let mut sub = gt.subscribe_stream::<Pinger>();
     let driver_handle = tokio::spawn(driver.run());
@@ -392,6 +393,7 @@ async fn driver_ships_enum_descriptors_before_struct_descriptors() {
         conn,
         [Painted::DESCRIPTOR],
         std::iter::empty(),
+        [],
     );
     let driver_handle = tokio::spawn(driver.run());
     gt.exit();
@@ -438,6 +440,7 @@ async fn container_after_early_subscribe_contains_cache_replay() {
         conn,
         [Pinger::DESCRIPTOR],
         [Pinger::DESCRIPTOR],
+        [],
     );
 
     // No subscription installed yet — match the user's reported

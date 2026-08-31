@@ -55,7 +55,9 @@ pub use layout::{
     encode_key_into, encode_to_vec, equal, expect_properties, has_properties, key_set, same,
 };
 pub use property_set::PropertySet;
-pub use registration::{GlobalRegistration, PUBLISHED_TYPES, SUBSCRIBED_TYPES};
+pub use registration::{
+    GlobalRegistration, PUBLISHED_TYPES, SUBSCRIBED_FILTERED_TYPES, SUBSCRIBED_TYPES,
+};
 pub use temporal::{Duration, Timepoint};
 pub use value::{Publishable, StructValue, Transmittable};
 

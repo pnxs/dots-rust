@@ -15,7 +15,7 @@ use std::sync::Arc;
 use dots_rs_core::{PropertySet, StructValue, decode_typed_from_slice, dots, encode_to_vec};
 use dots_rs_model::{
     DotsHeader, DotsMsgConnectResponse, DotsMsgHello, Registry, Transmission,
-    encode_transmission, registry_with_internal_types,
+    encode_transmission, StaticTypePolicy,
 };
 #[allow(unused_imports)]
 use dots_rs_model::*;
@@ -48,7 +48,7 @@ mod model {
 use model::*;
 
 fn registry() -> Arc<Registry> {
-    let reg = registry_with_internal_types();
+    let reg = Registry::with_static_types(StaticTypePolicy::InternalOnly);
     reg.register_struct_static(Pinger::DESCRIPTOR);
     reg.register_struct_static(Bonk::DESCRIPTOR);
     Arc::new(reg)

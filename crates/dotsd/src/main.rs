@@ -58,7 +58,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cleanup_interval,
     } = parse_args()?;
 
-    let host = HostTransceiver::new(daemon_name.clone());
+    // The broker learns user types exclusively from the descriptors
+    // its guests publish.
+    let host = HostTransceiver::with_registry(
+        daemon_name.clone(),
+        Arc::new(Registry::with_static_types(StaticTypePolicy::InternalOnly)),
+    );
 
     // Install the transition handler before endpoints start
     // accepting, so the very first guest's `Connect` already fires

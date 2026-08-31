@@ -144,36 +144,57 @@ pub struct GuestTransceiver {
     /// `subscribe::<T>` / `container::<T>` doesn't emit a duplicate
     /// Join. Mirrors dots-cpp's `m_preloadSubscribeTypes`.
     subscribe_types: Mutex<Vec<&'static StructDescriptor>>,
+    /// Types this transceiver opens filtered subscriptions
+    /// (`View<T>`) on. Their descriptors ship during EarlySubscribe
+    /// like the other two lists, but no `DotsMember(Join)` is emitted
+    /// — routing is established per-`View`, with the filter, when the
+    /// view opens.
+    subscribe_filtered_types: Mutex<Vec<&'static StructDescriptor>>,
 }
 
 impl GuestTransceiver {
     /// Build a guest from an established [`Connection`]. Returns the
     /// shared transceiver and a separable I/O driver.
     ///
-    /// `published_types` and `subscribed_types` declare the static
-    /// types this guest will publish and subscribe to. The
-    /// [`GuestDriver`] ships their descriptors (and any transitively
-    /// referenced struct/enum descriptors) to the broker during the
-    /// EarlySubscribe phase, then publishes a `DotsMember(Join)` for
-    /// each subscribed type so the broker can start cache replay
-    /// before `preloadClientFinished`. Mirrors the
-    /// `preloadPublishTypes` / `preloadSubscribeTypes` arguments of
-    /// dots-cpp's `GuestTransceiver::open`.
+    /// `published_types`, `subscribed_types`, and
+    /// `subscribed_filtered_types` declare the static types this guest
+    /// will publish, subscribe to, and open filtered views on. The
+    /// [`GuestDriver`] ships all their descriptors (and any
+    /// transitively referenced struct/enum descriptors) to the broker
+    /// during the EarlySubscribe phase, then publishes a
+    /// `DotsMember(Join)` for each entry of `subscribed_types` — and
+    /// only those — so the broker can start cache replay before
+    /// `preloadClientFinished`. Filtered-view types get no unfiltered
+    /// join; each `View` announces its own filtered join when it
+    /// opens. Mirrors the `preloadPublishTypes` /
+    /// `preloadSubscribeTypes` arguments of dots-cpp's
+    /// `GuestTransceiver::open`.
+    ///
+    /// `registry` should normally be built with
+    /// [`StaticTypePolicy::All`](dots_rs_model::StaticTypePolicy):
+    /// `container::<T>` / `publish` / `view::<T>` perform no codec
+    /// registration of their own — they rely on every compiled-in
+    /// type having been seeded at registry construction. With a
+    /// leaner policy, only the types passed in the lists here
+    /// (registered during EarlySubscribe) and types learned from wire
+    /// descriptors are decodable.
     ///
     /// The driver must be polled (typically via
     /// [`GuestDriver::run`]) to actually exchange traffic with the
     /// broker — until then, publishes will queue and incoming
     /// transmissions will not be observed.
-    pub fn from_connection<S, P, U>(
+    pub fn from_connection<S, P, U, V>(
         registry: Arc<Registry>,
         conn: Connection<S>,
         published_types: P,
         subscribed_types: U,
+        subscribed_filtered_types: V,
     ) -> (Arc<Self>, GuestDriver<S>)
     where
         S: AsyncRead + AsyncWrite + Unpin,
         P: IntoIterator<Item = &'static StructDescriptor>,
         U: IntoIterator<Item = &'static StructDescriptor>,
+        V: IntoIterator<Item = &'static StructDescriptor>,
     {
         let dispatch = conn.dispatch_handle();
         let client_id = conn.client_id();
@@ -184,6 +205,8 @@ impl GuestTransceiver {
             published_types.into_iter().collect();
         let subscribe_types: Vec<&'static StructDescriptor> =
             subscribed_types.into_iter().collect();
+        let subscribe_filtered_types: Vec<&'static StructDescriptor> =
+            subscribed_filtered_types.into_iter().collect();
 
         // Pre-bump joined_groups for every subscribed type so a later
         // user-side `subscribe::<T>` / `container::<T>` increments to 2
@@ -211,6 +234,7 @@ impl GuestTransceiver {
             next_subscription_id: AtomicU32::new(1),
             publish_types: Mutex::new(publish_types),
             subscribe_types: Mutex::new(subscribe_types),
+            subscribe_filtered_types: Mutex::new(subscribe_filtered_types),
         });
         let driver = GuestDriver {
             transceiver: transceiver.clone(),
@@ -262,19 +286,6 @@ impl GuestTransceiver {
     /// Allocate a fresh `subscription_id`. Process-local, monotonic.
     pub(crate) fn allocate_subscription_id(&self) -> u32 {
         self.next_subscription_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Register T's descriptor so the host can decode T's payload —
-    /// needed by `View<T>` which is opened after the early-handshake
-    /// descriptor exchange has ended.
-    pub(crate) fn ensure_struct_descriptor<T: StructValue>(&self) {
-        self.register_struct::<T>();
-    }
-
-    /// Shared handle on the dispatch state — used by `View<T>`'s
-    /// container construction.
-    pub(crate) fn dispatch_handle_ref(&self) -> &Arc<Mutex<DispatchState>> {
-        &self.dispatch
     }
 
     /// Insert a `Weak<dyn ViewDispatch>` into the demux table under
@@ -469,20 +480,21 @@ impl GuestTransceiver {
         }
     }
 
-    /// Subscribe to type-system events: every `StructDescriptorData`
-    /// arriving on the wire is passed to `handler` as the
+    /// Subscribe to type-system events: `handler` is invoked exactly
+    /// once per struct type name — synchronously for each
+    /// currently-registered struct descriptor before this returns
+    /// (catch-up replay), then for every *previously unknown* type
+    /// whose `StructDescriptorData` arrives on the wire, as the
     /// [`DynamicStructDescriptor`] the codec registry holds for it.
     /// (Registration itself happens unconditionally in the receive
-    /// path — the mirror of dots-cpp `Channel::importDependencies` —
-    /// before the transmission is dispatched here, so the handler
+    /// path before the transmission is dispatched here, so the handler
     /// always sees the same `Arc` the codec decodes against.)
-    /// Additionally, `handler` is invoked synchronously for each
-    /// currently-registered struct descriptor before this returns
-    /// (catch-up replay), so a fresh subscriber sees what's already
-    /// known plus everything that arrives afterwards.
     ///
-    /// Mirrors dots-cpp's `subscribe<StructDescriptor>` /
-    /// `DynamicTypeReceiver` pattern. Combine with
+    /// A re-arriving descriptor for a known name — e.g. the broker
+    /// echoing back a compiled-in type this guest announced — does
+    /// **not** re-fire the handler.
+    ///
+    /// Combine with
     /// [`subscribe_dynamic`](Self::subscribe_dynamic) and
     /// [`publish`](Self::publish) (with
     /// [`DynamicStruct::try_as_publishable`](dots_rs_core::DynamicStruct::try_as_publishable))
@@ -492,10 +504,12 @@ impl GuestTransceiver {
         F: FnMut(&Arc<DynamicStructDescriptor>) + Send + 'static,
     {
         let handler = Arc::new(Mutex::new(handler));
+        let mut seen: HashSet<String> = HashSet::new();
 
         {
             let mut h = handler.lock().expect("handler mutex poisoned");
             for desc in self.registry.iter_structs() {
+                seen.insert(desc.name.clone());
                 h(&desc);
             }
         }
@@ -513,7 +527,11 @@ impl GuestTransceiver {
             let Some(name) = event.updated().name.clone() else {
                 return;
             };
+            if seen.contains(&name) {
+                return;
+            }
             if let Some(dots_rs_model::DescriptorEntry::Struct(d)) = registry.lookup(&name) {
+                seen.insert(name);
                 if let Ok(mut h) = handler_for_wire.lock() {
                     h(&d);
                 }
@@ -582,9 +600,11 @@ impl GuestTransceiver {
     where
         T: StructValue + Send + Sync + 'static + dots_rs_core::GlobalRegistration,
     {
+        // Runtime no-op: anchors T's SUBSCRIBED_TYPES slice entry
+        // against dead-code elimination, so a registry built with
+        // `StaticTypePolicy::All` is guaranteed to have covered T.
         T::register_as_subscribed();
         let descriptor = T::type_descriptor();
-        self.register_struct::<T>();
         let dyn_container = self.get_or_create_dyn_container(descriptor);
         Container::<T>::from_dyn(dyn_container)
     }
@@ -688,15 +708,13 @@ impl GuestTransceiver {
     /// the call site for typed values; for runtime-described values,
     /// `try_as_publishable` returns `NotPublishable::SubstructOnly`.
     ///
-    /// For typed values, the underlying type's descriptor is
-    /// auto-registered with the broker. Runtime-described values
-    /// return `None` from `static_descriptor()` and the caller is
-    /// responsible for descriptor registration.
     pub fn publish<P: Publishable>(&self, value: &P) {
+        // Anchors P's PUBLISHED_TYPES slice entry (runtime no-op); the
+        // codec registration itself happens at registry construction
+        // (`StaticTypePolicy::All`). For runtime-described values this
+        // is the default no-op impl and the caller is responsible for
+        // having the type registered.
         P::register_as_published();
-        if let Some(d) = value.static_descriptor() {
-            self.register_struct_descriptor(d);
-        }
         let header = dots!(DotsHeader {
             type_name: value.type_name(),
             attributes: value.valid_set(),
@@ -746,9 +764,6 @@ impl GuestTransceiver {
     /// [`AnyStruct::copy_from`]: dots_rs_core::AnyStruct::copy_from
     pub fn publish_with_mask<P: Publishable>(&self, value: &P, included: PropertySet) {
         P::register_as_published();
-        if let Some(d) = value.static_descriptor() {
-            self.register_struct_descriptor(d);
-        }
         let mask = included | value.key_set();
         let header = dots!(DotsHeader {
             type_name: value.type_name(),
@@ -769,9 +784,6 @@ impl GuestTransceiver {
     /// Mirrors C++ `transceiver.remove(instance)`.
     pub fn remove<P: Publishable>(&self, value: &P) {
         P::register_as_published();
-        if let Some(d) = value.static_descriptor() {
-            self.register_struct_descriptor(d);
-        }
         let mask = value.key_set();
         let header = dots!(DotsHeader {
             type_name: value.type_name(),
@@ -825,21 +837,6 @@ impl GuestTransceiver {
     pub fn exit(&self) {
         self.exit_flag.store(true, Ordering::Release);
         self.exit_notify.notify_waiters();
-    }
-
-    fn register_struct<T: StructValue + 'static>(&self) {
-        self.register_struct_descriptor(T::type_descriptor());
-    }
-
-    /// Register a struct descriptor (and any nested struct/enum
-    /// descriptors it references) with the codec registry so incoming
-    /// wire transmissions can be decoded. Does **not** schedule the
-    /// descriptor for transmission to the broker — descriptor exchange
-    /// is driven exclusively by the `publish_types` / `subscribe_types`
-    /// lists passed to [`Self::from_connection`].
-    fn register_struct_descriptor(&self, descriptor: &'static StructDescriptor) {
-        let mut seen = HashSet::new();
-        register_struct_in_registry(&self.registry, descriptor, &mut seen);
     }
 
     /// Increment the per-group subscriber count, publishing
@@ -974,12 +971,23 @@ where
             .lock()
             .expect("subscribe_types mutex poisoned")
             .clone();
+        let subscribe_filtered_types = self
+            .transceiver
+            .subscribe_filtered_types
+            .lock()
+            .expect("subscribe_filtered_types mutex poisoned")
+            .clone();
         let mut structs_to_send: Vec<&'static StructDescriptor> = Vec::new();
         let mut enums_to_send: Vec<&'static EnumDescriptor> = Vec::new();
         {
             let mut seen_structs: HashSet<usize> = HashSet::new();
             let mut seen_enums: HashSet<usize> = HashSet::new();
-            for d in publish_types.iter().chain(subscribe_types.iter()).copied() {
+            for d in publish_types
+                .iter()
+                .chain(subscribe_types.iter())
+                .chain(subscribe_filtered_types.iter())
+                .copied()
+            {
                 collect_descriptor_send_order(
                     d,
                     &mut seen_structs,
@@ -1101,8 +1109,8 @@ where
                 maybe_in = stream.next() => match maybe_in {
                     Some(Ok(mut txn)) => {
                         tracing::trace!(
-                            type_name = ?txn.header.type_name,
-                            sender = ?txn.header.sender,
+                            header = ?txn.header,
+                            payload = ?txn.payload,
                             "dispatching incoming transmission"
                         );
                         // Decide `is_from_myself` on the receiving side
@@ -1206,39 +1214,6 @@ fn collect_field_kind_send_order(
             structs_to_send,
             enums_to_send,
         ),
-        _ => {}
-    }
-}
-
-/// Recursively register `descriptor` and every struct/enum reachable
-/// through its property tree with the codec registry. Used by the
-/// runtime `register_struct_descriptor` path so types pulled in by
-/// `publish` / `container::<T>` / `view::<T>` can be decoded when they
-/// arrive on the wire — even if the caller didn't include them in
-/// [`GuestTransceiver::from_connection`]'s publish/subscribe lists.
-fn register_struct_in_registry(
-    registry: &Registry,
-    descriptor: &'static StructDescriptor,
-    seen: &mut HashSet<usize>,
-) {
-    if !seen.insert(descriptor as *const _ as usize) {
-        return;
-    }
-    registry.register_struct_static(descriptor);
-    for prop in descriptor.properties {
-        register_field_kind_in_registry(registry, &prop.kind, seen);
-    }
-}
-
-fn register_field_kind_in_registry(
-    registry: &Registry,
-    kind: &FieldKind,
-    seen: &mut HashSet<usize>,
-) {
-    match kind {
-        FieldKind::Struct(d) => register_struct_in_registry(registry, d, seen),
-        FieldKind::Enum(e) => registry.register_enum_static(e),
-        FieldKind::Vec(inner) => register_field_kind_in_registry(registry, inner, seen),
         _ => {}
     }
 }

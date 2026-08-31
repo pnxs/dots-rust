@@ -16,6 +16,7 @@ dots-rs-core.workspace = true
 dots-rs-derive.workspace = true
 
 bytes.workspace = true
+rustc-hash.workspace = true
 
 [lints]
 workspace = true

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dots_rs_core::dots;
-use dots_rs_model::{Registry, filter::predicate, registry_with_internal_types};
+use dots_rs_model::{Registry, StaticTypePolicy, filter::predicate};
 use dots_rs_transport::{ConnectionBuilder, GuestTransceiver, HostTransceiver, ViewOp};
 
 mod model {
@@ -27,7 +27,7 @@ mod model {
 use model::*;
 
 fn registry() -> Arc<Registry> {
-    Arc::new(registry_with_internal_types())
+    Arc::new(Registry::with_static_types(StaticTypePolicy::All))
 }
 
 #[tokio::test]
@@ -54,6 +54,7 @@ async fn view_four_cases_enter_update_leave_reenter() {
     let (gt_a, driver_a) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_a,
+        [],
         [],
         [],
     );
@@ -99,6 +100,7 @@ async fn view_four_cases_enter_update_leave_reenter() {
         registry.clone(),
         conn_b,
         [Pinger::DESCRIPTOR],
+        [],
         [],
     );
     let driver_b_handle = tokio::spawn(driver_b.run());
@@ -165,6 +167,185 @@ async fn view_four_cases_enter_update_leave_reenter() {
     let _ = tokio::time::timeout(Duration::from_secs(1), driver_b_handle).await;
 }
 
+/// The `subscribed_filtered_types` list announces the type's
+/// descriptor during EarlySubscribe but does NOT join its group: the
+/// broker must not preload or fan out unfiltered transmissions to
+/// this guest. Routing starts only when the `View` opens, with the
+/// filter.
+#[tokio::test]
+async fn filtered_list_ships_descriptor_without_group_join() {
+    // InternalOnly host: doesn't know Pinger, so learning it proves
+    // the filtered list shipped the descriptor.
+    let host = HostTransceiver::with_registry(
+        "filtered-list-host",
+        Arc::new(Registry::with_static_types(StaticTypePolicy::InternalOnly)),
+    );
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+
+    let (host_io, guest_io) = tokio::io::duplex(16384);
+    host.accept(host_io);
+    let conn = ConnectionBuilder::new(guest_io, "view-only-guest", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    let (gt, driver) = GuestTransceiver::from_connection(
+        registry.clone(),
+        conn,
+        [],
+        [],
+        [Pinger::DESCRIPTOR],
+    );
+    let driver_handle = tokio::spawn(driver.run());
+
+    // Descriptor arrives at the broker...
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.registry().lookup("Pinger").is_some() {
+            break;
+        }
+    }
+    assert!(
+        host.registry().lookup("Pinger").is_some(),
+        "filtered list must ship the descriptor during EarlySubscribe"
+    );
+    // ...but no group membership was established.
+    assert_eq!(
+        host.group_size("Pinger"),
+        0,
+        "filtered list must not join the group"
+    );
+
+    // Opening the View establishes the (filtered) membership.
+    let view = gt
+        .view::<Pinger>(predicate(Pinger::SEQUENCE.lt(100_u64)).build())
+        .expect("broker should support filtered subscriptions");
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("Pinger") >= 1 {
+            break;
+        }
+    }
+    assert_eq!(host.group_size("Pinger"), 1);
+
+    drop(view);
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+}
+
+/// A guest that holds BOTH an unfiltered subscription and a View on
+/// the same type (publisher-and-subscriber in one process, the
+/// `dots-pinger-filtered` demo scenario). The unfiltered echoes carry
+/// full, unprojected state; they must never reach the view's
+/// container, which is fed exclusively through the `subscription_id`
+/// demux.
+///
+/// Regression: the view container used to be registered for
+/// type-name dispatch, so the unfiltered echo pre-created the key
+/// (enter classified as Update instead of Create) and merged the
+/// out-of-range update into the view — the leave-view event then
+/// carried the updated values (sequence=150, message set) instead of
+/// the last in-view projected state.
+#[tokio::test]
+async fn view_ignores_unfiltered_traffic_on_same_guest() {
+    let host = HostTransceiver::new("mixed-host");
+    let registry = registry();
+    registry.register_struct_static(Pinger::DESCRIPTOR);
+    host.registry().register_struct_static(Pinger::DESCRIPTOR);
+
+    let (host_io, guest_io) = tokio::io::duplex(16384);
+    host.accept(host_io);
+    let conn = ConnectionBuilder::new(guest_io, "mixed-guest", registry.clone())
+        .preload(false)
+        .connect()
+        .await
+        .unwrap();
+    // Publisher AND unfiltered subscriber: the subscribe list makes
+    // Phase 1b join the "Pinger" group, so every own publish echoes
+    // back byte-verbatim with full properties.
+    let (gt, driver) = GuestTransceiver::from_connection(
+        registry.clone(),
+        conn,
+        [Pinger::DESCRIPTOR],
+        [Pinger::DESCRIPTOR],
+        [],
+    );
+    let driver_handle = tokio::spawn(driver.run());
+
+    let view = gt
+        .view::<Pinger>(
+            predicate(Pinger::SEQUENCE.lt(100_u64))
+                .project(Pinger::PROP_ID | Pinger::PROP_SEQUENCE)
+                .build(),
+        )
+        .expect("broker should support filtered subscriptions");
+
+    // (op, id, sequence, message-is-set)
+    type Seen = Arc<Mutex<Vec<(ViewOp, Option<u32>, Option<u64>, bool)>>>;
+    let observed: Seen = Arc::new(Mutex::new(Vec::new()));
+    let observed_for_handler = observed.clone();
+    let _sub = view.subscribe(move |event| {
+        observed_for_handler.lock().unwrap().push((
+            event.op,
+            event.value.id,
+            event.value.sequence,
+            event.value.message.is_some(),
+        ));
+    });
+
+    // Unfiltered join (Phase 1b) + filtered sub must both be live.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if host.group_size("Pinger") >= 2 {
+            break;
+        }
+    }
+    assert!(host.group_size("Pinger") >= 2);
+
+    let key = 7u32;
+    for seq in [50u64, 75, 150, 42] {
+        gt.publish(&dots!(Pinger {
+            id: key,
+            message: "unprojected",
+            sequence: seq,
+        }));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if observed.lock().unwrap().len() >= 4 {
+            break;
+        }
+    }
+
+    let got = observed.lock().unwrap().clone();
+    assert_eq!(got.len(), 4, "expected 4 events, got {got:?}");
+
+    assert_eq!(
+        got[0],
+        (ViewOp::Create, Some(key), Some(50), false),
+        "enter is a Create with message projected out"
+    );
+    assert_eq!(got[1], (ViewOp::Update, Some(key), Some(75), false));
+    assert_eq!(
+        got[2],
+        (ViewOp::Remove, Some(key), Some(75), false),
+        "leave-view remove carries the last in-view snapshot, \
+         not the out-of-range update"
+    );
+    assert_eq!(
+        got[3],
+        (ViewOp::Create, Some(key), Some(42), false),
+        "re-enter is a Create again"
+    );
+
+    drop(view);
+    gt.exit();
+    let _ = tokio::time::timeout(Duration::from_secs(1), driver_handle).await;
+}
+
 #[tokio::test]
 async fn view_drop_removes_filtered_sub_from_host() {
     let host = HostTransceiver::new("test-host");
@@ -182,7 +363,7 @@ async fn view_drop_removes_filtered_sub_from_host() {
     // Filtered subscriber only — no auto-Join, see the four-cases test
     // above for why both lists are empty here.
     let (gt, driver) =
-        GuestTransceiver::from_connection(registry.clone(), conn, [], []);
+        GuestTransceiver::from_connection(registry.clone(), conn, [], [], []);
     let driver_handle = tokio::spawn(driver.run());
 
     let view = gt
@@ -236,6 +417,7 @@ async fn view_preload_from_existing_cache() {
         conn_b,
         [Pinger::DESCRIPTOR],
         [],
+        [],
     );
     let driver_b_handle = tokio::spawn(driver_b.run());
 
@@ -263,6 +445,7 @@ async fn view_preload_from_existing_cache() {
     let (gt_a, driver_a) = GuestTransceiver::from_connection(
         registry.clone(),
         conn_a,
+        [],
         [],
         [],
     );
@@ -324,7 +507,7 @@ async fn view_subscribe_replay_counts_down_from_cache() {
         .await
         .unwrap();
     let (gt_b, driver_b) =
-        GuestTransceiver::from_connection(registry.clone(), conn_b, [Pinger::DESCRIPTOR], []);
+        GuestTransceiver::from_connection(registry.clone(), conn_b, [Pinger::DESCRIPTOR], [], []);
     let driver_b_handle = tokio::spawn(driver_b.run());
 
     gt_b.publish(&dots!(Pinger { id: 1_u32, message: "a", sequence: 10_u64 }));
@@ -349,7 +532,7 @@ async fn view_subscribe_replay_counts_down_from_cache() {
         .await
         .unwrap();
     let (gt_a, driver_a) =
-        GuestTransceiver::from_connection(registry.clone(), conn_a, [], []);
+        GuestTransceiver::from_connection(registry.clone(), conn_a, [], [], []);
     let driver_a_handle = tokio::spawn(driver_a.run());
 
     let view = gt_a

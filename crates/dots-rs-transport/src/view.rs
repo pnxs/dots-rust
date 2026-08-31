@@ -236,15 +236,21 @@ where
             return Err(ViewError::Unsupported);
         }
 
-        T::register_as_subscribed();
-        transceiver.ensure_struct_descriptor::<T>();
+        // Runtime no-op: anchors T's SUBSCRIBED_FILTERED_TYPES slice
+        // entry so a registry built with `StaticTypePolicy::All`
+        // covered T and the App path announces T's descriptor —
+        // without the unfiltered group join (and full cache preload)
+        // that a SUBSCRIBED_TYPES entry would cause.
+        T::register_as_subscribed_filtered();
 
         let type_name = T::type_descriptor().name.to_string();
         let subscription_id = transceiver.allocate_subscription_id();
-        let container = crate::container::make_container::<T>(
-            transceiver.dispatch_handle_ref(),
-            None,
-        );
+        // Detached container: fed exclusively through the
+        // `subscription_id` demux. It must not receive type-name
+        // routed transmissions — an unfiltered subscription on the
+        // same type would otherwise leak unfiltered, unprojected
+        // state into the view.
+        let container = crate::container::make_view_container::<T>();
         let state = Arc::new(ViewState::new(container));
 
         // Register first, so an in-flight transmission tagged with

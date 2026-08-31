@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use dots_rs_core::{DynamicStruct, DynamicStructDescriptor, decode_typed_from_slice, encode_to_vec};
 use dots_rs_model::{
-    EnumDescriptorData, Registry, RegistryError, StructDescriptorData,
+    EnumDescriptorData, Registry, RegistryError, StaticTypePolicy, StructDescriptorData,
 };
 
 // ----- Fixture types (the "sender" side has these compiled) -----
@@ -229,6 +229,97 @@ fn registering_static_then_looking_up_works() {
         dots_rs_model::DescriptorEntry::Struct(d) => assert_eq!(d.name, "Address"),
         _ => panic!("wrong entry kind"),
     }
+}
+
+/// The `StaticTypePolicy` levels: `FundamentalOnly` yields an empty
+/// registry (fundamentals are codec-native), `InternalOnly` seeds the
+/// DOTS-internal types but no user types, `All` additionally seeds
+/// every compiled-in type from the link-time slices.
+#[test]
+fn static_type_policy_levels() {
+    use dots_rs_core::GlobalRegistration;
+    // Runtime no-ops, but their presence anchors the slice entries at
+    // link time — the same way `container::<T>` / `subscribe::<T>` /
+    // `view::<T>` call sites do.
+    Address::register_as_subscribed();
+    LogEntry::register_as_subscribed_filtered();
+
+    let fundamental = Registry::with_static_types(StaticTypePolicy::FundamentalOnly);
+    assert!(fundamental.is_empty());
+
+    let internal = Registry::with_static_types(StaticTypePolicy::InternalOnly);
+    assert!(internal.lookup("DotsHeader").is_some());
+    assert!(
+        internal.lookup("Address").is_none(),
+        "InternalOnly must not seed user types"
+    );
+
+    let all = Registry::with_static_types(StaticTypePolicy::All);
+    assert!(all.lookup("DotsHeader").is_some());
+    assert!(
+        all.lookup_static_struct("Address").is_some(),
+        "All must seed compiled-in user types from the slices"
+    );
+    assert!(
+        all.lookup_static_struct("LogEntry").is_some(),
+        "All must also seed view types (SUBSCRIBED_FILTERED_TYPES)"
+    );
+}
+
+/// Re-registering the same `&'static StructDescriptor` must keep the
+/// existing dynamic projection: `DynamicStruct` operations compare
+/// descriptors by `Arc` identity, so a fresh Arc per registration
+/// would make values decoded before the re-registration incomparable
+/// with values decoded after.
+#[test]
+fn re_registering_same_static_descriptor_is_idempotent() {
+    let reg = Registry::new();
+    reg.register_struct_static(Address::DESCRIPTOR);
+    let first = match reg.lookup("Address").unwrap() {
+        dots_rs_model::DescriptorEntry::Struct(d) => d,
+        _ => panic!("wrong entry kind"),
+    };
+
+    reg.register_struct_static(Address::DESCRIPTOR);
+    let second = match reg.lookup("Address").unwrap() {
+        dots_rs_model::DescriptorEntry::Struct(d) => d,
+        _ => panic!("wrong entry kind"),
+    };
+
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "repeated static registration must not mint a new descriptor Arc"
+    );
+}
+
+/// A wire-learned dynamic entry is still replaced when the static
+/// descriptor for the same name shows up (promotion to static), and
+/// the promoted entry then stays stable.
+#[test]
+fn static_registration_promotes_over_dynamic_entry() {
+    let reg = Registry::new();
+    let data = StructDescriptorData::from_static(Address::DESCRIPTOR);
+    let wire = Arc::new(reg.build_dynamic_struct(&data).unwrap());
+    reg.register_struct_dynamic(wire.clone());
+    assert!(reg.lookup_static_struct("Address").is_none());
+
+    reg.register_struct_static(Address::DESCRIPTOR);
+    assert!(reg.lookup_static_struct("Address").is_some());
+    let promoted = match reg.lookup("Address").unwrap() {
+        dots_rs_model::DescriptorEntry::Struct(d) => d,
+        _ => panic!("wrong entry kind"),
+    };
+    assert!(
+        !Arc::ptr_eq(&promoted, &wire),
+        "static registration must replace the wire-learned entry"
+    );
+
+    reg.register_struct_static(Address::DESCRIPTOR);
+    let after = match reg.lookup("Address").unwrap() {
+        dots_rs_model::DescriptorEntry::Struct(d) => d,
+        _ => panic!("wrong entry kind"),
+    };
+    assert!(Arc::ptr_eq(&promoted, &after));
 }
 
 #[test]
