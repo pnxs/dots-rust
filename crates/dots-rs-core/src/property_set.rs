@@ -127,6 +127,17 @@ impl PropertySet {
     }
 }
 
+impl core::str::FromStr for PropertySet {
+    type Err = crate::text::ParseValueError;
+
+    /// Accepts the `PropertySet{1,2,3}` tag-list form written by
+    /// [`Debug`](fmt::Debug), or the raw bitmask as `0b…`, `0x…` or a
+    /// decimal number.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        crate::text::property_set_from_str(s)
+    }
+}
+
 impl fmt::Debug for PropertySet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PropertySet{")?;

@@ -317,27 +317,5 @@ pub fn field_kind_type_name(kind: &FieldKind) -> String {
 /// when the broker re-emits a known struct's descriptor in response
 /// to `DotsDescriptorRequest`.
 pub fn dyn_field_kind_type_name(kind: &dots_rs_core::DynamicFieldKind) -> String {
-    use dots_rs_core::DynamicFieldKind;
-    match kind {
-        DynamicFieldKind::Bool => "bool".into(),
-        DynamicFieldKind::U8 => "uint8".into(),
-        DynamicFieldKind::U16 => "uint16".into(),
-        DynamicFieldKind::U32 => "uint32".into(),
-        DynamicFieldKind::U64 => "uint64".into(),
-        DynamicFieldKind::I8 => "int8".into(),
-        DynamicFieldKind::I16 => "int16".into(),
-        DynamicFieldKind::I32 => "int32".into(),
-        DynamicFieldKind::I64 => "int64".into(),
-        DynamicFieldKind::F32 => "float32".into(),
-        DynamicFieldKind::F64 => "float64".into(),
-        DynamicFieldKind::String => "string".into(),
-        DynamicFieldKind::PropertySet => "property_set".into(),
-        DynamicFieldKind::Uuid => "uuid".into(),
-        DynamicFieldKind::Timepoint => "timepoint".into(),
-        DynamicFieldKind::Duration => "duration".into(),
-        DynamicFieldKind::Vec(inner) => format!("vector<{}>", dyn_field_kind_type_name(inner)),
-        DynamicFieldKind::Struct(d) => d.name.clone(),
-        DynamicFieldKind::Enum(d) => d.name.clone(),
-        DynamicFieldKind::Any => "any".into(),
-    }
+    kind.type_name()
 }

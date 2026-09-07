@@ -62,6 +62,26 @@ impl DotsTypeKind for Timepoint {
     const KIND: FieldKind = FieldKind::Timepoint;
 }
 
+impl core::str::FromStr for Timepoint {
+    type Err = crate::text::ParseValueError;
+
+    /// Accepts fractional seconds since the Unix epoch, or an ISO-8601
+    /// date-time — read as UTC when it carries no offset. See
+    /// [`crate::text::parse_timepoint`].
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        crate::text::parse_timepoint(s).map(Self)
+    }
+}
+
+impl core::fmt::Display for Timepoint {
+    /// ISO-8601 UTC instant, to nanosecond precision with trailing
+    /// zeros trimmed — the inverse of the [`FromStr`](core::str::FromStr)
+    /// impl.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&crate::text::format_timepoint(self.0))
+    }
+}
+
 /// A duration as fractional seconds.
 ///
 /// Wire-compatible with C++ DOTS `duration_t`. On the wire it's a
@@ -120,6 +140,22 @@ impl DotsField for Duration {
 
 impl DotsTypeKind for Duration {
     const KIND: FieldKind = FieldKind::Duration;
+}
+
+impl core::str::FromStr for Duration {
+    type Err = crate::text::ParseValueError;
+
+    /// Accepts fractional seconds, with an optional `s` suffix.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        crate::text::parse_duration(s).map(Self)
+    }
+}
+
+impl core::fmt::Display for Duration {
+    /// Fractional seconds with an `s` suffix.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}s", self.0)
+    }
 }
 
 #[cfg(test)]

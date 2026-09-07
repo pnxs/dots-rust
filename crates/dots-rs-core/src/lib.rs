@@ -30,6 +30,7 @@ pub mod layout;
 mod property_set;
 mod registration;
 mod temporal;
+pub mod text;
 mod value;
 
 /// Re-export of the `linkme` crate so the derive macro can reference
@@ -59,6 +60,7 @@ pub use registration::{
     GlobalRegistration, PUBLISHED_TYPES, SUBSCRIBED_FILTERED_TYPES, SUBSCRIBED_TYPES,
 };
 pub use temporal::{Duration, Timepoint};
+pub use text::{ParseErrorReason, ParseValueError, uuid_from_str, uuid_to_string};
 pub use value::{Publishable, StructValue, Transmittable};
 
 /// Re-export of the `minicbor` crate so derived code and downstream users

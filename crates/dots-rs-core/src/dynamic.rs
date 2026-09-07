@@ -1099,8 +1099,11 @@ impl core::fmt::Display for DynamicValue {
             // [`DynamicStruct`]'s impl resolves variant names where it
             // can. For standalone values we fall back to the int.
             DynamicValue::Enum(v) => write!(f, "{v}"),
-            DynamicValue::Timepoint(s) => write!(f, "{s}"),
-            DynamicValue::Duration(s) => write!(f, "{s}"),
+            // Same text form as `Timepoint`/`Duration` themselves, so
+            // it reads back through
+            // [`DynamicFieldKind::parse_value`](crate::DynamicFieldKind::parse_value).
+            DynamicValue::Timepoint(s) => f.write_str(&crate::text::format_timepoint(*s)),
+            DynamicValue::Duration(s) => write!(f, "{s}s"),
             // Opaque: show the type identity and payload size, not the
             // contained object (decoding it needs a registry).
             DynamicValue::Any(a) => {
