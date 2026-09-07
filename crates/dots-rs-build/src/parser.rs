@@ -251,6 +251,18 @@ impl Parser {
             self.expect_kind(&TokenKind::RAngle, "`>`")?;
             return Ok(PropertyType::Vector(Box::new(inner)));
         }
+        if name == "instance_ref" {
+            // Generic `instance_ref`, or typed `instance_ref<Name>` —
+            // the target is a bare type name, never a nested
+            // vector/ref.
+            if !matches!(self.peek_kind(), Some(TokenKind::LAngle)) {
+                return Ok(PropertyType::InstanceRef(None));
+            }
+            self.bump();
+            let target = self.expect_ident()?;
+            self.expect_kind(&TokenKind::RAngle, "`>`")?;
+            return Ok(PropertyType::InstanceRef(Some(target)));
+        }
         if name.is_empty() {
             return Err(ParseError {
                 span,

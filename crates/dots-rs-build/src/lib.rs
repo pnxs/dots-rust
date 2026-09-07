@@ -49,6 +49,12 @@ pub enum BuildError {
         path: PathBuf,
         error: ParseError,
     },
+    /// A semantic rule violation (e.g. the key-property constraints of
+    /// wire-format spec §6.3).
+    Validate {
+        path: PathBuf,
+        message: String,
+    },
     OutDirNotSet,
 }
 
@@ -58,6 +64,7 @@ impl core::fmt::Display for BuildError {
             Self::Io { path, error } => write!(f, "{}: {}", path.display(), error),
             Self::Lex { path, error } => write!(f, "{}: {}", path.display(), error),
             Self::Parse { path, error } => write!(f, "{}: {}", path.display(), error),
+            Self::Validate { path, message } => write!(f, "{}: {}", path.display(), message),
             Self::OutDirNotSet => f.write_str("OUT_DIR environment variable not set"),
         }
     }
@@ -144,6 +151,30 @@ where
         }
     }
 
+    // Pass 2a': semantic validation. Needs the cross-file index so an
+    // `instance_ref<X>` target or a named key type can be classified
+    // as struct vs. enum.
+    let mut local_kinds: HashMap<&str, LocalKind> = HashMap::new();
+    for p in &parsed_files {
+        for item in &p.file.items {
+            match item {
+                Item::Struct(s) => {
+                    local_kinds.insert(&s.name, LocalKind::Struct);
+                }
+                Item::Enum(e) => {
+                    local_kinds.insert(&e.name, LocalKind::Enum);
+                }
+                _ => {}
+            }
+        }
+    }
+    for (p, file) in parsed_files.iter().zip(files) {
+        validate_file(&p.file, &local_kinds).map_err(|message| BuildError::Validate {
+            path: file.as_ref().into(),
+            message,
+        })?;
+    }
+
     // Pass 2b: generate Rust source per file, splicing in resolved
     // imports.
     let mut combined = String::new();
@@ -211,6 +242,131 @@ impl core::fmt::Display for ParseSourceError {
 }
 
 impl std::error::Error for ParseSourceError {}
+
+/// Struct-vs-enum classification of a locally declared type, for the
+/// semantic checks that need to tell the two apart.
+#[derive(Clone, Copy, PartialEq)]
+enum LocalKind {
+    Struct,
+    Enum,
+}
+
+/// Semantic validation of one parsed `.dots` file (wire-format spec
+/// §6.3 plus the `instance_ref` target rule of §6.5). `kinds` is the
+/// cross-file name index; names not in it (types imported from other
+/// packages) pass here — the derive's const assertion on
+/// `DotsTypeKind::KIND` is the backstop that still rejects them at
+/// compile time.
+fn validate_file(file: &File, kinds: &HashMap<&str, LocalKind>) -> Result<(), String> {
+    for item in &file.items {
+        let Item::Struct(s) = item else { continue };
+
+        // Key properties must be declared in ascending tag order.
+        let mut prev: Option<&Property> = None;
+        for prop in s.properties.iter().filter(|p| p.is_key()) {
+            if let Some(prev) = prev {
+                if prop.tag <= prev.tag {
+                    return Err(format!(
+                        "struct {}: [key] properties must be declared in ascending tag \
+                         order; `{}` (tag {}) is declared after `{}` (tag {})",
+                        s.name, prop.name, prop.tag, prev.name, prev.tag
+                    ));
+                }
+            }
+            prev = Some(prop);
+
+            // Key properties must be of byte-stable-equality kinds.
+            if let Some(reason) = key_type_error(&prop.ty, kinds) {
+                return Err(format!(
+                    "struct {}: [key] property `{}` {reason}",
+                    s.name, prop.name
+                ));
+            }
+        }
+
+        // `instance_ref<X>` targets must be struct types — checked for
+        // every property, key or not.
+        for prop in &s.properties {
+            if let Some(reason) = ref_target_error(&prop.ty, kinds) {
+                return Err(format!(
+                    "struct {}: property `{}` {reason}",
+                    s.name, prop.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Why `ty` is illegal as a `[key]` property type, if it is.
+fn key_type_error(ty: &PropertyType, kinds: &HashMap<&str, LocalKind>) -> Option<String> {
+    match ty {
+        PropertyType::Vector(_) => Some("has a vector type; vectors cannot be keys".into()),
+        PropertyType::InstanceRef(_) => None,
+        PropertyType::Named(name) => match name.as_str() {
+            "bool" | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32"
+            | "uint64" | "string" | "uuid" => None,
+            "float32" | "float64" | "timepoint" | "steady_timepoint" | "duration"
+            | "property_set" | "any" => Some(format!(
+                "has type `{name}`, whose equality is not byte-stable; keys must be \
+                 bool, integer, string, uuid, enum, or instance_ref"
+            )),
+            other => match kinds.get(other) {
+                Some(LocalKind::Struct) => Some(format!(
+                    "has struct type `{other}`; nested structs cannot be keys"
+                )),
+                // Enums are key-legal; unknown names are assumed to be
+                // enums from another package (derive backstop applies).
+                Some(LocalKind::Enum) | None => None,
+            },
+        },
+    }
+}
+
+/// Why `ty` names an illegal `instance_ref` target, if it does.
+/// Recurses through vectors so `vector<instance_ref<X>>` is covered.
+fn ref_target_error(ty: &PropertyType, kinds: &HashMap<&str, LocalKind>) -> Option<String> {
+    match ty {
+        PropertyType::Vector(inner) => ref_target_error(inner, kinds),
+        PropertyType::InstanceRef(Some(target)) => match kinds.get(target.as_str()) {
+            Some(LocalKind::Struct) => None,
+            Some(LocalKind::Enum) => Some(format!(
+                "references enum `{target}`; instance_ref targets must be struct types"
+            )),
+            None if is_primitive_name(target) => Some(format!(
+                "references primitive `{target}`; instance_ref targets must be struct types"
+            )),
+            // Unknown name: assumed to be a struct from another
+            // package (derive backstop applies).
+            None => None,
+        },
+        PropertyType::InstanceRef(None) | PropertyType::Named(_) => None,
+    }
+}
+
+fn is_primitive_name(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "float32"
+            | "float64"
+            | "string"
+            | "uuid"
+            | "timepoint"
+            | "steady_timepoint"
+            | "duration"
+            | "property_set"
+            | "any"
+    )
+}
 
 fn module_name_from_path(path: &Path) -> String {
     path.file_stem()

@@ -268,6 +268,8 @@ fn render_dots_type(ty: &PropertyType) -> String {
     match ty {
         PropertyType::Named(n) => n.clone(),
         PropertyType::Vector(inner) => format!("vector<{}>", render_dots_type(inner)),
+        PropertyType::InstanceRef(None) => "instance_ref".into(),
+        PropertyType::InstanceRef(Some(target)) => format!("instance_ref<{target}>"),
     }
 }
 
@@ -283,6 +285,10 @@ fn render_type(ty: &PropertyType) -> String {
     match ty {
         PropertyType::Named(name) => map_primitive(name).to_string(),
         PropertyType::Vector(inner) => format!("Vec<{}>", render_type(inner)),
+        PropertyType::InstanceRef(None) => "dots_rs::InstanceRef".into(),
+        PropertyType::InstanceRef(Some(target)) => {
+            format!("dots_rs::InstanceRef<{target}>")
+        }
     }
 }
 

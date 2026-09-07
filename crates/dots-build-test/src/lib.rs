@@ -10,7 +10,9 @@ include!(concat!(env!("OUT_DIR"), "/dots_generated.rs"));
 
 #[cfg(test)]
 mod tests {
-    use super::types::{DotsClient, DotsConnectionState, Pinger, StatusReport, TestResult};
+    use super::types::{
+        DotsClient, DotsConnectionState, Pinger, SetPointStatus, StatusReport, TestResult,
+    };
     use dots_rs::StructValue;
 
     #[test]
@@ -39,6 +41,25 @@ mod tests {
         let c = DotsConnectionState::DESCRIPTOR;
         assert_eq!(c.elements[0].value, 0);
         assert_eq!(c.elements[4].value, 4);
+    }
+
+    #[test]
+    fn generated_instance_refs_round_trip() {
+        let pinger = Pinger::new(7u32);
+        let status = SetPointStatus {
+            subject: dots_rs::instance_ref(&pinger),
+            parent: Some(dots_rs::InstanceRef::of(&pinger)),
+            applied: Some(true),
+        };
+        // Generic ref (key) carries the type name; typed ref does not.
+        assert_eq!(status.subject.type_name(), "Pinger");
+        assert_eq!(status.parent.as_ref().unwrap().type_name(), "Pinger");
+        assert_eq!(status.subject.key_bytes(), [0x81, 0x07]); // [7]
+        assert_eq!(status.parent.as_ref().unwrap().key_bytes(), [0x81, 0x07]);
+
+        let bytes = dots_rs::encode_to_vec(&status);
+        let decoded: SetPointStatus = dots_rs::decode_typed_from_slice(&bytes).unwrap();
+        assert_eq!(decoded, status);
     }
 
     #[test]

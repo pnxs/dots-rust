@@ -40,3 +40,11 @@ struct StatusReport [internal, cached] {
     2: timepoint startTime;
     3: duration uptime;
 }
+
+/// Tests instance references: a generic ref usable as a key, and a
+/// typed ref whose target type is fixed by the schema.
+struct SetPointStatus [cached] {
+    1: [key] instance_ref subject;
+    2: instance_ref<Pinger> parent;
+    3: bool applied;
+}

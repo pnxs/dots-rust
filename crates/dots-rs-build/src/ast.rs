@@ -71,12 +71,16 @@ pub struct Property {
 }
 
 /// Property type: a bare identifier (primitive name like `int32`,
-/// `string`, `timepoint`, or a user-defined type name) or a
-/// `vector<T>`.
+/// `string`, `timepoint`, or a user-defined type name), a
+/// `vector<T>`, or an instance reference (`instance_ref` /
+/// `instance_ref<TypeName>`).
 #[derive(Debug, Clone)]
 pub enum PropertyType {
     Named(String),
     Vector(Box<PropertyType>),
+    /// `instance_ref` (`None`) or `instance_ref<TypeName>`
+    /// (`Some(target)`); the target must be a struct type name.
+    InstanceRef(Option<String>),
 }
 
 /// One option from a `[name=value, name2, name3="literal"]` list. A

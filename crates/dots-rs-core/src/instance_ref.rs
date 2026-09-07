@@ -112,6 +112,35 @@ impl<T: RefTarget> core::fmt::Debug for InstanceRef<T> {
     }
 }
 
+impl<T: RefTarget> Default for InstanceRef<T> {
+    /// The empty reference: a canonical key of `[]` (and, for the
+    /// generic form, an empty type name). It denotes nothing — it
+    /// exists so bare `#[dots(key)]` reference fields have a valid
+    /// pre-assignment slot value, like `String`'s `""`.
+    fn default() -> Self {
+        Self {
+            type_name: T::TARGET_NAME.is_none().then(String::new),
+            key: alloc::vec![0x80],
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: RefTarget> crate::DotsFieldOps for InstanceRef<T> {
+    fn dots_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    /// Total order over the encoded identity — type name, then key
+    /// bytes. Byte order of the deterministic encoding is coherent
+    /// with identity (spec §6.2).
+    fn dots_cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.type_name
+            .cmp(&other.type_name)
+            .then_with(|| self.key.cmp(&other.key))
+    }
+}
+
 impl InstanceRef<AnyInstance> {
     /// Generic reference from raw parts. `key` must be a complete
     /// canonical-key CBOR array.
