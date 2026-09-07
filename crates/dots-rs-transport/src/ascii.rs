@@ -168,6 +168,17 @@ fn fmt_value(
                 None => paint(f, colors, |c| c.enum_value, tag),
             }
         }
+        // A typed ref's target name lives in the kind, not the value.
+        (
+            DynamicValue::InstanceRef {
+                type_name: None,
+                key,
+            },
+            DynamicFieldKind::InstanceRefTo(target),
+        ) => {
+            paint(f, colors, |c| c.type_name, target)?;
+            dots_rs_core::instance_ref::fmt_key(key, f)
+        }
         // Recurse so nested `any` inside a sub-struct also expands.
         (DynamicValue::Struct(inner), _) => fmt_struct(inner, reg, colors, f),
         (DynamicValue::Vec(items), DynamicFieldKind::Vec(inner_kind)) => {

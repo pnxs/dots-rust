@@ -250,37 +250,60 @@ impl DynamicStruct {
 
 impl<T: RefTarget> DotsField for InstanceRef<T> {
     fn dots_encode(&self, e: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
-        if T::TARGET_NAME.is_none() {
-            // Generic form: [ type-name, canonical key ].
-            e.array(2)?;
-            e.str(self.type_name())?;
-        }
-        // The key is already a complete CBOR item — splice it in raw.
-        e.writer_mut().extend_from_slice(&self.key);
-        Ok(())
+        let generic_name = T::TARGET_NAME.is_none().then(|| self.type_name());
+        encode_ref(generic_name, &self.key, e)
     }
 
     fn dots_decode(d: &mut CborDecoder<'_>) -> Result<Self, DecodeError> {
-        let type_name = if T::TARGET_NAME.is_none() {
-            let len = d.array()?.ok_or_else(|| {
-                DecodeError::message("indefinite-length array not supported in `instance_ref`")
-            })?;
-            if len != 2 {
-                return Err(DecodeError::message(
-                    "invalid `instance_ref`: expected a 2-element array",
-                ));
-            }
-            Some(d.str()?.to_string())
-        } else {
-            None
-        };
-        let key = read_key_array(d)?;
+        let (type_name, key) = decode_ref(T::TARGET_NAME.is_none(), d)?;
         Ok(Self {
             type_name,
             key,
             _marker: PhantomData,
         })
     }
+}
+
+/// Encode a reference's wire form (spec §6.5). `generic_name` is
+/// `Some(type name)` for the generic form — `[type-name, key]` — and
+/// `None` for the typed form, which is the bare canonical key. The key
+/// is already a complete CBOR item and is spliced in raw.
+pub(crate) fn encode_ref(
+    generic_name: Option<&str>,
+    key: &[u8],
+    e: &mut CborEncoder<'_>,
+) -> Result<(), EncodeError> {
+    if let Some(name) = generic_name {
+        e.array(2)?;
+        e.str(name)?;
+    }
+    e.writer_mut().extend_from_slice(key);
+    Ok(())
+}
+
+/// Decode a reference's wire form, the shape selected by the *schema*
+/// (`generic`), never by the bytes: the generic envelope carries its
+/// type name, the typed form is the bare key. Returns
+/// `(type name if generic, key bytes)`.
+pub(crate) fn decode_ref(
+    generic: bool,
+    d: &mut CborDecoder<'_>,
+) -> Result<(Option<String>, Vec<u8>), DecodeError> {
+    let type_name = if generic {
+        let len = d.array()?.ok_or_else(|| {
+            DecodeError::message("indefinite-length array not supported in `instance_ref`")
+        })?;
+        if len != 2 {
+            return Err(DecodeError::message(
+                "invalid `instance_ref`: expected a 2-element array",
+            ));
+        }
+        Some(d.str()?.to_string())
+    } else {
+        None
+    };
+    let key = read_key_array(d)?;
+    Ok((type_name, key))
 }
 
 impl<T: RefTarget> DotsTypeKind for InstanceRef<T> {
@@ -385,11 +408,13 @@ impl<T: RefTarget> core::fmt::Display for InstanceRef<T> {
     }
 }
 
-/// Render a canonical key (or, on malformed bytes, its hex form) —
-/// shared by [`InstanceRef`]'s `Display` and the dynamic value's.
-pub(crate) fn fmt_key(key: &[u8], f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+/// Render a canonical key in the non-normative diagnostic form —
+/// `["eth0",100]` — or, on malformed bytes, as hex. Shared by
+/// [`InstanceRef`]'s `Display`, the dynamic value's, and renderers
+/// that have the target type name from the field kind.
+pub fn fmt_key(key: &[u8], f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     let mut d = minicbor::Decoder::new(key);
-    match fmt_key_item(&mut d, f) {
+    match fmt_key_item(&mut d, f, 0) {
         Ok(()) if d.position() == key.len() => Ok(()),
         // The formatter may already hold partial output; hex after it
         // is still unambiguous for a diagnostic form.
@@ -403,9 +428,16 @@ pub(crate) fn fmt_key(key: &[u8], f: &mut core::fmt::Formatter<'_>) -> core::fmt
     }
 }
 
+/// Deepest array nesting the diagnostic renderer follows. Canonical
+/// keys nest only as deep as reference-typed key properties chain
+/// (spec §6.3), so real keys are shallow; the cap keeps a hostile or
+/// corrupt key from recursing the stack away — it falls back to hex.
+const MAX_KEY_DISPLAY_DEPTH: u32 = 16;
+
 fn fmt_key_item(
     d: &mut CborDecoder<'_>,
     f: &mut core::fmt::Formatter<'_>,
+    depth: u32,
 ) -> Result<(), core::fmt::Error> {
     use minicbor::data::Type;
     // Any decode error is mapped to fmt::Error and handled by the
@@ -413,13 +445,16 @@ fn fmt_key_item(
     let err = |_| core::fmt::Error;
     match d.datatype().map_err(err)? {
         Type::Array => {
+            if depth >= MAX_KEY_DISPLAY_DEPTH {
+                return Err(core::fmt::Error);
+            }
             let len = d.array().map_err(err)?.ok_or(core::fmt::Error)?;
             f.write_str("[")?;
             for i in 0..len {
                 if i > 0 {
                     f.write_str(",")?;
                 }
-                fmt_key_item(d, f)?;
+                fmt_key_item(d, f, depth + 1)?;
             }
             f.write_str("]")
         }

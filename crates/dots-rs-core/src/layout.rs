@@ -31,7 +31,7 @@ use core::alloc::Layout;
 use core::any::Any;
 use core::ptr::NonNull;
 
-use crate::{DotsFieldOps, PropertyDescriptor, PropertySet, StructDescriptor, StructValue};
+use crate::{DotsFieldOps, PropertySet, StructDescriptor, StructValue};
 
 /// CBOR encoder type used by property thunks. Fixed-writer (`&mut Vec<u8>`)
 /// so thunk fn-pointer signatures are stable across types.
@@ -679,12 +679,16 @@ pub fn encode_key_into(value: &dyn StructValue, buf: &mut Vec<u8>) {
     let descriptor = value.descriptor();
     let base = value.data_ptr();
     let mut encoder = minicbor::Encoder::new(buf);
-    let mut key_properties: Vec<&PropertyDescriptor> = descriptor.key_properties().collect();
-    key_properties.sort_unstable_by_key(|p| p.tag);
+    // The key mask iterates ascending by tag without allocating —
+    // this runs on the container's per-lookup path.
+    let key_mask = descriptor.key_mask();
     encoder
-        .array(key_properties.len() as u64)
+        .array(key_mask.len() as u64)
         .expect("Vec<u8> writes are infallible");
-    for prop in key_properties {
+    for tag in key_mask.iter() {
+        let prop = descriptor
+            .property(tag)
+            .expect("tag comes from this descriptor's key mask");
         // SAFETY: `prop.offset` is in-range for `descriptor`'s layout
         // by descriptor construction; `value.data_ptr()` points at a
         // buffer of that layout for `&self`'s lifetime.

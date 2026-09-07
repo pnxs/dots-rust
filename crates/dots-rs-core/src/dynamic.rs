@@ -475,8 +475,15 @@ impl DynamicStruct {
             } else {
                 None
             };
+            let kind = &self
+                .descriptor
+                .property(tag)
+                .expect("tag comes from this descriptor's key mask")
+                .kind;
             match value {
-                Some(v) => encode_value(v, &mut encoder).expect("Vec<u8> writes are infallible"),
+                Some(v) => {
+                    encode_value(kind, v, &mut encoder).expect("Vec<u8> writes are infallible")
+                }
                 None => {
                     encoder.null().expect("Vec<u8> writes are infallible");
                 }
@@ -967,12 +974,21 @@ fn encode_struct(
             .map(|(_, v)| v)
             .expect("valid_set claims tag is set but no value present");
         e.u32(prop.tag)?;
-        encode_value(value, e)?;
+        encode_value(&prop.kind, value, e)?;
     }
     Ok(())
 }
 
-fn encode_value(value: &DynamicValue, e: &mut CborEncoder<'_>) -> Result<(), EncodeError> {
+/// Encode one property value. `kind` is the property's declared kind:
+/// it selects the wire shape where the value alone cannot — a
+/// reference value is legal in both `instance_ref` (enveloped) and
+/// `instance_ref<T>` (bare key) slots, and the schema, not the value,
+/// decides which is on the wire.
+fn encode_value(
+    kind: &DynamicFieldKind,
+    value: &DynamicValue,
+    e: &mut CborEncoder<'_>,
+) -> Result<(), EncodeError> {
     match value {
         DynamicValue::Bool(v) => e.bool(*v).map(|_| ()),
         DynamicValue::U8(v) => e.u8(*v).map(|_| ()),
@@ -989,9 +1005,15 @@ fn encode_value(value: &DynamicValue, e: &mut CborEncoder<'_>) -> Result<(), Enc
         DynamicValue::PropertySet(p) => p.dots_encode(e),
         DynamicValue::Uuid(b) => e.bytes(b).map(|_| ()),
         DynamicValue::Vec(items) => {
+            let item_kind = match kind {
+                DynamicFieldKind::Vec(inner) => inner,
+                // Kind/value mismatch (caller bug): elements still
+                // encode by their own variant.
+                other => other,
+            };
             e.array(items.len() as u64)?;
             for item in items {
-                encode_value(item, e)?;
+                encode_value(item_kind, item, e)?;
             }
             Ok(())
         }
@@ -1001,16 +1023,18 @@ fn encode_value(value: &DynamicValue, e: &mut CborEncoder<'_>) -> Result<(), Enc
         // Opaque passthrough: re-emit the `[type-name, payload]`
         // envelope verbatim without touching the inner object.
         DynamicValue::Any(a) => a.dots_encode(e),
-        // Generic refs carry the `[type-name, key]` envelope; typed
-        // refs are the bare canonical key. Either way the key is a
-        // complete CBOR item spliced in verbatim.
+        // The slot's kind picks the wire shape (spec §6.5): a generic
+        // `instance_ref` slot gets the `[type-name, key]` envelope, a
+        // typed `instance_ref<T>` slot the bare canonical key — even if
+        // the value happens to carry a name. Only when the kind is not
+        // a reference kind at all (caller bug) does the value decide.
         DynamicValue::InstanceRef { type_name, key } => {
-            if let Some(name) = type_name {
-                e.array(2)?;
-                e.str(name)?;
-            }
-            e.writer_mut().extend_from_slice(key);
-            Ok(())
+            let generic_name = match kind {
+                DynamicFieldKind::InstanceRef => Some(type_name.as_deref().unwrap_or("")),
+                DynamicFieldKind::InstanceRefTo(_) => None,
+                _ => type_name.as_deref(),
+            };
+            crate::instance_ref::encode_ref(generic_name, key, e)
         }
     }
 }
@@ -1101,25 +1125,11 @@ pub(crate) fn decode_value(
         // Read the opaque envelope into an `AnyObject` without decoding
         // the contained object (the descriptor for it may not be known).
         DynamicFieldKind::Any => Ok(DynamicValue::Any(crate::AnyObject::dots_decode(d)?)),
-        DynamicFieldKind::InstanceRef => {
-            let len = d.array()?.ok_or_else(|| {
-                DecodeError::message("indefinite-length array not supported in `instance_ref`")
-            })?;
-            if len != 2 {
-                return Err(DecodeError::message(
-                    "invalid `instance_ref`: expected a 2-element array",
-                ));
-            }
-            let type_name = d.str()?.to_string();
-            Ok(DynamicValue::InstanceRef {
-                type_name: Some(type_name),
-                key: crate::instance_ref::read_key_array(d)?,
-            })
+        DynamicFieldKind::InstanceRef | DynamicFieldKind::InstanceRefTo(_) => {
+            let generic = matches!(kind, DynamicFieldKind::InstanceRef);
+            let (type_name, key) = crate::instance_ref::decode_ref(generic, d)?;
+            Ok(DynamicValue::InstanceRef { type_name, key })
         }
-        DynamicFieldKind::InstanceRefTo(_) => Ok(DynamicValue::InstanceRef {
-            type_name: None,
-            key: crate::instance_ref::read_key_array(d)?,
-        }),
     }
 }
 
@@ -1222,6 +1232,19 @@ impl core::fmt::Display for DynamicStruct {
                         Some(elem) => f.write_str(&elem.name)?,
                         None => write!(f, "{tag}")?,
                     }
+                }
+                // A typed ref's target name lives in the kind, not the
+                // value — print it so the dynamic rendering matches
+                // `InstanceRef<T>`'s Display.
+                (
+                    Some(DynamicValue::InstanceRef {
+                        type_name: None,
+                        key,
+                    }),
+                    DynamicFieldKind::InstanceRefTo(target),
+                ) => {
+                    f.write_str(target)?;
+                    crate::instance_ref::fmt_key(key, f)?;
                 }
                 (Some(v), _) => core::fmt::Display::fmt(v, f)?,
                 (None, _) => f.write_str("?")?,
