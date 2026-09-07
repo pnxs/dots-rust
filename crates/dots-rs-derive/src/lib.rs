@@ -110,9 +110,8 @@ fn resolve_roots(rt_internal: bool, rt_path: &Option<Path>) -> Roots {
 /// order never affects an instance's identity.
 ///
 /// Key properties must be of a kind whose equality is byte-stable —
-/// bool, integer, string, uuid, or enum. Floats (and `timepoint`,
-/// `duration`, `property_set`, vectors, `any`) are rejected
-/// syntactically:
+/// bool, integer, string, uuid, enum, or an instance reference. Floats,
+/// vectors and `any` are rejected syntactically:
 ///
 /// ```compile_fail
 /// # use dots_rs_derive::DotsStruct;
@@ -124,8 +123,9 @@ fn resolve_roots(rt_internal: bool, rt_path: &Option<Path>) -> Roots {
 /// }
 /// ```
 ///
-/// Nested structs are not syntactically distinguishable from enums, so
-/// a struct-typed key fails at const evaluation instead:
+/// Everything else (nested structs, `Timepoint`/`Duration`/
+/// `PropertySet`, type aliases) is not syntactically distinguishable
+/// from a legal enum, so it fails at const evaluation instead:
 ///
 /// ```compile_fail
 /// # use dots_rs_derive::DotsStruct;
@@ -1019,11 +1019,12 @@ fn key_forbidden_kind(ty: &Type) -> Option<&'static str> {
     }
     if let Type::Path(tp) = ty {
         if let Some(last) = tp.path.segments.last() {
+            // Only names no user DOTS type can legitimately carry: a
+            // model may well declare its own `enum Duration`, so the
+            // runtime newtypes (Timepoint, Duration, PropertySet) are
+            // left to the const assertion on `DotsTypeKind::KIND`.
             return match last.ident.to_string().as_str() {
                 "f32" | "f64" => Some("floating-point"),
-                "Timepoint" => Some("`timepoint` (Timepoint)"),
-                "Duration" => Some("`duration` (Duration)"),
-                "PropertySet" => Some("`property_set` (PropertySet)"),
                 _ => None,
             };
         }
@@ -1317,10 +1318,10 @@ fn parse_field(field: &Field) -> syn::Result<DotsField<'_>> {
 
     // Key properties must be of a kind whose equality is byte-stable
     // (wire-format spec §6.3). Kinds the macro can recognize
-    // syntactically are rejected here with a precise span; nested
-    // structs hiding behind a bare type name are caught by the const
-    // assertion on `DotsTypeKind::KIND` that `expand` emits per key
-    // field.
+    // unambiguously are rejected here with a precise span; everything
+    // hiding behind a bare type name (nested structs, the temporal
+    // newtypes, aliases) is caught by the const assertion on
+    // `DotsTypeKind::KIND` that `expand` emits per key field.
     if attrs.is_key {
         if let Some(kind) = key_forbidden_kind(inner_ty) {
             return Err(syn::Error::new(

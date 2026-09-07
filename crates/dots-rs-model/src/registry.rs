@@ -50,13 +50,6 @@ pub enum RegistryError {
     MissingField(&'static str),
     /// Property in `StructDescriptorData` lacked a name, tag, or type.
     MalformedProperty(&'static str),
-    /// A key property's kind is not key-legal (wire-format spec §6.3):
-    /// keys must be bool, integer, string, uuid, enum, or an instance
-    /// reference.
-    NonScalarKey {
-        type_name: String,
-        property: String,
-    },
 }
 
 impl core::fmt::Display for RegistryError {
@@ -66,14 +59,6 @@ impl core::fmt::Display for RegistryError {
             Self::MalformedTypeName(name) => write!(f, "malformed type name `{name}`"),
             Self::MissingField(name) => write!(f, "descriptor missing required field `{name}`"),
             Self::MalformedProperty(reason) => write!(f, "malformed property: {reason}"),
-            Self::NonScalarKey {
-                type_name,
-                property,
-            } => write!(
-                f,
-                "{type_name}.{property}: key property kind is not key-legal \
-                 (wire-format spec §6.3)"
-            ),
         }
     }
 }
@@ -457,16 +442,11 @@ impl Registry {
                 .as_ref()
                 .ok_or(RegistryError::MalformedProperty("missing type"))?;
             let kind = self.parse_type_name(type_name)?;
-            // Key properties must be of key-legal kinds (wire-format
-            // spec §6.3). Ordering is NOT checked here: property order
-            // in a wire descriptor is presentation, and the canonical
-            // key sorts by tag regardless.
-            if is_key && !kind.is_valid_key_kind() {
-                return Err(RegistryError::NonScalarKey {
-                    type_name: name,
-                    property: prop_name,
-                });
-            }
+            // Key kinds are deliberately not policed here: spec §6.3
+            // constrains *declarations* (generators reject), not what a
+            // receiver accepts. A foreign peer's odd-but-valid type
+            // must still register so it is cached and routed; tools can
+            // flag it via `DynamicFieldKind::is_valid_key_kind`.
             properties.push(DynamicPropertyDescriptor {
                 name: prop_name,
                 tag,
@@ -503,14 +483,16 @@ impl Registry {
             let el_name = el
                 .name
                 .as_ref()
-                .ok_or(RegistryError::MalformedProperty("enum element missing name"))?
+                .ok_or(RegistryError::MalformedProperty(
+                    "enum element missing name",
+                ))?
                 .clone();
             let tag = el
                 .tag
                 .ok_or(RegistryError::MalformedProperty("enum element missing tag"))?;
-            let value = el
-                .enum_value
-                .ok_or(RegistryError::MalformedProperty("enum element missing value"))?;
+            let value = el.enum_value.ok_or(RegistryError::MalformedProperty(
+                "enum element missing value",
+            ))?;
             elements.push(DynamicEnumElement {
                 name: el_name,
                 tag,
@@ -609,10 +591,22 @@ mod tests {
     #[test]
     fn parses_primitives() {
         let r = Registry::new();
-        assert!(matches!(r.parse_type_name("bool"), Ok(DynamicFieldKind::Bool)));
-        assert!(matches!(r.parse_type_name("uint32"), Ok(DynamicFieldKind::U32)));
-        assert!(matches!(r.parse_type_name("int64"), Ok(DynamicFieldKind::I64)));
-        assert!(matches!(r.parse_type_name("float64"), Ok(DynamicFieldKind::F64)));
+        assert!(matches!(
+            r.parse_type_name("bool"),
+            Ok(DynamicFieldKind::Bool)
+        ));
+        assert!(matches!(
+            r.parse_type_name("uint32"),
+            Ok(DynamicFieldKind::U32)
+        ));
+        assert!(matches!(
+            r.parse_type_name("int64"),
+            Ok(DynamicFieldKind::I64)
+        ));
+        assert!(matches!(
+            r.parse_type_name("float64"),
+            Ok(DynamicFieldKind::F64)
+        ));
         assert!(matches!(
             r.parse_type_name("string"),
             Ok(DynamicFieldKind::String)
@@ -663,7 +657,10 @@ mod tests {
     #[test]
     fn parses_any() {
         let r = Registry::new();
-        assert!(matches!(r.parse_type_name("any"), Ok(DynamicFieldKind::Any)));
+        assert!(matches!(
+            r.parse_type_name("any"),
+            Ok(DynamicFieldKind::Any)
+        ));
     }
 }
 
@@ -737,5 +734,4 @@ mod from_any_tests {
             other => panic!("expected UnknownType, got {other:?}"),
         }
     }
-
 }

@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
-use dots_rs_core::{DynamicStruct, DynamicStructDescriptor, decode_typed_from_slice, encode_to_vec};
+use dots_rs_core::{
+    DynamicStruct, DynamicStructDescriptor, decode_typed_from_slice, encode_to_vec,
+};
 use dots_rs_model::{
     EnumDescriptorData, Registry, RegistryError, StaticTypePolicy, StructDescriptorData,
 };
@@ -412,8 +414,16 @@ fn iter_structs_and_iter_enums_partition_the_registry() {
     reg.register_enum_dynamic(Arc::new(DynamicEnumDescriptor {
         name: "Mood".into(),
         elements: vec![
-            DynamicEnumElement { name: "Happy".into(), tag: 1, value: 0 },
-            DynamicEnumElement { name: "Grumpy".into(), tag: 2, value: 1 },
+            DynamicEnumElement {
+                name: "Happy".into(),
+                tag: 1,
+                value: 0,
+            },
+            DynamicEnumElement {
+                name: "Grumpy".into(),
+                tag: 2,
+                value: 1,
+            },
         ],
     }));
 
@@ -465,7 +475,10 @@ fn parse_type_name_resolves_instance_refs() {
         DynamicFieldKind::InstanceRefTo(target) => assert_eq!(target, "NetworkRoute"),
         other => panic!("expected InstanceRefTo, got {other:?}"),
     }
-    match reg.parse_type_name("vector<instance_ref<Address>>").unwrap() {
+    match reg
+        .parse_type_name("vector<instance_ref<Address>>")
+        .unwrap()
+    {
         DynamicFieldKind::Vec(inner) => {
             assert!(matches!(*inner, DynamicFieldKind::InstanceRefTo(ref t) if t == "Address"));
         }
@@ -478,12 +491,15 @@ fn parse_type_name_resolves_instance_refs() {
 }
 
 #[test]
-fn build_dynamic_struct_rejects_non_scalar_keys() {
+fn build_dynamic_struct_accepts_foreign_key_kinds() {
+    use dots_rs_core::DynamicFieldKind;
     use dots_rs_model::StructPropertyData;
 
     // A wire descriptor with a float-typed key: no dots-rust program
-    // can publish this (the derive rejects it), but a foreign or buggy
-    // peer could.
+    // can publish this (the derive rejects it), but a foreign peer may.
+    // Receivers don't police spec §6.3 — the type must still register
+    // so it is cached and routed; the kind predicate is there for
+    // tools that want to flag it.
     let reg = Registry::new();
     let data = StructDescriptorData {
         name: Some("Rogue".into()),
@@ -496,17 +512,13 @@ fn build_dynamic_struct_rejects_non_scalar_keys() {
         }]),
         ..Default::default()
     };
+    let rogue = reg.build_dynamic_struct(&data).unwrap();
+    let key = &rogue.properties[0];
+    assert!(key.is_key);
+    assert!(matches!(key.kind, DynamicFieldKind::F64));
+    assert!(!key.kind.is_valid_key_kind());
 
-    assert_eq!(
-        reg.build_dynamic_struct(&data).unwrap_err(),
-        RegistryError::NonScalarKey {
-            type_name: "Rogue".into(),
-            property: "value".into(),
-        }
-    );
-
-    // The same shape with a key-legal kind — including a typed ref —
-    // builds fine.
+    // A typed reference is a legal key kind.
     let data = StructDescriptorData {
         name: Some("Fine".into()),
         properties: Some(vec![StructPropertyData {
@@ -518,5 +530,6 @@ fn build_dynamic_struct_rejects_non_scalar_keys() {
         }]),
         ..Default::default()
     };
-    assert!(reg.build_dynamic_struct(&data).is_ok());
+    let fine = reg.build_dynamic_struct(&data).unwrap();
+    assert!(fine.properties[0].kind.is_valid_key_kind());
 }
