@@ -48,6 +48,10 @@ mod model {
         pub labels: Option<Vec<String>>,
         #[dots(tag = 5)]
         pub sub: Option<InspectSub>,
+        #[dots(tag = 6)]
+        pub subject: Option<dots_rs::InstanceRef>,
+        #[dots(tag = 7)]
+        pub twin: Option<dots_rs::InstanceRef<InspectPong>>,
     }
 
     #[derive(DotsStruct, Default, Debug, Clone)]
@@ -110,6 +114,8 @@ fn renders_types_as_dots_idl() {
          \x20   3: InspectColor color;\n\
          \x20   4: vector<string> labels;\n\
          \x20   5: InspectSub sub;\n\
+         \x20   6: instance_ref subject;\n\
+         \x20   7: instance_ref<InspectPong> twin;\n\
          }\n"
     );
 

@@ -449,3 +449,74 @@ fn registering_overwrites_existing_entry() {
         _ => panic!(),
     }
 }
+
+#[test]
+fn parse_type_name_resolves_instance_refs() {
+    use dots_rs_core::DynamicFieldKind;
+
+    let reg = Registry::new();
+    assert!(matches!(
+        reg.parse_type_name("instance_ref").unwrap(),
+        DynamicFieldKind::InstanceRef
+    ));
+    // Typed targets stay names — no registry lookup, so an unknown
+    // target type resolves fine (the key bytes are opaque anyway).
+    match reg.parse_type_name("instance_ref<NetworkRoute>").unwrap() {
+        DynamicFieldKind::InstanceRefTo(target) => assert_eq!(target, "NetworkRoute"),
+        other => panic!("expected InstanceRefTo, got {other:?}"),
+    }
+    match reg.parse_type_name("vector<instance_ref<Address>>").unwrap() {
+        DynamicFieldKind::Vec(inner) => {
+            assert!(matches!(*inner, DynamicFieldKind::InstanceRefTo(ref t) if t == "Address"));
+        }
+        other => panic!("expected Vec, got {other:?}"),
+    }
+    assert_eq!(
+        reg.parse_type_name("instance_ref<>").unwrap_err(),
+        RegistryError::MalformedTypeName("instance_ref<>".into())
+    );
+}
+
+#[test]
+fn build_dynamic_struct_rejects_non_scalar_keys() {
+    use dots_rs_model::StructPropertyData;
+
+    // A wire descriptor with a float-typed key: no dots-rust program
+    // can publish this (the derive rejects it), but a foreign or buggy
+    // peer could.
+    let reg = Registry::new();
+    let data = StructDescriptorData {
+        name: Some("Rogue".into()),
+        properties: Some(vec![StructPropertyData {
+            name: Some("value".into()),
+            tag: Some(1),
+            is_key: Some(true),
+            type_name: Some("float64".into()),
+            type_id: None,
+        }]),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        reg.build_dynamic_struct(&data).unwrap_err(),
+        RegistryError::NonScalarKey {
+            type_name: "Rogue".into(),
+            property: "value".into(),
+        }
+    );
+
+    // The same shape with a key-legal kind — including a typed ref —
+    // builds fine.
+    let data = StructDescriptorData {
+        name: Some("Fine".into()),
+        properties: Some(vec![StructPropertyData {
+            name: Some("subject".into()),
+            tag: Some(1),
+            is_key: Some(true),
+            type_name: Some("instance_ref<NetworkRoute>".into()),
+            type_id: None,
+        }]),
+        ..Default::default()
+    };
+    assert!(reg.build_dynamic_struct(&data).is_ok());
+}

@@ -50,6 +50,13 @@ pub enum RegistryError {
     MissingField(&'static str),
     /// Property in `StructDescriptorData` lacked a name, tag, or type.
     MalformedProperty(&'static str),
+    /// A key property's kind is not key-legal (wire-format spec §6.3):
+    /// keys must be bool, integer, string, uuid, enum, or an instance
+    /// reference.
+    NonScalarKey {
+        type_name: String,
+        property: String,
+    },
 }
 
 impl core::fmt::Display for RegistryError {
@@ -59,6 +66,14 @@ impl core::fmt::Display for RegistryError {
             Self::MalformedTypeName(name) => write!(f, "malformed type name `{name}`"),
             Self::MissingField(name) => write!(f, "descriptor missing required field `{name}`"),
             Self::MalformedProperty(reason) => write!(f, "malformed property: {reason}"),
+            Self::NonScalarKey {
+                type_name,
+                property,
+            } => write!(
+                f,
+                "{type_name}.{property}: key property kind is not key-legal \
+                 (wire-format spec §6.3)"
+            ),
         }
     }
 }
@@ -442,6 +457,16 @@ impl Registry {
                 .as_ref()
                 .ok_or(RegistryError::MalformedProperty("missing type"))?;
             let kind = self.parse_type_name(type_name)?;
+            // Key properties must be of key-legal kinds (wire-format
+            // spec §6.3). Ordering is NOT checked here: property order
+            // in a wire descriptor is presentation, and the canonical
+            // key sorts by tag regardless.
+            if is_key && !kind.is_valid_key_kind() {
+                return Err(RegistryError::NonScalarKey {
+                    type_name: name,
+                    property: prop_name,
+                });
+            }
             properties.push(DynamicPropertyDescriptor {
                 name: prop_name,
                 tag,
@@ -530,12 +555,24 @@ impl Registry {
             "property_set" => return Ok(DynamicFieldKind::PropertySet),
             "uuid" => return Ok(DynamicFieldKind::Uuid),
             "any" => return Ok(DynamicFieldKind::Any),
+            "instance_ref" => return Ok(DynamicFieldKind::InstanceRef),
             _ => {}
         }
 
         if let Some(inner) = strip_vector(s) {
             let inner_kind = self.parse_type_name(inner)?;
             return Ok(DynamicFieldKind::Vec(Box::new(inner_kind)));
+        }
+
+        // `instance_ref<Target>` — the target stays a name (no registry
+        // lookup): the codec treats the key as opaque bytes, so nothing
+        // depends on the target type being registered here.
+        if let Some(target) = strip_generic(s, "instance_ref") {
+            let target = target.trim();
+            if target.is_empty() {
+                return Err(RegistryError::MalformedTypeName(s.into()));
+            }
+            return Ok(DynamicFieldKind::InstanceRefTo(target.into()));
         }
 
         match self.lookup(s) {
@@ -551,12 +588,18 @@ impl Registry {
 /// `None`. Whitespace inside the angle brackets is preserved for
 /// recursive parsing.
 fn strip_vector(s: &str) -> Option<&str> {
+    strip_generic(s, "vector")
+}
+
+/// Strip an outer `base<...>` wrapper. Returns `Some(inner)` if `s` is
+/// exactly of that form (with matching brackets), else `None`.
+/// Whitespace inside the angle brackets is preserved for recursive
+/// parsing.
+fn strip_generic<'a>(s: &'a str, base: &str) -> Option<&'a str> {
     let s = s.trim();
-    let prefix = "vector<";
-    if !s.starts_with(prefix) || !s.ends_with('>') {
-        return None;
-    }
-    Some(&s[prefix.len()..s.len() - 1])
+    let rest = s.strip_prefix(base)?;
+    let inner = rest.strip_prefix('<')?;
+    inner.strip_suffix('>')
 }
 
 #[cfg(test)]
