@@ -38,10 +38,9 @@ fn accepts_compliant_sources() {
 
 #[test]
 fn rejects_out_of_order_key_declarations() {
-    let message = validate(
-        "struct Route {\n    2: [key] string name;\n    1: [key] string parent;\n}\n",
-    )
-    .expect("out-of-order keys must be rejected");
+    let message =
+        validate("struct Route {\n    2: [key] string name;\n    1: [key] string parent;\n}\n")
+            .expect("out-of-order keys must be rejected");
     assert!(message.contains("ascending tag order"), "{message}");
     assert!(message.contains("`parent` (tag 1)"), "{message}");
 }
@@ -49,14 +48,8 @@ fn rejects_out_of_order_key_declarations() {
 #[test]
 fn rejects_non_scalar_key_types() {
     for (source, expected) in [
-        (
-            "struct S { 1: [key] float64 value; }",
-            "not byte-stable",
-        ),
-        (
-            "struct S { 1: [key] timepoint at; }",
-            "not byte-stable",
-        ),
+        ("struct S { 1: [key] float64 value; }", "not byte-stable"),
+        ("struct S { 1: [key] timepoint at; }", "not byte-stable"),
         (
             "struct S { 1: [key] vector<string> names; }",
             "vectors cannot be keys",
@@ -84,11 +77,12 @@ fn accepts_enum_and_ref_keys() {
 
 #[test]
 fn rejects_non_struct_ref_targets() {
-    let message = validate(
-        "enum Mood { 1: happy }\nstruct S { 1: instance_ref<Mood> mood_ref; }",
-    )
-    .expect("enum ref target must be rejected");
-    assert!(message.contains("targets must be struct types"), "{message}");
+    let message = validate("enum Mood { 1: happy }\nstruct S { 1: instance_ref<Mood> mood_ref; }")
+        .expect("enum ref target must be rejected");
+    assert!(
+        message.contains("targets must be struct types"),
+        "{message}"
+    );
 
     let message = validate("struct S { 1: instance_ref<uint32> id_ref; }")
         .expect("primitive ref target must be rejected");
@@ -104,9 +98,11 @@ fn rejects_non_struct_ref_targets() {
 
 #[test]
 fn checks_ref_targets_inside_vectors() {
-    let message = validate(
-        "enum Mood { 1: happy }\nstruct S { 1: vector<instance_ref<Mood>> refs; }",
-    )
-    .expect("vector element ref target must be validated");
-    assert!(message.contains("targets must be struct types"), "{message}");
+    let message =
+        validate("enum Mood { 1: happy }\nstruct S { 1: vector<instance_ref<Mood>> refs; }")
+            .expect("vector element ref target must be validated");
+    assert!(
+        message.contains("targets must be struct types"),
+        "{message}"
+    );
 }

@@ -191,6 +191,33 @@ impl<T: RefTarget> InstanceRef<T> {
         &self.key
     }
 
+    /// Encode this reference's wire form (spec §6.5): generic refs as
+    /// `[type-name, key]`, typed refs as the bare canonical key.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.encode_into(&mut buf);
+        buf
+    }
+
+    /// Append the wire form to an existing buffer.
+    pub fn encode_into(&self, buf: &mut Vec<u8>) {
+        let mut encoder = minicbor::Encoder::new(buf);
+        self.dots_encode(&mut encoder)
+            .expect("Vec<u8> writes are infallible");
+    }
+
+    /// Decode one reference from `bytes`, rejecting trailing input.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut d = minicbor::Decoder::new(bytes);
+        let decoded = Self::dots_decode(&mut d)?;
+        if d.position() != bytes.len() {
+            return Err(DecodeError::message(
+                "trailing bytes after instance reference",
+            ));
+        }
+        Ok(decoded)
+    }
+
     /// Widen to the generic form, materializing the type name.
     pub fn into_any(self) -> InstanceRef<AnyInstance> {
         InstanceRef {
@@ -336,9 +363,7 @@ pub fn materialize_key(
         valid = valid.with_tag(tag);
     }
     if d.position() != key.len() {
-        return Err(DecodeError::message(
-            "trailing bytes after canonical key",
-        ));
+        return Err(DecodeError::message("trailing bytes after canonical key"));
     }
 
     Ok(DynamicStruct {
@@ -468,10 +493,7 @@ mod tests {
         assert_eq!(value.key_bytes(), [0x81, 0x64, b'e', b't', b'h', b'0']);
 
         let generic = value.instance_ref();
-        assert_eq!(
-            generic.key_bytes(),
-            [0x81, 0x64, b'e', b't', b'h', b'0']
-        );
+        assert_eq!(generic.key_bytes(), [0x81, 0x64, b'e', b't', b'h', b'0']);
 
         let mut buf = Vec::new();
         let mut e: CborEncoder<'_> = minicbor::Encoder::new(&mut buf);
@@ -561,9 +583,7 @@ mod tests {
         // Wrong arity.
         assert!(decode_any(&[0x81, 0x6B]).is_err());
         // Key element is not an array (a text string instead).
-        assert!(
-            decode_any(&[0x82, 0x61, b'T', 0x64, b'e', b't', b'h', b'0']).is_err()
-        );
+        assert!(decode_any(&[0x82, 0x61, b'T', 0x64, b'e', b't', b'h', b'0']).is_err());
     }
 
     fn decode_any(bytes: &[u8]) -> Result<InstanceRef, DecodeError> {
@@ -594,7 +614,10 @@ mod tests {
 
     #[test]
     fn display_is_diagnostic() {
-        assert_eq!(format!("{}", eth0().instance_ref()), r#"ExampleType["eth0"]"#);
+        assert_eq!(
+            format!("{}", eth0().instance_ref()),
+            r#"ExampleType["eth0"]"#
+        );
         // Malformed key falls back to hex.
         let broken = InstanceRef {
             type_name: Some("X".into()),
