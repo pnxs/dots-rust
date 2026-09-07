@@ -314,17 +314,27 @@ impl<T: RefTarget> DotsTypeKind for InstanceRef<T> {
 }
 
 /// Read one canonical-key array from the decoder, returning its raw
-/// bytes (the complete CBOR item). The key is kept opaque — comparison
-/// never needs its elements — but it must at least *be* an array.
+/// bytes (the complete CBOR item). Elements remain opaque, but the
+/// array must be definite-length and contain no top-level nulls.
 pub(crate) fn read_key_array(d: &mut CborDecoder<'_>) -> Result<Vec<u8>, DecodeError> {
-    if d.datatype()? != minicbor::data::Type::Array {
-        return Err(DecodeError::message(
-            "invalid instance reference: canonical key must be a CBOR array",
-        ));
-    }
     let start = d.position();
-    d.skip()?;
+    skip_complete_key_array(d)?;
     Ok(d.input()[start..d.position()].to_vec())
+}
+
+fn skip_complete_key_array(d: &mut CborDecoder<'_>) -> Result<(), DecodeError> {
+    let len = d.array()?.ok_or_else(|| {
+        DecodeError::message("indefinite-length array not supported in a canonical key")
+    })?;
+    for _ in 0..len {
+        if d.datatype()? == minicbor::data::Type::Null {
+            return Err(DecodeError::message(
+                "invalid instance reference: canonical key must not contain null elements",
+            ));
+        }
+        d.skip()?;
+    }
+    Ok(())
 }
 
 /// Whether `key` is a definite-length CBOR array without top-level
@@ -333,21 +343,7 @@ pub(crate) fn read_key_array(d: &mut CborDecoder<'_>) -> Result<Vec<u8>, DecodeE
 /// `false`.
 fn key_is_complete(key: &[u8]) -> bool {
     let mut d = minicbor::Decoder::new(key);
-    let Ok(Some(len)) = d.array() else {
-        return false;
-    };
-    for _ in 0..len {
-        match d.datatype() {
-            Ok(minicbor::data::Type::Null) => return false,
-            Ok(_) => {
-                if d.skip().is_err() {
-                    return false;
-                }
-            }
-            Err(_) => return false,
-        }
-    }
-    d.position() == key.len()
+    skip_complete_key_array(&mut d).is_ok() && d.position() == key.len()
 }
 
 // ===== Materialization =====

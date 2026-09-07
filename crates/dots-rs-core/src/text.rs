@@ -200,15 +200,26 @@ impl DynamicFieldKind {
                 .parse_signed(text, i64::MIN as i128, i64::MAX as i128)
                 .map(|v| DynamicValue::I64(v as i64)),
             Self::F32 => {
-                let value = self.parse_float(text)?;
-                let narrowed = value as f32;
-                // A finite value that overflows to ±inf, or a non-zero
-                // one that underflows to 0, is out of `float32` range.
-                if (value.is_finite() && !narrowed.is_finite()) || (value != 0.0 && narrowed == 0.0)
+                let value = text.parse::<f32>().map_err(|_| {
+                    ParseValueError::malformed(self.type_name(), "expected a number")
+                })?;
+                // Inspect the input after validating its syntax: parsing
+                // can already have rounded a numeric literal to inf/zero.
+                let unsigned = text.trim_start_matches(['+', '-']);
+                let explicit_infinity = unsigned.eq_ignore_ascii_case("inf")
+                    || unsigned.eq_ignore_ascii_case("infinity");
+                let nonzero_significand = text
+                    .split(['e', 'E'])
+                    .next()
+                    .unwrap_or("")
+                    .bytes()
+                    .any(|b| matches!(b, b'1'..=b'9'));
+                if (value.is_infinite() && !explicit_infinity)
+                    || (value == 0.0 && nonzero_significand)
                 {
                     return Err(ParseValueError::out_of_range(self.type_name()));
                 }
-                Ok(DynamicValue::F32(narrowed))
+                Ok(DynamicValue::F32(value))
             }
             Self::F64 => self.parse_float(text).map(DynamicValue::F64),
             Self::String => unescape_string(text)
@@ -872,6 +883,54 @@ mod tests {
             DynamicFieldKind::F64.parse_value("1e3").unwrap(),
             DynamicValue::F64(1000.0)
         );
+    }
+
+    #[test]
+    fn float32_rejects_numeric_overflow_and_underflow() {
+        for text in ["1e40", "1e400", "1e-50", "1e-400", "1E400", "1E-400"] {
+            for sign in ["", "+", "-"] {
+                let input = format!("{sign}{text}");
+                assert_eq!(
+                    DynamicFieldKind::F32
+                        .parse_value(&input)
+                        .unwrap_err()
+                        .reason,
+                    ParseErrorReason::OutOfRange,
+                    "{input}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn float32_preserves_special_values_and_range_boundaries() {
+        for (text, expected) in [
+            ("inf", f32::INFINITY),
+            ("+INFINITY", f32::INFINITY),
+            ("-Inf", f32::NEG_INFINITY),
+            ("0e400", 0.0),
+            ("+0.000E-400", 0.0),
+            ("-0e-400", -0.0),
+        ] {
+            let DynamicValue::F32(value) = DynamicFieldKind::F32.parse_value(text).unwrap() else {
+                panic!("expected float32");
+            };
+            assert_eq!(value.to_bits(), expected.to_bits(), "{text}");
+        }
+        for text in ["NaN", "+nan", "-NAN"] {
+            let DynamicValue::F32(value) = DynamicFieldKind::F32.parse_value(text).unwrap() else {
+                panic!("expected float32");
+            };
+            assert!(value.is_nan());
+        }
+        for value in [f32::MAX, f32::MIN, f32::MIN_POSITIVE, f32::from_bits(1)] {
+            assert_eq!(
+                DynamicFieldKind::F32
+                    .parse_value(&value.to_string())
+                    .unwrap(),
+                DynamicValue::F32(value)
+            );
+        }
     }
 
     #[test]

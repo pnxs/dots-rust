@@ -211,6 +211,35 @@ fn both_ref_forms_round_trip_inside_a_struct() {
 }
 
 #[test]
+fn both_ref_forms_reject_incomplete_keys() {
+    for key in [
+        &[0x81, 0xf6][..],   // [null]
+        &[0x82, 0x01, 0xf6], // [1, null]
+        &[0x9f, 0x01, 0xff], // indefinite array
+        &[0x82, 0x01],       // truncated array
+    ] {
+        assert!(InstanceRef::<ExampleType>::decode(key).is_err());
+        let mut generic = vec![0x82, 0x61, b'X'];
+        generic.extend_from_slice(key);
+        assert!(InstanceRef::<AnyInstance>::decode(&generic).is_err());
+
+        // Exercise the static and dynamic property codecs as well.
+        for (tag, payload) in [(1, generic.as_slice()), (2, key)] {
+            let mut bytes = vec![0xa1, tag];
+            bytes.extend_from_slice(payload);
+            assert!(dots_rs_core::decode_typed_from_slice::<RefPair>(&bytes).is_err());
+            let descriptor = std::sync::Arc::new(
+                dots_rs_core::DynamicStructDescriptor::from_static(RefPair::DESCRIPTOR),
+            );
+            assert!(DynamicStruct::decode(descriptor, &bytes).is_err());
+        }
+    }
+    // A keyless singleton still has a complete identity.
+    assert!(InstanceRef::<TimeType>::decode(&[0x80]).is_ok());
+    assert!(InstanceRef::<AnyInstance>::decode(&[0x82, 0x61, b'X', 0x80]).is_ok());
+}
+
+#[test]
 fn typed_ref_materializes_back_to_key_properties() {
     let typed: InstanceRef<ExampleType> = InstanceRef::of(&eth0());
     let descriptor = std::sync::Arc::new(dots_rs_core::DynamicStructDescriptor::from_static(
