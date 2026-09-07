@@ -97,6 +97,64 @@ fn resolve_roots(rt_internal: bool, rt_path: &Option<Path>) -> Roots {
     }
 }
 
+/// Derive a DOTS struct.
+///
+/// Fields are `Option<T>` (partial-object semantics), each tagged with
+/// `#[dots(tag = N)]`; `#[dots(key)]` marks key properties, which may
+/// also be a bare `T`.
+///
+/// # Key-property constraints (wire-format spec §6.3)
+///
+/// Key properties must be declared in **ascending tag order**, so
+/// declaration order and canonical-key (tag) order are provably the
+/// same:
+///
+/// ```compile_fail
+/// # use dots_rs_derive::DotsStruct;
+/// #[derive(DotsStruct, Debug, PartialEq, Clone)]
+/// #[dots(name = "OutOfOrder")]
+/// struct OutOfOrder {
+///     #[dots(tag = 2, key)]
+///     name: Option<String>,
+///     #[dots(tag = 1, key)]
+///     parent: Option<String>,
+/// }
+/// ```
+///
+/// Key properties must be of a kind whose equality is byte-stable —
+/// bool, integer, string, uuid, or enum. Floats (and `timepoint`,
+/// `duration`, `property_set`, vectors, `any`) are rejected
+/// syntactically:
+///
+/// ```compile_fail
+/// # use dots_rs_derive::DotsStruct;
+/// #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+/// #[dots(name = "FloatKey")]
+/// struct FloatKey {
+///     #[dots(tag = 1, key)]
+///     value: Option<f64>,
+/// }
+/// ```
+///
+/// Nested structs are not syntactically distinguishable from enums, so
+/// a struct-typed key fails at const evaluation instead:
+///
+/// ```compile_fail
+/// # use dots_rs_derive::DotsStruct;
+/// #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+/// #[dots(name = "Inner")]
+/// struct Inner {
+///     #[dots(tag = 1)]
+///     x: Option<u32>,
+/// }
+///
+/// #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+/// #[dots(name = "StructKey")]
+/// struct StructKey {
+///     #[dots(tag = 1, key)]
+///     inner: Option<Inner>,
+/// }
+/// ```
 #[proc_macro_derive(DotsStruct, attributes(dots))]
 pub fn derive_dots_struct(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -390,6 +448,41 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
     }
+
+    // Key properties must be declared in ascending tag order
+    // (wire-format spec §6.3). Declaration order is then provably the
+    // canonical-key (tag) order, so `new()`'s argument order, the
+    // canonical instance key, and presentation layers all agree.
+    let mut prev_key: Option<&DotsField<'_>> = None;
+    for field in fields.iter().filter(|f| f.is_key) {
+        if let Some(prev) = prev_key {
+            if field.tag < prev.tag {
+                return Err(syn::Error::new(
+                    field.ident.span(),
+                    format!(
+                        "`#[dots(key)]` properties must be declared in ascending tag order; \
+                         `{}` (tag {}) is declared after `{}` (tag {})",
+                        field.ident, field.tag, prev.ident, prev.tag
+                    ),
+                ));
+            }
+        }
+        prev_key = Some(field);
+    }
+
+    // Const backstop for the §6.3 key-kind rule: kinds `parse_field`
+    // cannot see syntactically (a nested struct behind a bare type
+    // name, a type alias to a float, …) still fail at const-eval.
+    let key_kind_asserts = fields.iter().filter(|f| f.is_key).map(|f| {
+        let kind = field_kind_for(f.inner_ty, dots_rt);
+        quote! {
+            const _: () = assert!(
+                #kind.is_valid_key_kind(),
+                "`#[dots(key)]` property kind is not key-legal; keys must be \
+                 bool, integer, string, uuid, or enum (wire-format spec 6.3)"
+            );
+        }
+    });
 
     // Per-property vtable statics + descriptor entries.
     let property_decls = fields.iter().map(|f| property_decl(struct_ident, f, dots_rt));
@@ -734,6 +827,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         // `static __DOTS_VTABLE_<field>: PropertyVtable = ...;`.
         #[doc(hidden)]
         const _: () = {
+            #( #key_kind_asserts )*
+
             #( #property_decls )*
 
             static #descriptor_const_ident: #dots_rt::StructDescriptor =
@@ -932,6 +1027,33 @@ fn type_is_any(ty: &Type) -> bool {
         }
     }
     false
+}
+
+/// The reason a syntactically recognizable type is illegal as a
+/// `#[dots(key)]` property (wire-format spec §6.3), or `None` when the
+/// type is either key-legal or not decidable from syntax. Matching is
+/// by last path segment — the same technique as [`type_is_any`] — so
+/// aliases and nested structs pass here and are caught by the const
+/// assertion on `DotsTypeKind::KIND` instead.
+fn key_forbidden_kind(ty: &Type) -> Option<&'static str> {
+    if type_is_any(ty) {
+        return Some("`any` (AnyObject)");
+    }
+    if vec_element_type(ty).is_some() {
+        return Some("`vector` (Vec)");
+    }
+    if let Type::Path(tp) = ty {
+        if let Some(last) = tp.path.segments.last() {
+            return match last.ident.to_string().as_str() {
+                "f32" | "f64" => Some("floating-point"),
+                "Timepoint" => Some("`timepoint` (Timepoint)"),
+                "Duration" => Some("`duration` (Duration)"),
+                "PropertySet" => Some("`property_set` (PropertySet)"),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 /// If `ty` is `Vec<X>` for any `X`, return `&X`. Otherwise `None`.
@@ -1218,14 +1340,22 @@ fn parse_field(field: &Field) -> syn::Result<DotsField<'_>> {
         ));
     }
 
-    // `any` (and, later, `variant`) properties as keys are disallowed:
-    // comparing opaque heterogeneous blobs as keys is a footgun. Caught
-    // here syntactically by the `AnyObject` type name.
-    if attrs.is_key && type_is_any(inner_ty) {
-        return Err(syn::Error::new(
-            field.span(),
-            "`any` (AnyObject) properties cannot be `#[dots(key)]`",
-        ));
+    // Key properties must be of a kind whose equality is byte-stable
+    // (wire-format spec §6.3). Kinds the macro can recognize
+    // syntactically are rejected here with a precise span; nested
+    // structs hiding behind a bare type name are caught by the const
+    // assertion on `DotsTypeKind::KIND` that `expand` emits per key
+    // field.
+    if attrs.is_key {
+        if let Some(kind) = key_forbidden_kind(inner_ty) {
+            return Err(syn::Error::new(
+                field.span(),
+                format!(
+                    "{kind} properties cannot be `#[dots(key)]`: key equality \
+                     must be byte-stable (wire-format spec §6.3)"
+                ),
+            ));
+        }
     }
 
     let doc_lines = extract_doc_lines(&field.attrs);

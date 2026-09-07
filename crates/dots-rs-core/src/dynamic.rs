@@ -186,6 +186,26 @@ impl DynamicPropertyDescriptor {
 }
 
 impl DynamicFieldKind {
+    /// Whether this kind is legal for a key property — dynamic
+    /// counterpart of [`FieldKind::is_valid_key_kind`].
+    pub fn is_valid_key_kind(&self) -> bool {
+        matches!(
+            self,
+            Self::Bool
+                | Self::U8
+                | Self::U16
+                | Self::U32
+                | Self::U64
+                | Self::I8
+                | Self::I16
+                | Self::I32
+                | Self::I64
+                | Self::String
+                | Self::Uuid
+                | Self::Enum(_)
+        )
+    }
+
     fn from_static(k: &FieldKind) -> Self {
         match k {
             FieldKind::Bool => Self::Bool,
@@ -401,36 +421,28 @@ impl DynamicStruct {
         buf
     }
 
-    /// Encode the key-properties of this struct as a deterministic
-    /// CBOR array — same shape as [`crate::encode_key_bytes`] for
-    /// typed values, suitable as a map key for in-memory caches that
-    /// need to dedupe instances by their declared key fields.
+    /// The canonical instance key (wire-format spec §6): a
+    /// deterministic CBOR array of the key-property values in
+    /// **ascending tag order**, with `null` for an unset key property
+    /// and `[]` for keyless types. Byte-identical to
+    /// [`crate::encode_key_bytes`] for the same logical value.
     ///
-    /// Properties marked `#[dots(key)]` are emitted in declaration
-    /// order; missing key fields are encoded as `null` so partial-key
-    /// values stay distinguishable from values where the key is set
-    /// to a default-encoded zero.
+    /// Iteration goes through the key mask rather than the
+    /// descriptor's property list, so descriptors received over the
+    /// wire with out-of-order property entries still produce the
+    /// canonical byte form. Byte equality of two keys is instance
+    /// identity; the bytes also serve as map keys for in-memory
+    /// caches.
     pub fn key_bytes(&self) -> Vec<u8> {
+        let key_mask = self.descriptor.key_mask();
         let mut buf = Vec::new();
         let mut encoder = minicbor::Encoder::new(&mut buf);
-        let key_count = self
-            .descriptor
-            .properties
-            .iter()
-            .filter(|p| p.is_key)
-            .count() as u64;
         encoder
-            .array(key_count)
+            .array(key_mask.len() as u64)
             .expect("Vec<u8> writes are infallible");
-        for prop in &self.descriptor.properties {
-            if !prop.is_key {
-                continue;
-            }
-            let value = if self.valid.has(prop.tag) {
-                self.properties
-                    .iter()
-                    .find(|(t, _)| *t == prop.tag)
-                    .map(|(_, v)| v)
+        for tag in key_mask.iter() {
+            let value = if self.valid.has(tag) {
+                self.get(tag)
             } else {
                 None
             };

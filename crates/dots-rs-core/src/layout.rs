@@ -654,21 +654,27 @@ pub fn key_set(value: &dyn StructValue) -> PropertySet {
     set
 }
 
-/// Encode the value's *key* properties — those marked `#[dots(key)]` —
-/// as a CBOR array, returning the bytes. Suitable as a `BTreeMap` /
-/// `HashMap` key for indexing instances by their primary key.
+/// The canonical instance key (wire-format spec §6): a deterministic
+/// CBOR array of the `#[dots(key)]` property values in ascending tag
+/// order, with `null` for an unset key property and `[]` for keyless
+/// types. Byte equality of two keys is instance identity; the bytes
+/// also serve as `BTreeMap`/`HashMap` keys for indexing instances.
 ///
-/// Properties are encoded in declaration order. A key property whose
-/// `Option<T>` is `None` writes a CBOR `null`, so partial-key values
-/// stay distinguishable from values where the key is set to a
-/// default-encoded zero.
+/// Byte-identical to [`DynamicStruct::key_bytes`] for the same
+/// logical value.
+///
+/// [`DynamicStruct::key_bytes`]: crate::DynamicStruct::key_bytes
 pub fn encode_key_bytes(value: &dyn StructValue) -> Vec<u8> {
     let mut buf = Vec::new();
     encode_key_into(value, &mut buf);
     buf
 }
 
-/// Append the key-properties CBOR array to an existing buffer.
+/// Append the canonical-key CBOR array to an existing buffer.
+///
+/// Key properties are walked in declaration order, which the derive
+/// guarantees equals ascending tag order (key properties must be
+/// declared ascending — wire-format spec §6.3).
 pub fn encode_key_into(value: &dyn StructValue, buf: &mut Vec<u8>) {
     let descriptor = value.descriptor();
     let base = value.data_ptr();

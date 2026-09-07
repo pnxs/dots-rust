@@ -75,6 +75,32 @@ pub enum FieldKind {
     Any = 19,
 }
 
+impl FieldKind {
+    /// Whether this kind is legal for a `#[dots(key)]` property
+    /// (wire-format spec §6.3): scalars whose deterministic encoding
+    /// makes byte equality valid identity. Floats, temporal types,
+    /// `property_set`, vectors, nested structs, and `any` are not —
+    /// their equality is not byte-stable (or, for `property_set`, not
+    /// an identity).
+    pub const fn is_valid_key_kind(&self) -> bool {
+        matches!(
+            self,
+            Self::Bool
+                | Self::U8
+                | Self::U16
+                | Self::U32
+                | Self::U64
+                | Self::I8
+                | Self::I16
+                | Self::I32
+                | Self::I64
+                | Self::String
+                | Self::Uuid
+                | Self::Enum(_)
+        )
+    }
+}
+
 impl PartialEq for FieldKind {
     fn eq(&self, other: &Self) -> bool {
         use FieldKind::*;
