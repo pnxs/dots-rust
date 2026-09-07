@@ -199,7 +199,17 @@ impl DynamicFieldKind {
             Self::I64 => self
                 .parse_signed(text, i64::MIN as i128, i64::MAX as i128)
                 .map(|v| DynamicValue::I64(v as i64)),
-            Self::F32 => self.parse_float(text).map(|v| DynamicValue::F32(v as f32)),
+            Self::F32 => {
+                let value = self.parse_float(text)?;
+                let narrowed = value as f32;
+                // A finite value that overflows to ±inf, or a non-zero
+                // one that underflows to 0, is out of `float32` range.
+                if (value.is_finite() && !narrowed.is_finite()) || (value != 0.0 && narrowed == 0.0)
+                {
+                    return Err(ParseValueError::out_of_range(self.type_name()));
+                }
+                Ok(DynamicValue::F32(narrowed))
+            }
             Self::F64 => self.parse_float(text).map(DynamicValue::F64),
             Self::String => unescape_string(text)
                 .map(DynamicValue::String)
@@ -243,7 +253,11 @@ impl DynamicFieldKind {
     }
 
     /// Render `value` as text that [`parse_value`](Self::parse_value)
-    /// reads back into an equal value.
+    /// reads back into an equal value. The one precision caveat is
+    /// `timepoint`: the ISO-8601 form carries nanoseconds, which is
+    /// exact for epoch-scale instants (an `f64` ulp exceeds a
+    /// nanosecond beyond ~5·10⁶ s) but rounds finer fractions of tiny
+    /// magnitudes.
     ///
     /// A `value` whose variant doesn't match this kind is rendered by
     /// its own [`Display`](core::fmt::Display) impl rather than
@@ -497,11 +511,19 @@ pub fn parse_timepoint(text: &str) -> Result<f64, ParseValueError> {
         .ok_or_else(|| ParseValueError::malformed("timepoint", "expected seconds or ISO-8601"))
 }
 
+/// Earliest / latest instants the ISO-8601 form covers: years
+/// `0000-01-01` through `9999-12-31` (four-digit years, as the parser
+/// expects). Values outside fall back to raw seconds text.
+const MIN_ISO_SECS: f64 = -62_167_219_200.0;
+const MAX_ISO_SECS: f64 = 253_402_300_800.0;
+
 /// Render a `timepoint` as an ISO-8601 UTC instant, with the
 /// fractional part written to nanosecond precision and trailing zeros
-/// trimmed. Non-finite values fall back to their float text.
+/// trimmed. Non-finite values and instants outside years 0000–9999
+/// fall back to their float text, which [`parse_timepoint`] also
+/// accepts.
 pub fn format_timepoint(secs: f64) -> String {
-    if !secs.is_finite() {
+    if !secs.is_finite() || !(MIN_ISO_SECS..MAX_ISO_SECS).contains(&secs) {
         return format!("{secs}");
     }
     let mut whole = floor(secs) as i64;
@@ -572,12 +594,15 @@ fn parse_iso8601(text: &str) -> Option<f64> {
         return None;
     }
     let day: i64 = read_int(&text[8..10])?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
         return None;
     }
 
     let mut rest = &text[10..];
-    let (mut hour, mut minute, mut second, mut fraction) = (0i64, 0i64, 0i64, 0.0f64);
+    let (mut hour, mut minute, mut second) = (0i64, 0i64, 0i64);
+    // Fractional-second digits, kept as text so the final value is one
+    // correctly rounded decimal-to-float conversion.
+    let mut fraction_digits = "";
 
     if !rest.is_empty() {
         let separator = rest.as_bytes()[0];
@@ -603,12 +628,12 @@ fn parse_iso8601(text: &str) -> Option<f64> {
             rest = &rest[3..];
         }
         if rest.starts_with('.') || rest.starts_with(',') {
-            let digits: String = rest[1..].chars().take_while(char::is_ascii_digit).collect();
-            if digits.is_empty() {
+            let digit_count = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
+            if digit_count == 0 {
                 return None;
             }
-            fraction = format!("0.{digits}").parse::<f64>().ok()?;
-            rest = &rest[1 + digits.len()..];
+            fraction_digits = &rest[1..1 + digit_count];
+            rest = &rest[1 + digit_count..];
         }
         if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
             return None;
@@ -643,7 +668,47 @@ fn parse_iso8601(text: &str) -> Option<f64> {
 
     let days = days_from_civil(year, month, day);
     let whole = days * SECS_PER_DAY + hour * 3600 + minute * 60 + second - offset_secs;
-    Some(whole as f64 + fraction)
+    Some(seconds_from_parts(whole, fraction_digits))
+}
+
+/// Combine whole seconds and fractional digits into an `f64` through a
+/// single decimal-to-float conversion, so the result is the correctly
+/// rounded value of the written decimal — also for negative instants,
+/// where `whole` (floored) and the fraction have opposite signs and a
+/// naive `whole + fraction` would round twice.
+fn seconds_from_parts(whole: i64, fraction_digits: &str) -> f64 {
+    // Beyond 18 digits the fraction is far below f64 resolution.
+    let digits = &fraction_digits[..fraction_digits.len().min(18)];
+    let fraction: u64 = digits.parse().unwrap_or(0);
+    if fraction == 0 {
+        return whole as f64;
+    }
+    let text = if whole >= 0 {
+        format!("{whole}.{digits}")
+    } else {
+        // -1 + 0.7 == -(0 + 0.3): borrow one second and complement the
+        // fraction within its digit count.
+        let scale = 10u64.pow(digits.len() as u32);
+        format!(
+            "-{}.{:0width$}",
+            -(whole + 1),
+            scale - fraction,
+            width = digits.len()
+        )
+    };
+    text.parse().unwrap_or(whole as f64)
+}
+
+/// Days in `month` of the proleptic-Gregorian `year`.
+const fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            if leap { 29 } else { 28 }
+        }
+    }
 }
 
 /// All-ASCII-digit string to integer, rejecting anything else (unlike
@@ -988,12 +1053,45 @@ mod tests {
                 .reason,
             ParseErrorReason::Malformed("expected 32 hex digits")
         );
-        assert_eq!(
+        for bad_date in [
+            "2020-13-01T00:00:00Z",
+            "2021-02-30",
+            "2021-04-31T00:00:00Z",
+            "2100-02-29", // not a leap year (century rule)
+        ] {
+            assert_eq!(
+                DynamicFieldKind::Timepoint
+                    .parse_value(bad_date)
+                    .unwrap_err()
+                    .reason,
+                ParseErrorReason::Malformed("expected seconds or ISO-8601"),
+                "{bad_date}"
+            );
+        }
+        // Leap days that do exist.
+        assert!(
             DynamicFieldKind::Timepoint
-                .parse_value("2020-13-01T00:00:00Z")
+                .parse_value("2020-02-29")
+                .is_ok()
+        );
+        assert!(
+            DynamicFieldKind::Timepoint
+                .parse_value("2000-02-29")
+                .is_ok()
+        );
+        assert_eq!(
+            DynamicFieldKind::F32
+                .parse_value("1e39")
                 .unwrap_err()
                 .reason,
-            ParseErrorReason::Malformed("expected seconds or ISO-8601")
+            ParseErrorReason::OutOfRange
+        );
+        assert_eq!(
+            DynamicFieldKind::F32
+                .parse_value("1e-50")
+                .unwrap_err()
+                .reason,
+            ParseErrorReason::OutOfRange
         );
         assert_eq!(
             DynamicFieldKind::Any
@@ -1036,10 +1134,29 @@ mod tests {
         assert_eq!(format_timepoint(0.0), "1970-01-01T00:00:00Z");
         assert_eq!(format_timepoint(-1.0), "1969-12-31T23:59:59Z");
         assert_eq!(format_duration(123.456), "123.456s");
+        // Outside years 0000–9999 (and far beyond i64) the text form
+        // falls back to raw seconds, which parses back unchanged.
+        for out_of_calendar in [1e19, -1e19, 1e300, 253_402_300_800.0, -62_167_219_201.0] {
+            let text = format_timepoint(out_of_calendar);
+            assert_eq!(text, format!("{out_of_calendar}"));
+            assert_eq!(parse_timepoint(&text).unwrap(), out_of_calendar);
+        }
+        assert_eq!(format_timepoint(253_402_300_799.0), "9999-12-31T23:59:59Z");
+    }
+
+    /// Negative instants split into a floored second and a positive
+    /// fraction; reassembly must not round twice.
+    #[test]
+    fn negative_fractional_timepoints_round_trip() {
+        for secs in [-0.3, -0.7, -1.1, -86_401.75, -1583960877.123_456_7] {
+            let text = format_timepoint(secs);
+            assert_eq!(parse_timepoint(&text).unwrap(), secs, "{text}");
+        }
     }
 
     /// Every kind's `format_value` output must parse back to the same
-    /// value, bit for bit.
+    /// value, bit for bit (timepoints at epoch scale, where nanosecond
+    /// text is finer than an `f64` ulp).
     #[test]
     fn round_trips_every_kind() {
         let cases: alloc::vec::Vec<(DynamicFieldKind, DynamicValue)> = vec![
