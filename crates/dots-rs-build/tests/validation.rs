@@ -37,12 +37,13 @@ fn accepts_compliant_sources() {
 }
 
 #[test]
-fn rejects_out_of_order_key_declarations() {
-    let message =
-        validate("struct Route {\n    2: [key] string name;\n    1: [key] string parent;\n}\n")
-            .expect("out-of-order keys must be rejected");
-    assert!(message.contains("ascending tag order"), "{message}");
-    assert!(message.contains("`parent` (tag 1)"), "{message}");
+fn key_declaration_order_is_free() {
+    // Identity artifacts sort by tag (spec §6.3), so declaring key
+    // properties out of tag order is legal.
+    assert_eq!(
+        validate("struct Route {\n    2: [key] string name;\n    1: [key] string parent;\n}\n"),
+        None
+    );
 }
 
 #[test]

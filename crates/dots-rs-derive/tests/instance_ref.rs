@@ -33,6 +33,18 @@ mod model {
         pub via: Option<String>,
     }
 
+    /// `RouteType` with the key properties declared out of tag order —
+    /// declaration order is free (spec §6.3); identity artifacts sort
+    /// by tag.
+    #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
+    #[dots(name = "ReversedRouteType")]
+    pub struct ReversedRouteType {
+        #[dots(tag = 2, key)]
+        pub name: Option<String>,
+        #[dots(tag = 1, key)]
+        pub parent: Option<String>,
+    }
+
     /// Spec §6.5: keyless singleton.
     #[derive(DotsStruct, Default, Debug, PartialEq, Clone)]
     #[dots(name = "TimeType")]
@@ -61,7 +73,7 @@ mod model {
         pub typed: Option<dots_rs_core::InstanceRef<ExampleType>>,
     }
 }
-use model::{ExampleType, RefPair, RouteType, StatusType, TimeType};
+use model::{ExampleType, RefPair, ReversedRouteType, RouteType, StatusType, TimeType};
 
 fn eth0() -> ExampleType {
     ExampleType {
@@ -115,6 +127,26 @@ fn golden_vectors_composite_and_keyless() {
         tz: Some("UTC".into()),
     };
     assert_eq!(encode_key_bytes(&time), [0x80]);
+}
+
+/// Declaring the key properties out of tag order changes nothing:
+/// the canonical key sorts by tag (spec §6.3).
+#[test]
+fn key_declaration_order_does_not_affect_identity() {
+    let reversed = ReversedRouteType {
+        name: Some("r1".into()),
+        parent: Some("eth0".into()),
+    };
+    // Same bytes as RouteType's golden vector: ["eth0","r1"].
+    assert_eq!(
+        encode_key_bytes(&reversed),
+        [0x82, 0x64, b'e', b't', b'h', b'0', 0x62, b'r', b'1']
+    );
+    // Static and dynamic paths agree on the reversed declaration too.
+    assert_eq!(
+        DynamicStruct::from_struct_value(&reversed).key_bytes(),
+        encode_key_bytes(&reversed)
+    );
 }
 
 /// Spec §6.6: a reference used as a key — canonical keys nest.

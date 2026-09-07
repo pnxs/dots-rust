@@ -31,7 +31,7 @@ use core::alloc::Layout;
 use core::any::Any;
 use core::ptr::NonNull;
 
-use crate::{DotsFieldOps, PropertySet, StructDescriptor, StructValue};
+use crate::{DotsFieldOps, PropertyDescriptor, PropertySet, StructDescriptor, StructValue};
 
 /// CBOR encoder type used by property thunks. Fixed-writer (`&mut Vec<u8>`)
 /// so thunk fn-pointer signatures are stable across types.
@@ -672,18 +672,19 @@ pub fn encode_key_bytes(value: &dyn StructValue) -> Vec<u8> {
 
 /// Append the canonical-key CBOR array to an existing buffer.
 ///
-/// Key properties are walked in declaration order, which the derive
-/// guarantees equals ascending tag order (key properties must be
-/// declared ascending — wire-format spec §6.3).
+/// Key properties are emitted in ascending tag order — never
+/// declaration order, which stays free to change (wire-format spec
+/// §6.3).
 pub fn encode_key_into(value: &dyn StructValue, buf: &mut Vec<u8>) {
     let descriptor = value.descriptor();
     let base = value.data_ptr();
     let mut encoder = minicbor::Encoder::new(buf);
-    let key_count = descriptor.key_properties().count() as u64;
+    let mut key_properties: Vec<&PropertyDescriptor> = descriptor.key_properties().collect();
+    key_properties.sort_unstable_by_key(|p| p.tag);
     encoder
-        .array(key_count)
+        .array(key_properties.len() as u64)
         .expect("Vec<u8> writes are infallible");
-    for prop in descriptor.key_properties() {
+    for prop in key_properties {
         // SAFETY: `prop.offset` is in-range for `descriptor`'s layout
         // by descriptor construction; `value.data_ptr()` points at a
         // buffer of that layout for `&self`'s lifetime.

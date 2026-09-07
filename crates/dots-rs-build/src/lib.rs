@@ -261,21 +261,9 @@ fn validate_file(file: &File, kinds: &HashMap<&str, LocalKind>) -> Result<(), St
     for item in &file.items {
         let Item::Struct(s) = item else { continue };
 
-        // Key properties must be declared in ascending tag order.
-        let mut prev: Option<&Property> = None;
+        // Key properties must be of byte-stable-equality kinds. Their
+        // declaration order is free — identity artifacts sort by tag.
         for prop in s.properties.iter().filter(|p| p.is_key()) {
-            if let Some(prev) = prev {
-                if prop.tag <= prev.tag {
-                    return Err(format!(
-                        "struct {}: [key] properties must be declared in ascending tag \
-                         order; `{}` (tag {}) is declared after `{}` (tag {})",
-                        s.name, prop.name, prop.tag, prev.name, prev.tag
-                    ));
-                }
-            }
-            prev = Some(prop);
-
-            // Key properties must be of byte-stable-equality kinds.
             if let Some(reason) = key_type_error(&prop.ty, kinds) {
                 return Err(format!(
                     "struct {}: [key] property `{}` {reason}",

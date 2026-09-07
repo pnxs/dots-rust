@@ -105,21 +105,9 @@ fn resolve_roots(rt_internal: bool, rt_path: &Option<Path>) -> Roots {
 ///
 /// # Key-property constraints (wire-format spec §6.3)
 ///
-/// Key properties must be declared in **ascending tag order**, so
-/// declaration order and canonical-key (tag) order are provably the
-/// same:
-///
-/// ```compile_fail
-/// # use dots_rs_derive::DotsStruct;
-/// #[derive(DotsStruct, Debug, PartialEq, Clone)]
-/// #[dots(name = "OutOfOrder")]
-/// struct OutOfOrder {
-///     #[dots(tag = 2, key)]
-///     name: Option<String>,
-///     #[dots(tag = 1, key)]
-///     parent: Option<String>,
-/// }
-/// ```
+/// Key properties may be declared in any order — identity artifacts
+/// (the canonical instance key) are sorted by tag, so declaration
+/// order never affects an instance's identity.
 ///
 /// Key properties must be of a kind whose equality is byte-stable —
 /// bool, integer, string, uuid, or enum. Floats (and `timepoint`,
@@ -447,27 +435,6 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ));
             }
         }
-    }
-
-    // Key properties must be declared in ascending tag order
-    // (wire-format spec §6.3). Declaration order is then provably the
-    // canonical-key (tag) order, so `new()`'s argument order, the
-    // canonical instance key, and presentation layers all agree.
-    let mut prev_key: Option<&DotsField<'_>> = None;
-    for field in fields.iter().filter(|f| f.is_key) {
-        if let Some(prev) = prev_key {
-            if field.tag < prev.tag {
-                return Err(syn::Error::new(
-                    field.ident.span(),
-                    format!(
-                        "`#[dots(key)]` properties must be declared in ascending tag order; \
-                         `{}` (tag {}) is declared after `{}` (tag {})",
-                        field.ident, field.tag, prev.ident, prev.tag
-                    ),
-                ));
-            }
-        }
-        prev_key = Some(field);
     }
 
     // Const backstop for the §6.3 key-kind rule: kinds `parse_field`
