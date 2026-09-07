@@ -897,6 +897,14 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 #dots_rt::FieldKind::Struct(Self::DESCRIPTOR);
         }
 
+        // Lets this struct be the target of a typed instance
+        // reference, `InstanceRef<Self>` (model type
+        // `instance_ref<Name>`).
+        impl #dots_rt::RefTarget for #struct_ident {
+            const TARGET_NAME: ::core::option::Option<&'static str> =
+                ::core::option::Option::Some(#wire_name);
+        }
+
         // `DotsField` lets this struct appear as a nested field inside
         // another DOTS struct. Encoding/decoding go through the same
         // descriptor-driven path used at the top level. The seed is built

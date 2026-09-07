@@ -26,6 +26,7 @@ mod any;
 mod descriptor;
 pub mod dynamic;
 pub mod field_ops;
+pub mod instance_ref;
 pub mod layout;
 mod property_set;
 mod registration;
@@ -49,6 +50,7 @@ pub use dynamic::{
     value_cmp, value_eq,
 };
 pub use field_ops::DotsFieldOps;
+pub use instance_ref::{AnyInstance, InstanceRef, RefTarget, instance_ref, materialize_key};
 pub use layout::{
     AnyStruct, DecodeError, DotsField, EncodeError, MissingProperties, cmp_masked,
     decode_typed_from_decoder, decode_typed_from_slice, diff_properties, encode_into_encoder,

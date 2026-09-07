@@ -73,6 +73,20 @@ pub enum FieldKind {
     /// object is an explicit, registry-resolved decode step
     /// (`crate::AnyObject` + the broker's `Registry::from_any`).
     Any = 19,
+
+    /// Generic instance reference — model type `instance_ref`
+    /// (wire-format spec §6.5). Identity-only counterpart of [`Any`]:
+    /// `[ type-name, canonical key ]` on the wire. Runtime
+    /// representation is [`crate::InstanceRef`].
+    ///
+    /// [`Any`]: FieldKind::Any
+    InstanceRef = 20,
+
+    /// Typed instance reference — model type `instance_ref<T>`. The
+    /// payload is the target's DOTS type name; the wire carries only
+    /// the canonical key array. Runtime representation is
+    /// `InstanceRef<T>`.
+    InstanceRefTo(&'static str) = 21,
 }
 
 impl FieldKind {
@@ -97,6 +111,8 @@ impl FieldKind {
                 | Self::String
                 | Self::Uuid
                 | Self::Enum(_)
+                | Self::InstanceRef
+                | Self::InstanceRefTo(_)
         )
     }
 }
@@ -110,10 +126,11 @@ impl PartialEq for FieldKind {
             | (F32, F32) | (F64, F64)
             | (String, String) | (Uuid, Uuid)
             | (Timepoint, Timepoint) | (Duration, Duration)
-            | (Any, Any) => true,
+            | (Any, Any) | (InstanceRef, InstanceRef) => true,
             (Vec(a), Vec(b)) => core::ptr::eq(*a, *b) || a == b,
             (Struct(a), Struct(b)) => core::ptr::eq(*a, *b),
             (Enum(a), Enum(b)) => core::ptr::eq(*a, *b),
+            (InstanceRefTo(a), InstanceRefTo(b)) => a == b,
             _ => false,
         }
     }

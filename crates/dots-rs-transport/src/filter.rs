@@ -288,8 +288,11 @@ impl PropertyCategory {
             Uuid => Self::Uuid,
             // `any` payloads are opaque, so they can't be filtered on
             // server-side (the type identity is in the clear, but the
-            // value is not). Treat as non-comparable.
-            PropertySet | Vec(_) | Struct(_) | Enum(_) | Any => return None,
+            // value is not). Treat as non-comparable; instance
+            // references likewise (their key bytes are opaque to the
+            // predicate DSL).
+            PropertySet | Vec(_) | Struct(_) | Enum(_) | Any | InstanceRef
+            | InstanceRefTo(_) => return None,
         })
     }
 

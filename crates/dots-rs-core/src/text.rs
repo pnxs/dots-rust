@@ -124,6 +124,8 @@ impl DynamicFieldKind {
             Self::Struct(d) => d.name.clone(),
             Self::Enum(d) => d.name.clone(),
             Self::Any => "any".into(),
+            Self::InstanceRef => "instance_ref".into(),
+            Self::InstanceRefTo(target) => format!("instance_ref<{target}>"),
         }
     }
 
@@ -234,10 +236,9 @@ impl DynamicFieldKind {
                     ParseValueError::new(self.type_name(), ParseErrorReason::UnknownEnumerator)
                 })
             }
-            Self::Struct(_) | Self::Any => Err(ParseValueError::new(
-                self.type_name(),
-                ParseErrorReason::Unsupported,
-            )),
+            Self::Struct(_) | Self::Any | Self::InstanceRef | Self::InstanceRefTo(_) => Err(
+                ParseValueError::new(self.type_name(), ParseErrorReason::Unsupported),
+            ),
         }
     }
 

@@ -309,6 +309,8 @@ pub fn field_kind_type_name(kind: &FieldKind) -> String {
         FieldKind::Struct(d) => d.name.into(),
         FieldKind::Enum(d) => d.name.into(),
         FieldKind::Any => "any".into(),
+        FieldKind::InstanceRef => "instance_ref".into(),
+        FieldKind::InstanceRefTo(target) => format!("instance_ref<{target}>"),
     }
 }
 

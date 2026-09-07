@@ -60,6 +60,16 @@ pub enum DynamicFieldKind {
     /// contained type isn't known from the schema; the value carries
     /// its own type identity. See [`crate::AnyObject`].
     Any,
+    /// Generic instance reference — model type `instance_ref`
+    /// (wire-format spec §6.5): `[type-name, canonical key]` on the
+    /// wire. See [`crate::InstanceRef`].
+    InstanceRef,
+    /// Typed instance reference — model type `instance_ref<T>`. The
+    /// payload is the target's DOTS type name; the wire carries only
+    /// the canonical key array. Kept as a name (not a resolved
+    /// descriptor) so wire descriptors don't depend on target
+    /// registration order.
+    InstanceRefTo(String),
 }
 
 /// Owned property metadata.
@@ -203,6 +213,8 @@ impl DynamicFieldKind {
                 | Self::String
                 | Self::Uuid
                 | Self::Enum(_)
+                | Self::InstanceRef
+                | Self::InstanceRefTo(_)
         )
     }
 
@@ -232,6 +244,8 @@ impl DynamicFieldKind {
                 Self::Enum(Arc::new(DynamicEnumDescriptor::from_static(inner)))
             }
             FieldKind::Any => Self::Any,
+            FieldKind::InstanceRef => Self::InstanceRef,
+            FieldKind::InstanceRefTo(name) => Self::InstanceRefTo((*name).to_string()),
         }
     }
 }
@@ -276,6 +290,14 @@ pub enum DynamicValue {
     /// kept opaque. The inner object is *not* decoded here; recovering
     /// it is a separate, registry-resolved step.
     Any(crate::AnyObject),
+    /// Instance reference (wire-format spec §6.5). `type_name` is
+    /// `Some` for generic `instance_ref` values and `None` for typed
+    /// `instance_ref<T>` values (whose target is in the field kind);
+    /// `key` is the complete canonical-key CBOR array, kept opaque.
+    InstanceRef {
+        type_name: Option<String>,
+        key: Vec<u8>,
+    },
 }
 
 /// A wire-only struct value: descriptor + sparse property map.
@@ -369,6 +391,13 @@ pub fn value_cmp(
         }
         (DynamicValue::Struct(x), DynamicValue::Struct(y)) => x.cmp_masked(y, PropertySet::ALL),
         (DynamicValue::Any(x), DynamicValue::Any(y)) => x.dots_cmp(y),
+        // Byte equality of the deterministic encoding is instance
+        // identity (spec §6.2), so ordering over (name, key bytes) is
+        // total and consistent with it.
+        (
+            DynamicValue::InstanceRef { type_name: xn, key: xk },
+            DynamicValue::InstanceRef { type_name: yn, key: yk },
+        ) => xn.cmp(yn).then_with(|| xk.cmp(yk)),
         _ => panic!("DynamicValue kind mismatch in value_cmp"),
     }
 }
@@ -972,6 +1001,17 @@ fn encode_value(value: &DynamicValue, e: &mut CborEncoder<'_>) -> Result<(), Enc
         // Opaque passthrough: re-emit the `[type-name, payload]`
         // envelope verbatim without touching the inner object.
         DynamicValue::Any(a) => a.dots_encode(e),
+        // Generic refs carry the `[type-name, key]` envelope; typed
+        // refs are the bare canonical key. Either way the key is a
+        // complete CBOR item spliced in verbatim.
+        DynamicValue::InstanceRef { type_name, key } => {
+            if let Some(name) = type_name {
+                e.array(2)?;
+                e.str(name)?;
+            }
+            e.writer_mut().extend_from_slice(key);
+            Ok(())
+        }
     }
 }
 
@@ -1003,7 +1043,7 @@ fn decode_struct(
     Ok((valid, properties))
 }
 
-fn decode_value(
+pub(crate) fn decode_value(
     kind: &DynamicFieldKind,
     d: &mut CborDecoder<'_>,
 ) -> Result<DynamicValue, DecodeError> {
@@ -1061,6 +1101,25 @@ fn decode_value(
         // Read the opaque envelope into an `AnyObject` without decoding
         // the contained object (the descriptor for it may not be known).
         DynamicFieldKind::Any => Ok(DynamicValue::Any(crate::AnyObject::dots_decode(d)?)),
+        DynamicFieldKind::InstanceRef => {
+            let len = d.array()?.ok_or_else(|| {
+                DecodeError::message("indefinite-length array not supported in `instance_ref`")
+            })?;
+            if len != 2 {
+                return Err(DecodeError::message(
+                    "invalid `instance_ref`: expected a 2-element array",
+                ));
+            }
+            let type_name = d.str()?.to_string();
+            Ok(DynamicValue::InstanceRef {
+                type_name: Some(type_name),
+                key: crate::instance_ref::read_key_array(d)?,
+            })
+        }
+        DynamicFieldKind::InstanceRefTo(_) => Ok(DynamicValue::InstanceRef {
+            type_name: None,
+            key: crate::instance_ref::read_key_array(d)?,
+        }),
     }
 }
 
@@ -1120,6 +1179,14 @@ impl core::fmt::Display for DynamicValue {
             // contained object (decoding it needs a registry).
             DynamicValue::Any(a) => {
                 write!(f, "any<{}>[{} bytes]", a.type_name(), a.payload().len())
+            }
+            // Diagnostic ref form: `TypeName["eth0"]`; typed refs
+            // (whose name lives in the field kind) print only the key.
+            DynamicValue::InstanceRef { type_name, key } => {
+                if let Some(name) = type_name {
+                    f.write_str(name)?;
+                }
+                crate::instance_ref::fmt_key(key, f)
             }
         }
     }
