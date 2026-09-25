@@ -20,11 +20,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use dots_rs_core::{StructValue, dots};
+use dots_rs_core::StructValue;
 use dots_rs_model::{DotsHeader, Transmission, filter::DotsFilter};
-// `dots!` companion macros (see guest.rs note).
-#[allow(unused_imports)]
-use dots_rs_model::*;
 
 use crate::connection::ViewDispatch;
 use crate::container::Container;
@@ -148,6 +145,15 @@ where
         };
         let decoded: T = typed.clone();
 
+        // Hold the handler list across the container update and the
+        // delivery: `View::subscribe` snapshots and registers under the
+        // same lock, so each transmission reaches a new handler exactly
+        // once — through its replay or live.
+        let mut handlers = self
+            .handlers
+            .lock()
+            .expect("view handlers mutex poisoned");
+
         // Classify the transition by consulting the pre-update
         // container state for this key. Mirrors C++ `Event<T>::mt()`
         // — Create on new key, Update on existing key, Remove when
@@ -174,10 +180,6 @@ where
             value,
             op,
         };
-        let mut handlers = self
-            .handlers
-            .lock()
-            .expect("view handlers mutex poisoned");
         for (_, handler) in handlers.iter_mut() {
             handler(&event);
         }
@@ -278,40 +280,30 @@ where
         mut handler: impl FnMut(&ViewEvent<T>) + Send + 'static,
     ) -> ViewSubscription<T> {
         // Sync replay: call the handler over the current container
-        // entries with synthetic Create-shaped events. `from_cache`
-        // counts down `N-1 … 1, 0` over the snapshot (matching the
-        // broker's cache-replay semantics) so a handler can detect the
-        // last current-state entry via `from_cache == 0`.
-        let events: Vec<ViewEvent<T>> = self.state.container.with_iter(|iter| {
-            iter.map(|(_, value, info)| ViewEvent {
-                header: dots!(DotsHeader {
-                    type_name: self.type_name.clone(),
-                    attributes: <T as dots_rs_core::Transmittable>::valid_set(value),
-                    sender: info.last_update_sender,
-                    sent_time: info.last_update_time,
-                    subscription_id: self.subscription_id,
-                }),
+        // entries with synthetic Create-shaped events, `from_cache`
+        // counting down to 0 on the last one. Snapshot, replay and
+        // registration all happen under the handler-list lock that
+        // dispatch holds while updating the container, so no live event
+        // is missed or duplicated.
+        let mut handlers = self
+            .state
+            .handlers
+            .lock()
+            .expect("view handlers mutex poisoned");
+        let events = self.state.container.replay(|mut header, value, _| {
+            header.subscription_id = Some(self.subscription_id);
+            ViewEvent {
+                header,
                 value: value.clone(),
                 op: ViewOp::Create,
-            })
-            .collect()
+            }
         });
-        // Release the container lock before invoking user code.
-        let total = events.len();
-        for (i, mut event) in events.into_iter().enumerate() {
-            event.header.from_cache = Some((total - 1 - i) as u32);
-            handler(&event);
+        for event in &events {
+            handler(event);
         }
-
         let id = self.state.next_handler_id.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut handlers = self
-                .state
-                .handlers
-                .lock()
-                .expect("view handlers mutex poisoned");
-            handlers.insert(id, Box::new(handler));
-        }
+        handlers.insert(id, Box::new(handler));
+        drop(handlers);
         ViewSubscription {
             id,
             state: Arc::downgrade(&self.state),

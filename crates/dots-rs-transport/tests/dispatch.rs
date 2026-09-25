@@ -503,3 +503,108 @@ async fn dynamic_subscription_classifies_second_publish_as_update() {
     transceiver.exit();
     let _ = timeout(GENEROUS, driver_handle).await;
 }
+
+// ----- Replay vs. concurrent dispatch -----
+
+/// A subscription registered while transmissions of its type stream in
+/// must observe every state exactly once: its cache replay, then each
+/// later update live. No update may be both replayed and delivered
+/// live, and none may be skipped between the two. Covers typed
+/// callbacks, streams and dynamic callbacks, each registered from a
+/// thread other than the dispatching read loop.
+#[tokio::test]
+async fn subscribing_during_dispatch_neither_duplicates_nor_skips_updates() {
+    const UPDATES: u32 = 2000;
+    type Seen = Arc<Mutex<Vec<u32>>>;
+    fn seq(pinger: &Pinger) -> u32 {
+        pinger.message.as_deref().unwrap().parse().unwrap()
+    }
+
+    let (transceiver, driver, mut server) = connect_guest().await;
+    let driver_handle = tokio::spawn(driver.run());
+    let cache = transceiver.container::<Pinger>();
+
+    let pushing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let pusher = {
+        let pushing = pushing.clone();
+        tokio::spawn(async move {
+            for i in 1..=UPDATES {
+                let pinger = dots!(Pinger {
+                    id: 1_u32,
+                    message: i.to_string(),
+                });
+                push_pinger(&mut server, &pinger, false).await;
+                if i % 16 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            pushing.store(false, Ordering::Release);
+            server
+        })
+    };
+
+    let subscriber = {
+        let transceiver = transceiver.clone();
+        let pushing = pushing.clone();
+        tokio::task::spawn_blocking(move || {
+            let descriptor = Arc::new(DynamicStructDescriptor::from_static(Pinger::DESCRIPTOR));
+            let mut callbacks = Vec::new();
+            let mut streams = Vec::new();
+            while pushing.load(Ordering::Acquire) && callbacks.len() < 600 {
+                let seen: Seen = Arc::default();
+                let seen_in = seen.clone();
+                let handle = transceiver.subscribe::<Pinger>(move |evt| {
+                    seen_in.lock().unwrap().push(seq(evt.updated()));
+                });
+                callbacks.push((seen, handle));
+
+                let seen: Seen = Arc::default();
+                let seen_in = seen.clone();
+                let handle = transceiver.subscribe_dynamic(descriptor.clone(), move |evt| {
+                    let bytes = evt.updated().encode();
+                    let pinger: Pinger = dots_rs_core::decode_typed_from_slice(&bytes).unwrap();
+                    seen_in.lock().unwrap().push(seq(&pinger));
+                });
+                callbacks.push((seen, handle));
+
+                streams.push(transceiver.subscribe_stream::<Pinger>());
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            (callbacks, streams)
+        })
+    };
+
+    let (callbacks, mut streams) = subscriber.await.unwrap();
+    let _server = pusher.await.unwrap();
+    assert!(callbacks.len() > 10, "subscriptions raced the updates");
+    wait_until("all updates cached", || {
+        cache.get_ref(&dots!(Pinger { id: 1_u32 })).is_some_and(|p| seq(&p) == UPDATES)
+    })
+    .await;
+
+    let check = |what: &str, seen: &[u32]| {
+        // A subscriber that registered before the first update sees
+        // them all live; later ones start with their replayed state.
+        let first = seen.first().copied().unwrap_or(1);
+        let expected: Vec<u32> = (first..=UPDATES).collect();
+        assert_eq!(seen, expected.as_slice(), "{what}: each state exactly once, in order");
+    };
+    for (i, (seen, _)) in callbacks.iter().enumerate() {
+        wait_until("callback caught up", || {
+            seen.lock().unwrap().last() == Some(&UPDATES)
+        })
+        .await;
+        check(&format!("callback #{i}"), &seen.lock().unwrap());
+    }
+    for (i, stream) in streams.iter_mut().enumerate() {
+        let mut seen = Vec::new();
+        while seen.last() != Some(&UPDATES) {
+            let evt = recv_timeout(stream, GENEROUS).await.expect("stream caught up");
+            seen.push(seq(evt.updated()));
+        }
+        check(&format!("stream #{i}"), &seen);
+    }
+
+    transceiver.exit();
+    let _ = timeout(GENEROUS, driver_handle).await;
+}

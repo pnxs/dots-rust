@@ -657,6 +657,45 @@ impl DynContainer {
         })
     }
 
+    /// Build a subscriber's initial cache replay: one synthetic create
+    /// event per stored instance, in container order, under one read
+    /// lock. `event` receives each entry with its prepared header —
+    /// sender and times from the clone info, `from_cache` counting down
+    /// `N-1 … 0` (the broker's cache-replay convention) so
+    /// `from_cache == 0` marks the last replayed instance.
+    ///
+    /// The lock is released before returning, so callers deliver the
+    /// events to user code without holding it.
+    pub(crate) fn replay<E>(
+        &self,
+        mut event: impl FnMut(DotsHeader, &ContainerValue, &CloneInfo) -> E,
+    ) -> Vec<E> {
+        let state = self.state.read();
+        let total = state.entries.len();
+        state
+            .entries
+            .values()
+            .enumerate()
+            .map(|(i, entry)| {
+                let attributes = match &entry.value {
+                    ContainerValue::Typed(a) => StructValue::valid_set(a),
+                    ContainerValue::Dynamic(d) => dots_rs_core::Transmittable::valid_set(d),
+                };
+                let info = &entry.clone_info;
+                let header = DotsHeader {
+                    type_name: Some(self.name().to_string()),
+                    attributes: Some(attributes),
+                    sender: info.last_update_sender,
+                    sent_time: info.last_update_time,
+                    server_sent_time: info.last_update_time,
+                    from_cache: Some((total - 1 - i) as u32),
+                    ..Default::default()
+                };
+                event(header, &entry.value, info)
+            })
+            .collect()
+    }
+
     /// Convert a dynamic-representation container to the static
     /// representation **in place**: every stored [`DynamicStruct`] is
     /// re-decoded into an [`AnyStruct`] and the descriptor swaps to
@@ -1001,6 +1040,16 @@ where
     {
         let guard = self.lock();
         f(guard.iter())
+    }
+
+    /// Typed [`DynContainer::replay`]: `event` borrows each instance as `&T`.
+    pub(crate) fn replay<E>(
+        &self,
+        mut event: impl FnMut(DotsHeader, &T, &CloneInfo) -> E,
+    ) -> Vec<E> {
+        self.inner.replay(|header, value, info| {
+            event(header, value.as_typed::<T>().expect(TYPED_VIEW_EXPECT), info)
+        })
     }
 
     /// Borrow the entry whose key matches `query`.

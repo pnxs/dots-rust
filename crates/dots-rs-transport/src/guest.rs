@@ -1310,34 +1310,39 @@ fn replay_events<T>(container: &Arc<DynContainer>) -> Vec<Event<T>>
 where
     T: StructValue + Send + Sync + Clone + 'static,
 {
-    // Build the owned events directly, then release the cache lock before
-    // callers invoke handlers. No intermediate container snapshot is needed.
-    let mut events: Vec<Event<T>> = Container::<T>::from_dyn(container.clone()).with_iter(|iter| {
-        iter.map(|(_, value, info)| {
-            let header = DotsHeader {
-                type_name: Some(container.name().to_string()),
-                attributes: Some(StructValue::valid_set(value)),
-                sender: info.last_update_sender,
-                sent_time: info.last_update_time,
-                server_sent_time: info.last_update_time,
-                ..Default::default()
-            };
-            let updated = Arc::new(value.clone());
-            Event::from_parts(
-                header,
-                value.clone(),
-                updated,
-                Operation::Create,
-                info.clone(),
-            )
-        })
-        .collect()
-    });
-    let total = events.len();
-    for (i, event) in events.iter_mut().enumerate() {
-        event.header.from_cache = Some((total - 1 - i) as u32);
-    }
-    events
+    Container::<T>::from_dyn(container.clone()).replay(|header, value, info| {
+        let updated = Arc::new(value.clone());
+        Event::from_parts(header, value.clone(), updated, Operation::Create, info.clone())
+    })
+}
+
+/// Dynamic counterpart of [`replay_events`]: statically stored
+/// instances are projected onto the subscription's `descriptor`.
+fn replay_dynamic_events(
+    container: &DynContainer,
+    descriptor: &Arc<DynamicStructDescriptor>,
+) -> Vec<Event<DynamicStruct>> {
+    container.replay(|header, stored, info| {
+        let value = match stored {
+            ContainerValue::Dynamic(d) => d.clone(),
+            ContainerValue::Typed(a) => project_dynamic(descriptor, a),
+        };
+        let updated = Arc::new(value.clone());
+        Event::from_parts(header, value, updated, Operation::Create, info.clone())
+    })
+}
+
+/// Project a statically typed instance onto a dynamic subscription's
+/// descriptor via CBOR, so all of the subscription's values share that
+/// descriptor `Arc` (`DynamicStruct` equality is descriptor-pointer
+/// identity). The `from_struct_value` fallback mints a fresh `Arc` and
+/// only runs on descriptor drift.
+fn project_dynamic(
+    descriptor: &Arc<DynamicStructDescriptor>,
+    value: &dots_rs_core::AnyStruct,
+) -> DynamicStruct {
+    DynamicStruct::decode(descriptor.clone(), &dots_rs_core::encode_to_vec(value))
+        .unwrap_or_else(|_| DynamicStruct::from_struct_value(value))
 }
 
 fn register_callback<T, F>(
@@ -1351,12 +1356,12 @@ where
 {
     // The handler is shared between the dispatch entry and this
     // registration path so the container's current state can be replayed
-    // into it. Holding its lock across register + replay means live
-    // dispatch of any transmission processed after registration blocks
-    // until the replay has been delivered — replay events always come
-    // first, and a transmission landing between registration and the
-    // snapshot is delivered twice (same state both times, but the
-    // handler does observe the extra invocation), never lost.
+    // into it. Registering and snapshotting under the dispatch lock makes
+    // the pair atomic with respect to a dispatch choosing its recipients
+    // and updating the container (see `dispatch_external`): each
+    // transmission either reaches the snapshot or the new entry, never
+    // both and never neither. Holding the handler lock until the replay
+    // is delivered keeps live events queued behind it.
     let handler = Arc::new(Mutex::new(handler));
     let mut replaying = handler.lock().expect("fresh handler mutex");
     let entry: CallbackDispatchEntry<T, F> = CallbackDispatchEntry {
@@ -1365,11 +1370,12 @@ where
         _phantom: PhantomData,
     };
     let type_name = T::type_descriptor().name.to_string();
-    let id = dispatch
-        .lock()
-        .expect("dispatch mutex poisoned")
-        .register(type_name.clone(), Box::new(entry));
-    for event in replay_events::<T>(&container) {
+    let (id, events) = {
+        let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+        let id = state.register(type_name.clone(), Box::new(entry));
+        (id, replay_events::<T>(&container))
+    };
+    for event in events {
         (*replaying)(&event);
     }
     drop(replaying);
@@ -1425,48 +1431,23 @@ fn register_dynamic_callback<F>(
 where
     F: FnMut(&Event<DynamicStruct>) + Send + 'static,
 {
-    // Match typed callbacks: keep live delivery blocked until the local
-    // snapshot has been replayed, and invoke user code without cache locks.
+    // Same registration protocol as `register_callback`.
     let handler = Arc::new(Mutex::new(handler));
     let mut replaying = handler.lock().expect("fresh handler mutex");
     let entry = DynamicCallbackDispatchEntry {
         descriptor: descriptor.clone(),
         handler: handler.clone(),
     };
-    let id = dispatch
-        .lock()
-        .expect("dispatch mutex poisoned")
-        .register(type_name.clone(), Box::new(entry));
-    if let Some(container) = container {
-        let events: Vec<Event<DynamicStruct>> = container.with_iter(|iter| {
-            iter.map(|(_, stored, info)| {
-                let value = match stored {
-                    ContainerValue::Dynamic(d) => d.clone(),
-                    ContainerValue::Typed(a) => {
-                        DynamicStruct::decode(descriptor.clone(), &dots_rs_core::encode_to_vec(a))
-                            .unwrap_or_else(|_| DynamicStruct::from_struct_value(a))
-                    }
-                };
-                let header = DotsHeader {
-                    type_name: Some(type_name.clone()),
-                    attributes: Some(value.valid_set()),
-                    sender: info.last_update_sender,
-                    sent_time: info.last_update_time,
-                    server_sent_time: info.last_update_time,
-                    ..Default::default()
-                };
-                let updated = Arc::new(value.clone());
-                Event::from_parts(header, value, updated, Operation::Create, info.clone())
-            })
-            .collect()
-        });
-        // Project borrowed storage while locked, but deliver owned events
-        // afterward so callbacks can access the container themselves.
-        let total = events.len();
-        for (i, mut event) in events.into_iter().enumerate() {
-            event.header.from_cache = Some((total - 1 - i) as u32);
-            (*replaying)(&event);
-        }
+    let (id, events) = {
+        let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+        let id = state.register(type_name.clone(), Box::new(entry));
+        let events = container
+            .map(|c| replay_dynamic_events(&c, &descriptor))
+            .unwrap_or_default();
+        (id, events)
+    };
+    for event in events {
+        (*replaying)(&event);
     }
     drop(replaying);
     SubscriptionHandle {
@@ -1510,17 +1491,11 @@ where
         // dynamic-only types. But `subscribe_all_types` can install
         // dynamic subscribers for types whose static descriptor *is*
         // compiled in — those decode to `Payload::Typed`, and the
-        // handler still needs the `DynamicStruct` shape. Project
-        // through CBOR in that case, decoding against this
-        // subscription's descriptor `Arc` (the `from_struct_value`
-        // fallback mints a fresh `Arc` and only runs on descriptor
-        // drift).
+        // handler still needs the `DynamicStruct` shape, projected
+        // onto this subscription's descriptor.
         let dyn_value = match &txn.payload {
             dots_rs_model::Payload::Wire(d) => d.clone(),
-            dots_rs_model::Payload::Typed(a) => {
-                DynamicStruct::decode(self.descriptor.clone(), &dots_rs_core::encode_to_vec(a))
-                    .unwrap_or_else(|_| DynamicStruct::from_struct_value(a))
-            }
+            dots_rs_model::Payload::Typed(a) => project_dynamic(&self.descriptor, a),
         };
         // When a cached container for the type ran (pass 1), classify
         // against its outcome exactly like a statically-typed
@@ -1581,12 +1556,10 @@ where
     let id = {
         let mut state = dispatch.lock().expect("dispatch mutex poisoned");
         // Replay the container's current state, then register — both
-        // under the dispatch lock. The new entry can only be taken for
-        // dispatch after the lock is released, so every replayed event
-        // is queued strictly before any live one. A transmission already
-        // mid-dispatch while we snapshot is missed unless its container
-        // update has already landed (then the replay carries it) — the
-        // same window an un-replayed subscribe has always had.
+        // under the dispatch lock, which a dispatch also holds while
+        // choosing its recipients and updating the container. Every
+        // transmission therefore lands either in the replay or as a live
+        // event queued strictly after it.
         if let Some(container) = &container {
             for event in replay_events::<T>(container) {
                 let _ = tx.send(event);

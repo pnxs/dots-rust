@@ -695,12 +695,15 @@ pub(crate) fn import_wire_descriptors(registry: &Registry, txn: &Transmission) {
 /// call we'd deadlock. The take-out-put-back pattern lets handlers
 /// freely lock dispatch.
 ///
-/// New subscribers registered during a dispatch aren't handed this
-/// transmission (they're put back behind the entries we just
-/// processed and only see future events) — but registration replays
-/// the container's current state, which by the subscriber phase
-/// already includes this transmission, so the observable outcome
-/// matches dots-cpp's invoke-for-the-current-event. Subscriptions dropped
+/// Taking the entries and running the containers (see
+/// [`take_and_apply`]) does happen under the dispatch mutex, which
+/// subscription registration also holds while snapshotting the
+/// container for its replay. A subscriber registered concurrently thus
+/// either is among the recipients and its replay predates this
+/// transmission, or it isn't and its replay already includes it: the
+/// transmission is delivered exactly once. Subscribers registered
+/// during a dispatch (e.g. from a handler) are put back behind the
+/// entries we just processed and only see future events. Subscriptions dropped
 /// during a dispatch of their own type are recorded in
 /// `DispatchState::pending_unregister` (the type's entries vec is
 /// momentarily out of the map): the loop skips them for the current
@@ -728,17 +731,11 @@ fn dispatch_external(dispatch: &Arc<Mutex<DispatchState>>, txn: &Transmission) {
         return;
     };
 
-    let taken = {
-        let mut state = dispatch.lock().expect("dispatch mutex poisoned");
-        state.take_entries_for_dispatch(type_name)
-    };
-    let Some(mut entries) = taken else {
+    let Some(mut taken) = take_and_apply(dispatch, txn, type_name) else {
         return;
     };
-
-    dispatch_entries_borrowed(dispatch, &mut entries, txn, type_name);
-
-    put_back_entries(dispatch, type_name, entries);
+    dispatch_subscribers(dispatch, &mut taken, txn, type_name);
+    put_back_entries(dispatch, type_name, taken.entries);
 }
 
 /// Put a type's entries back after a dispatch: drop entries that were
@@ -780,47 +777,82 @@ fn unregistered_mid_dispatch(
         .is_some_and(|ids| ids.contains(&id))
 }
 
-/// Dispatch `txn` (borrowed) to a type's entries with the container(s)
-/// running **first** — so subscribers observe the post-update cache and
-/// receive the instance read back from it, matching dots-cpp's
-/// `Dispatcher::dispatchEvent` (update the container, *then* emit events).
+/// A type's entries taken out for one dispatch, after pass 1.
+struct Taken {
+    entries: DispatchEntries,
+    /// Per-entry retain decision, parallel to `entries`.
+    keep: Vec<bool>,
+    /// Outcome the containers published for the subscribers.
+    shared: DispatchShared,
+}
+
+/// Take a type's entries for dispatching `txn` and run its containers
+/// (pass 1) — both under one dispatch-mutex critical section, which is
+/// what makes a concurrent subscription's register-and-snapshot atomic
+/// with respect to this transmission (see [`dispatch_external`]).
 ///
-/// The container publishes the instance to dispatch into a shared slot
-/// that the subscribers then read, so the partial-update merge and
-/// create/update/remove classification happen exactly once per
-/// transmission instead of once per subscriber.
-fn dispatch_entries_borrowed(
+/// The containers run **first** so subscribers observe the
+/// post-update cache and receive the instance read back from it,
+/// matching dots-cpp's `Dispatcher::dispatchEvent` (update the
+/// container, *then* emit events). They publish that instance into a
+/// shared slot, so the partial-update merge and create/update/remove
+/// classification happen exactly once per transmission. Containers run
+/// no user code, so holding the mutex here cannot deadlock a handler.
+fn take_and_apply(
     dispatch: &Arc<Mutex<DispatchState>>,
-    entries: &mut DispatchEntries,
+    txn: &Transmission,
+    type_name: &str,
+) -> Option<Taken> {
+    let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+    let entries = state.take_entries_for_dispatch(type_name)?;
+    let taken = apply_containers(entries, txn, type_name);
+    drop(state);
+    Some(taken)
+}
+
+/// Pass 1 of [`take_and_apply`]; the caller holds the dispatch mutex.
+fn apply_containers(mut entries: DispatchEntries, txn: &Transmission, type_name: &str) -> Taken {
+    let has_subscribers = entries.iter().any(|(_, e)| !e.wants_owned());
+    let mut shared = DispatchShared::Uncached;
+    let keep = entries
+        .iter_mut()
+        .map(|(_, entry)| {
+            !entry.wants_owned()
+                || dispatch_keep(entry.dispatch(txn, has_subscribers, &mut shared), type_name)
+        })
+        .collect();
+    Taken {
+        entries,
+        keep,
+        shared,
+    }
+}
+
+/// Pass 2: deliver `txn` to the subscribers among `taken`, building
+/// events from the containers' post-update outcome, then drop entries
+/// that asked to be removed.
+///
+/// Each entry re-checks `pending_unregister` before it is invoked: a
+/// handler removed by an earlier handler of the SAME transmission must
+/// not fire for it (dots-cpp contract).
+fn dispatch_subscribers(
+    dispatch: &Arc<Mutex<DispatchState>>,
+    taken: &mut Taken,
     txn: &Transmission,
     type_name: &str,
 ) {
-    let has_subscribers = entries.iter().any(|(_, e)| !e.wants_owned());
-    let mut shared = DispatchShared::Uncached;
-    let mut keep = vec![true; entries.len()];
-
-    // Both passes re-check `pending_unregister` before invoking each
-    // entry: a handler removed by an earlier handler of the SAME
-    // transmission must not fire for it (dots-cpp contract).
-    //
-    // Pass 1 — containers: apply the update and publish the outcome.
-    for (i, (id, entry)) in entries.iter_mut().enumerate() {
-        if entry.wants_owned() {
-            if unregistered_mid_dispatch(dispatch, type_name, *id) {
-                keep[i] = false;
-                continue;
-            }
-            keep[i] = dispatch_keep(entry.dispatch(txn, has_subscribers, &mut shared), type_name);
-        }
-    }
-    // Pass 2 — subscribers: build events from the post-update outcome.
+    let Taken {
+        entries,
+        keep,
+        shared,
+    } = taken;
     for (i, (id, entry)) in entries.iter_mut().enumerate() {
         if !entry.wants_owned() {
             if unregistered_mid_dispatch(dispatch, type_name, *id) {
                 keep[i] = false;
                 continue;
             }
-            keep[i] = dispatch_keep(entry.dispatch(txn, has_subscribers, &mut shared), type_name);
+            keep[i] = dispatch_keep(entry.dispatch(txn, true, shared), type_name);
         }
     }
 
@@ -858,46 +890,35 @@ fn dispatch_external_owned(dispatch: &Arc<Mutex<DispatchState>>, txn: Transmissi
     // `unwrap` is safe: `movable` checked `type_name.is_some()`.
     let type_name = txn.header.type_name.as_deref().unwrap().to_string();
 
-    let taken = {
-        let mut state = dispatch.lock().expect("dispatch mutex poisoned");
-        state.take_entries_for_dispatch(&type_name)
-    };
-    let Some(mut entries) = taken else {
+    let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+    let Some(mut entries) = state.take_entries_for_dispatch(&type_name) else {
         // No handlers for this type — the owned `txn` simply drops.
         return;
     };
 
-    let has_subscribers = entries.iter().any(|(_, e)| !e.wants_owned());
-    if has_subscribers {
+    if entries.iter().any(|(_, e)| !e.wants_owned()) {
         // Subscribers need the transmission alive for `transmitted` (and
         // run after the container), so the payload can't be moved in —
         // fall back to the borrowing, container-first path.
-        dispatch_entries_borrowed(dispatch, &mut entries, &txn, &type_name);
+        let mut taken = apply_containers(entries, &txn, &type_name);
+        drop(state);
+        dispatch_subscribers(dispatch, &mut taken, &txn, &type_name);
+        entries = taken.entries;
     } else {
-        // No subscribers: the container is the sole consumer, so hand the
-        // last owner the moved payload (the zero-clone fan-in).
-        match entries.iter().rposition(|(_, e)| e.wants_owned()) {
-            None => {
-                // No owner and no subscribers — nothing to do.
-                let mut shared = DispatchShared::Uncached;
-                entries.retain_mut(|(_, e)| {
-                    dispatch_keep(e.dispatch(&txn, false, &mut shared), &type_name)
-                });
-            }
-            Some(oi) => {
-                // Pull the owner out so any other containers borrow `txn`
-                // first; the owner then consumes it and is re-appended if
-                // it survives.
-                let (owner_id, mut owner) = entries.remove(oi);
-                let mut shared = DispatchShared::Uncached;
-                entries.retain_mut(|(_, e)| {
-                    dispatch_keep(e.dispatch(&txn, false, &mut shared), &type_name)
-                });
-                if dispatch_keep(owner.dispatch_owned(txn, false, &mut shared), &type_name) {
-                    entries.push((owner_id, owner));
-                }
+        // No subscribers: the containers are the sole consumers, so hand
+        // the last one the moved payload (the zero-clone fan-in). Pull it
+        // out so the others borrow `txn` first; it then consumes it and
+        // is re-appended if it survives.
+        if let Some((owner_id, mut owner)) = entries.pop() {
+            let mut shared = DispatchShared::Uncached;
+            entries.retain_mut(|(_, e)| {
+                dispatch_keep(e.dispatch(&txn, false, &mut shared), &type_name)
+            });
+            if dispatch_keep(owner.dispatch_owned(txn, false, &mut shared), &type_name) {
+                entries.push((owner_id, owner));
             }
         }
+        drop(state);
     }
 
     put_back_entries(dispatch, &type_name, entries);
