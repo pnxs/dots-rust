@@ -35,7 +35,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Notify, mpsc};
 
 use crate::connection::{Connection, DispatchEntry, DispatchState, Event, GroupLeaver};
-use crate::container::{CloneInfo, Container, DispatchShared, DynContainer, Operation};
+use crate::container::{CloneInfo, Container, ContainerValue, DispatchShared, DynContainer, Operation};
 use crate::error::TransportError;
 use crate::ConnectionError;
 
@@ -550,6 +550,10 @@ impl GuestTransceiver {
     /// Registers the descriptor with the codec registry so the read
     /// loop can decode incoming wire bytes; joins the type group so
     /// the broker routes (and replays cache for) this type.
+    ///
+    /// For cached types, synchronously replay the current local container
+    /// as create events to this handler before returning, then deliver live
+    /// events. Uncached types have no initial replay.
     pub fn subscribe_dynamic(
         self: &Arc<Self>,
         descriptor: Arc<DynamicStructDescriptor>,
@@ -575,10 +579,12 @@ impl GuestTransceiver {
         // dynamic counterpart of dots-cpp's `Dispatcher::dispatchEvent`
         // routing every cached type through the container pool.
         // Uncached types keep container-less always-create semantics.
-        if descriptor.flags.is_cached() {
-            let _ = self.get_or_create_dyn_container_dynamic(descriptor.clone());
-        }
-        let mut handle = register_dynamic_callback(&self.dispatch, type_name, descriptor, handler);
+        let container = descriptor
+            .flags
+            .is_cached()
+            .then(|| self.get_or_create_dyn_container_dynamic(descriptor.clone()));
+        let mut handle =
+            register_dynamic_callback(&self.dispatch, type_name, descriptor, container, handler);
         handle.set_leaver(leaver);
         handle
     }
@@ -1404,19 +1410,52 @@ fn register_dynamic_callback<F>(
     dispatch: &Arc<Mutex<DispatchState>>,
     type_name: String,
     descriptor: Arc<DynamicStructDescriptor>,
+    container: Option<Arc<DynContainer>>,
     handler: F,
 ) -> SubscriptionHandle
 where
     F: FnMut(&Event<DynamicStruct>) + Send + 'static,
 {
+    // Match typed callbacks: keep live delivery blocked until the local
+    // snapshot has been replayed, and invoke user code without cache locks.
+    let handler = Arc::new(Mutex::new(handler));
+    let mut replaying = handler.lock().expect("fresh handler mutex");
     let entry = DynamicCallbackDispatchEntry {
-        descriptor,
-        handler,
+        descriptor: descriptor.clone(),
+        handler: handler.clone(),
     };
     let id = dispatch
         .lock()
         .expect("dispatch mutex poisoned")
         .register(type_name.clone(), Box::new(entry));
+    if let Some(container) = container {
+        let snapshot = container.with_entries_dyn(|entries| {
+            entries.values().cloned().collect::<Vec<_>>()
+        });
+        let total = snapshot.len();
+        for (i, entry) in snapshot.into_iter().enumerate() {
+            let value = match entry.value {
+                ContainerValue::Dynamic(d) => d,
+                ContainerValue::Typed(a) => {
+                    DynamicStruct::decode(descriptor.clone(), &dots_rs_core::encode_to_vec(&a))
+                        .unwrap_or_else(|_| DynamicStruct::from_struct_value(&a))
+                }
+            };
+            let header = DotsHeader {
+                type_name: Some(type_name.clone()),
+                attributes: Some(value.valid_set()),
+                sender: entry.clone_info.last_update_sender,
+                sent_time: entry.clone_info.last_update_time,
+                server_sent_time: entry.clone_info.last_update_time,
+                from_cache: Some((total - 1 - i) as u32),
+                ..Default::default()
+            };
+            let updated = Arc::new(value.clone());
+            let event = Event::from_parts(header, value, updated, Operation::Create, entry.clone_info);
+            (*replaying)(&event);
+        }
+    }
+    drop(replaying);
     SubscriptionHandle {
         type_name,
         id,
@@ -1441,7 +1480,7 @@ struct DynamicCallbackDispatchEntry<F> {
     /// events of a subscription share a descriptor instance
     /// (`DynamicStruct` equality is descriptor-pointer-identity).
     descriptor: Arc<DynamicStructDescriptor>,
-    handler: F,
+    handler: Arc<Mutex<F>>,
 }
 
 impl<F> DispatchEntry for DynamicCallbackDispatchEntry<F>
@@ -1509,7 +1548,7 @@ where
             }
         };
         let event = Event::from_parts(txn.header.clone(), dyn_value, updated, operation, clone_info);
-        (self.handler)(&event);
+        (self.handler.lock().expect("handler mutex poisoned"))(&event);
         Ok(true)
     }
 }

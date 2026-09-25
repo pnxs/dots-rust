@@ -470,3 +470,113 @@ async fn dynamic_then_typed_promotes_container() {
     transceiver.exit();
     let _ = timeout(Duration::from_secs(2), driver_handle).await;
 }
+
+#[tokio::test]
+async fn dynamic_subscription_replays_dynamic_container() {
+    check_dynamic_replay(false).await;
+}
+
+#[tokio::test]
+async fn dynamic_subscription_replays_promoted_container() {
+    check_dynamic_replay(true).await;
+}
+
+async fn check_dynamic_replay(promote: bool) {
+    let (transceiver, driver, mut server, reg) = connect_guest().await;
+    let driver_handle = tokio::spawn(driver.run());
+    push_typed(
+        &mut server,
+        "StructDescriptorData",
+        &StructDescriptorData::from_static(TraceItem::DESCRIPTOR),
+    )
+    .await;
+    let descriptor = learned_descriptor(&reg, "TraceItem").await;
+    let first: Seen = Arc::new(Mutex::new(Vec::new()));
+    let _first = transceiver.subscribe_dynamic(descriptor.clone(), recording_handler(&first));
+    assert!(first.lock().unwrap().is_empty());
+
+    let mut one = TraceItem {
+        id: Some(1),
+        message: Some("initial".into()),
+        sequence: Some(10),
+    };
+    let two = TraceItem {
+        id: Some(2),
+        message: Some("second".into()),
+        sequence: Some(20),
+    };
+    push_typed(&mut server, "TraceItem", &one).await;
+    push_typed(&mut server, "TraceItem", &two).await;
+    let update = TraceItem {
+        id: Some(1),
+        message: Some("merged".into()),
+        sequence: None,
+    };
+    push_typed(&mut server, "TraceItem", &update).await;
+    wait_until("initial updates", || first.lock().unwrap().len() == 3).await;
+    one.message = update.message;
+
+    if promote {
+        assert_eq!(transceiver.container::<TraceItem>().len(), 2);
+    }
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let received_handler = received.clone();
+    let expected_descriptor = descriptor.clone();
+    let _second = transceiver.subscribe_dynamic(descriptor, move |event| {
+        assert!(Arc::ptr_eq(
+            &event.updated().descriptor,
+            &expected_descriptor
+        ));
+        received_handler.lock().unwrap().push((
+            event.operation(),
+            event.updated().encode(),
+            event.header.from_cache,
+            event.clone_info().last_operation,
+        ));
+    });
+    // Replay finishes before subscribe returns, without sending any more wire data.
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec![
+            (
+                Operation::Create,
+                encode_to_vec(&one),
+                Some(1),
+                Operation::Update
+            ),
+            (
+                Operation::Create,
+                encode_to_vec(&two),
+                Some(0),
+                Operation::Create
+            ),
+        ]
+    );
+    assert_eq!(
+        first.lock().unwrap().len(),
+        3,
+        "only the new subscriber gets replay"
+    );
+
+    push_remove(&mut server, "TraceItem", &two).await;
+    wait_until("live removal after replay", || {
+        received.lock().unwrap().len() == 3
+    })
+    .await;
+    assert_eq!(
+        received.lock().unwrap()[2],
+        (
+            Operation::Remove,
+            encode_to_vec(&two),
+            None,
+            Operation::Remove
+        )
+    );
+    assert_eq!(first.lock().unwrap().len(), 4);
+    transceiver.exit();
+    timeout(Duration::from_secs(2), driver_handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
