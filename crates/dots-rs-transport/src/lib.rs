@@ -40,8 +40,8 @@ pub use ascii::{ColorSchema, StructDisplay};
 pub use codec::{RawTransmissionCodec, TransmissionCodec};
 pub use connection::{Connection, ConnectionBuilder, ConnectionError, Event, Subscription};
 pub use container::{
-    CloneInfo, Container, ContainerDescriptor, ContainerEntry, ContainerValue, DynContainer,
-    DynContainerEntry, Operation,
+    CloneInfo, Container, ContainerDescriptor, ContainerEntry, ContainerIter, ContainerValue,
+    DynContainer, DynContainerEntry, DynContainerIter, Operation,
 };
 pub use endpoint::{
     DEFAULT_ENDPOINT_URI, DEFAULT_TCP_PORT, DOTS_ENDPOINT_ENV, Endpoint, EndpointError,

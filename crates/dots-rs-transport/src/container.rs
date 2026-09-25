@@ -18,7 +18,8 @@
 //!   cast — no CBOR roundtrip. The borrowed accessors are
 //!   [`get`](Container::get) (single entry, returns a guard-backed
 //!   [`ContainerRef`]), [`for_each`](Container::for_each) (iterate
-//!   while the lock is held), and [`lock`](Container::lock) (hold the
+//!   while the lock is held), [`with_iter`](Container::with_iter)
+//!   (run iterator operations under the lock), and [`lock`](Container::lock) (hold the
 //!   read lock across several lookups via a [`ContainerReadGuard`]).
 //!   [`snapshot`](Container::snapshot) stays as the explicit
 //!   owned-`Vec` path.
@@ -631,6 +632,31 @@ impl DynContainer {
         f(&state.entries)
     }
 
+    /// Run `f` over borrowed `(key_bytes, &ContainerValue, &CloneInfo)`
+    /// entries under one read lock, without cloning or converting values.
+    /// Works with both dynamic and static storage, including promoted
+    /// containers: inspect [`ContainerValue`] to access the representation.
+    ///
+    /// The lock is released before returning. Borrowed entries cannot escape
+    /// the closure; return owned results instead. Keep the closure brief,
+    /// avoid re-entering this container, and do I/O after it returns.
+    ///
+    /// ```compile_fail
+    /// use dots_rs_transport::{ContainerValue, DynContainer};
+    /// fn escape(container: &DynContainer) -> Option<&ContainerValue> {
+    ///     container.with_iter(|mut iter| iter.next().map(|(_, value, _)| value))
+    /// }
+    /// ```
+    pub fn with_iter<F, R>(&self, f: F) -> R
+    where
+        F: for<'entry> FnOnce(DynContainerIter<'entry>) -> R,
+    {
+        let state = self.state.read();
+        f(DynContainerIter {
+            inner: state.entries.iter(),
+        })
+    }
+
     /// Convert a dynamic-representation container to the static
     /// representation **in place**: every stored [`DynamicStruct`] is
     /// re-decoded into an [`AnyStruct`] and the descriptor swaps to
@@ -946,6 +972,46 @@ where
         }
     }
 
+    /// Run `f` over borrowed `(key_bytes, &T, &CloneInfo)` entries under
+    /// one read lock. Standard iterator operations can select and transform
+    /// entries without cloning whole instances.
+    ///
+    /// The lock is released before returning. Borrowed entries cannot escape
+    /// the closure; return owned results instead. Keep the closure brief,
+    /// avoid re-entering this container, and do I/O after it returns.
+    ///
+    /// ```
+    /// use dots_rs_core::StructValue;
+    /// use dots_rs_transport::Container;
+    /// fn count<T: StructValue + Send + Sync + Clone + 'static>(c: &Container<T>) -> usize {
+    ///     c.with_iter(|iter| iter.filter(|(_, _, info)| info.created_sender.is_some()).count())
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use dots_rs_core::StructValue;
+    /// use dots_rs_transport::Container;
+    /// fn escape<T: StructValue + Send + Sync + Clone + 'static>(c: &Container<T>) -> Option<&T> {
+    ///     c.with_iter(|mut iter| iter.next().map(|(_, value, _)| value))
+    /// }
+    /// ```
+    pub fn with_iter<F, R>(&self, f: F) -> R
+    where
+        F: for<'entry> FnOnce(ContainerIter<'entry, T>) -> R,
+    {
+        let guard = self.lock();
+        f(guard.iter())
+    }
+
+    /// Borrow the entry whose key matches `query`.
+    ///
+    /// Compatibility alias for [`get_ref`](Self::get_ref). This method
+    /// continues to return a borrowed value; prefer `get_ref` in new code
+    /// to make the borrowing semantics explicit.
+    pub fn get<'a>(&'a self, query: &T) -> Option<ContainerRef<'a, T>> {
+        self.get_ref(query)
+    }
+
     /// Look up the entry whose key matches that of `query`. Only the
     /// `#[dots(key)]` properties of `query` are used; other fields are
     /// ignored.
@@ -955,7 +1021,7 @@ where
     /// directly out of the stored buffer (no clone). Clone the
     /// specific fields you need, or `(*entry).clone()` for the whole
     /// value, then drop the ref to release the lock.
-    pub fn get<'a>(&'a self, query: &T) -> Option<ContainerRef<'a, T>> {
+    pub fn get_ref<'a>(&'a self, query: &T) -> Option<ContainerRef<'a, T>> {
         let state = self.inner.state.read();
         // `with_key_bytes` borrows a thread-local scratch buffer only
         // for the lookup; the returned `&DynContainerEntry` borrows
@@ -974,6 +1040,48 @@ where
             _guard: state,
             _phantom: PhantomData,
         })
+    }
+
+    /// Return an owned copy of the first instance matching `predicate`.
+    ///
+    /// Scans borrowed instances in container iteration order and stops at
+    /// the first match. Only that instance is cloned. Returns `None` if
+    /// nothing matches. For lookup by a complete key, prefer [`get`](Self::get).
+    ///
+    /// The predicate runs under the container's read lock: keep it brief
+    /// and do not re-enter this container. The lock is released before
+    /// returning; the result can be retained across updates or `.await`.
+    pub fn find<F>(&self, mut predicate: F) -> Option<T>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let guard = self.lock();
+        guard
+            .iter()
+            .find(|(_, value, _)| predicate(value))
+            .map(|(_, value, _)| value.clone())
+    }
+
+    /// Return owned copies of all instances matching `predicate`.
+    ///
+    /// Scans borrowed instances once in container iteration order and
+    /// clones only matches. Returns an empty vector if nothing matches.
+    /// Unlike [`snapshot`](Self::snapshot), results contain only the values,
+    /// without clone metadata.
+    ///
+    /// The predicate runs under one read lock, so all matches reflect a
+    /// consistent container state. Keep it brief and do not re-enter this
+    /// container. The lock is released before returning.
+    pub fn filter<F>(&self, mut predicate: F) -> Vec<T>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let guard = self.lock();
+        guard
+            .iter()
+            .filter(|(_, value, _)| predicate(value))
+            .map(|(_, value, _)| value.clone())
+            .collect()
     }
 
     /// Iterate every stored entry while holding the container's read
@@ -1144,6 +1252,21 @@ where
         let (k, entry) = self.inner.next()?;
         let value: &T = entry.value.as_typed::<T>().expect(TYPED_VIEW_EXPECT);
         Some((k.as_slice(), value, &entry.clone_info))
+    }
+}
+
+/// Borrowed iterator supplied to [`DynContainer::with_iter`].
+/// Values retain their stored representation; iteration does not convert them.
+pub struct DynContainerIter<'a> {
+    inner: std::collections::btree_map::Iter<'a, Vec<u8>, DynContainerEntry>,
+}
+
+impl<'a> Iterator for DynContainerIter<'a> {
+    type Item = (&'a [u8], &'a ContainerValue, &'a CloneInfo);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (key, entry) = self.inner.next()?;
+        Some((key.as_slice(), &entry.value, &entry.clone_info))
     }
 }
 
@@ -1560,6 +1683,36 @@ mod dynamic_classify_tests {
     }
 
     #[test]
+    fn dynamic_with_iter_borrows_before_and_after_promotion() {
+        let desc = dyn_descriptor();
+        let c = dyn_container(&desc);
+        assert_eq!(c.with_iter(|iter| iter.count()), 0);
+        let value = DynPinger {
+            id: Some(1),
+            message: Some("stored".into()),
+            sequence: Some(10),
+        };
+        c.apply(&wire_txn(&desc, &value, &header(&value, false)));
+        c.with_iter(|mut iter| {
+            assert!(c.state.try_write().is_none());
+            let (key, stored, info) = iter.next().unwrap();
+            assert_eq!(key, encode_key_bytes(&value));
+            assert_eq!(info.created_sender, Some(7));
+            let dynamic = stored.as_dynamic().unwrap();
+            assert!(Arc::ptr_eq(&dynamic.descriptor, &desc));
+            assert_dynamic_eq(dynamic, &value);
+            assert!(iter.next().is_none());
+        });
+        assert!(c.state.try_write().is_some());
+        c.promote_to_static(DynPinger::DESCRIPTOR);
+        c.with_iter(|mut iter| {
+            let (_, stored, _) = iter.next().unwrap();
+            assert_eq!(stored.as_typed::<DynPinger>(), Some(&value));
+        });
+        assert!(c.state.try_write().is_some());
+    }
+
+    #[test]
     fn dynamic_container_classifies_create_update_remove() {
         let desc = dyn_descriptor();
         let c = dyn_container(&desc);
@@ -1762,5 +1915,141 @@ mod dynamic_classify_tests {
         assert!(Arc::ptr_eq(&d1, &d2));
         assert_eq!(&*t1, &v);
         assert_dynamic_eq(&d1, &v);
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use dots_rs_core::AnyStruct;
+    use dots_rs_derive::DotsStruct;
+    use dots_rs_model::Payload;
+    use std::cell::Cell;
+
+    thread_local! {
+        static CLONES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[derive(DotsStruct, Default, Debug, PartialEq)]
+    #[dots(name = "ContainerSearchItem", cached)]
+    struct Item {
+        #[dots(tag = 1, key)]
+        id: Option<u32>,
+        #[dots(tag = 2)]
+        message: Option<String>,
+    }
+
+    impl Clone for Item {
+        fn clone(&self) -> Self {
+            CLONES.with(|count| count.set(count.get() + 1));
+            Self {
+                id: self.id,
+                message: self.message.clone(),
+            }
+        }
+    }
+
+    fn insert(container: &Container<Item>, id: u32, message: &str) {
+        let value = Item {
+            id: Some(id),
+            message: Some(message.into()),
+        };
+        container.inner.apply(&Transmission {
+            header: DotsHeader {
+                type_name: Some("ContainerSearchItem".into()),
+                ..Default::default()
+            },
+            payload: Payload::Typed(AnyStruct::from_struct_value(&value)),
+        });
+    }
+
+    #[test]
+    fn with_iter_borrows_and_projects_without_cloning_instances() {
+        let container = make_view_container::<Item>();
+        assert_eq!(container.with_iter(|iter| iter.count()), 0);
+        insert(&container, 1, "skip");
+        insert(&container, 2, "match");
+        CLONES.with(|count| count.set(0));
+        let mut visited = 0;
+        let ids = container.with_iter(|iter| {
+            assert!(container.inner.state.try_write().is_none());
+            iter.filter(|(_, item, _)| {
+                visited += 1;
+                item.message.as_deref() == Some("match")
+            })
+            .map(|(key, item, info)| {
+                assert_eq!(key, encode_key_bytes(item));
+                assert_eq!(info.last_operation, Operation::Create);
+                item.id.unwrap()
+            })
+            .collect::<Vec<_>>()
+        });
+        assert_eq!(ids, vec![2]);
+        assert_eq!(visited, 2);
+        assert_eq!(CLONES.with(Cell::get), 0);
+        assert!(container.inner.state.try_write().is_some());
+        assert_eq!(
+            container.as_dyn().with_iter(|iter| {
+                iter.map(|(_, value, _)| value.as_typed::<Item>().unwrap().id.unwrap())
+                    .collect::<Vec<_>>()
+            }),
+            vec![1, 2]
+        );
+        assert_eq!(CLONES.with(Cell::get), 0);
+        assert!(container.inner.state.try_write().is_some());
+    }
+
+    #[test]
+    fn searches_clone_only_matches_and_release_the_lock() {
+        let container = make_view_container::<Item>();
+        assert!(container.find(|_| panic!("empty container")).is_none());
+        assert!(container.filter(|_| panic!("empty container")).is_empty());
+        insert(&container, 1, "skip");
+        insert(&container, 2, "match");
+        insert(&container, 3, "match");
+        CLONES.with(|count| count.set(0));
+
+        let mut visited = Vec::new();
+        let found = container
+            .find(|value| {
+                visited.push(value.id.unwrap());
+                value.message.as_deref() == Some("match")
+            })
+            .unwrap();
+        assert_eq!(found.id, Some(2));
+        assert_eq!(visited, vec![1, 2], "find stops at the first match");
+        assert_eq!(CLONES.with(Cell::get), 1);
+        assert!(container.inner.state.try_write().is_some());
+
+        visited.clear();
+        let filtered = container.filter(|value| {
+            visited.push(value.id.unwrap());
+            value.message.as_deref() == Some("match")
+        });
+        assert_eq!(visited, vec![1, 2, 3]);
+        assert_eq!(
+            filtered.iter().map(|v| v.id.unwrap()).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            CLONES.with(Cell::get),
+            3,
+            "only matching instances are cloned"
+        );
+        assert!(container.inner.state.try_write().is_some());
+
+        assert!(container.find(|_| false).is_none());
+        assert!(container.filter(|_| false).is_empty());
+        assert_eq!(CLONES.with(Cell::get), 3, "misses do not clone");
+        assert_eq!(container.filter(|_| true).len(), 3);
+        assert_eq!(CLONES.with(Cell::get), 6);
+
+        insert(&container, 2, "changed");
+        assert_eq!(found.message.as_deref(), Some("match"));
+        assert_eq!(filtered[0].message.as_deref(), Some("match"));
+        assert_eq!(
+            container.get(&found).unwrap().message.as_deref(),
+            Some("changed")
+        );
     }
 }
