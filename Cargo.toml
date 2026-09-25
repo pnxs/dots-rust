@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.85"
 license = "LGPL-3.0-only"
@@ -19,13 +19,13 @@ categories = ["network-programming", "encoding"]
 # them on path deps for publishing — they can't be inherited). When
 # bumping, update `workspace.package.version` and these requirements
 # together, e.g. via `cargo set-version --workspace <new>` (cargo-edit).
-dots-rs = { path = "crates/dots-rs", version = "0.1.6" }
-dots-rs-core = { path = "crates/dots-rs-core", version = "0.1.6" }
-dots-rs-derive = { path = "crates/dots-rs-derive", version = "0.1.6" }
-dots-rs-model = { path = "crates/dots-rs-model", version = "0.1.6" }
-dots-rs-transport = { path = "crates/dots-rs-transport", version = "0.1.6", default-features = false }
-dots-rs-testing = { path = "crates/dots-rs-testing", version = "0.1.6" }
-dots-rs-build = { path = "crates/dots-rs-build", version = "0.1.6" }
+dots-rs = { path = "crates/dots-rs", version = "0.1.7" }
+dots-rs-core = { path = "crates/dots-rs-core", version = "0.1.7" }
+dots-rs-derive = { path = "crates/dots-rs-derive", version = "0.1.7" }
+dots-rs-model = { path = "crates/dots-rs-model", version = "0.1.7" }
+dots-rs-transport = { path = "crates/dots-rs-transport", version = "0.1.7", default-features = false }
+dots-rs-testing = { path = "crates/dots-rs-testing", version = "0.1.7" }
+dots-rs-build = { path = "crates/dots-rs-build", version = "0.1.7" }
 
 minicbor = { version = "2", default-features = false, features = ["alloc"] }
 

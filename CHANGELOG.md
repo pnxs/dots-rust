@@ -6,6 +6,35 @@ version-bump commits as boundaries; dates indicate those commits, not verified
 publication dates. Version 0.1.0 covers the initial implementation through the
 crates.io workspace restructuring.
 
+## 0.1.7 - 2026-09-25
+
+### Added
+
+- `Container::get_ref` for explicit borrowed key lookup, retaining `get` as a
+  compatibility alias; `find_ref`, `find`, and `filter` for predicate searches
+  that borrow matches or clone only matching values.
+- `Container::with_iter` and `DynContainer::with_iter` for borrowed iteration,
+  projections, and counting under one read lock. Export `ContainerIter` and
+  `DynContainerIter` from the transport crate.
+- AI client usage and container access guides, repository agent guidance, and
+  expanded user documentation covering startup preload, application LTO,
+  partial updates, property masks, replay, and borrowed access.
+
+### Changed
+
+- Reduce unnecessary cache snapshots and clones in subscription replay, view
+  handling, and smarthome examples by using borrowed container access and shared
+  replay builders.
+
+### Fixed
+
+- Dynamic subscriptions replay existing local cached state as create events
+  before live delivery, including containers promoted to typed storage.
+- Prevent missed or duplicate updates when subscriptions register concurrently
+  with dispatch, making registration and replay snapshots atomic with cache
+  updates for typed and dynamic callbacks, streams, and filtered views.
+- Include `server_sent_time` in replayed view events.
+
 ## 0.1.6 — 2026-09-08
 
 ### Added
