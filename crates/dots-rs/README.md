@@ -17,6 +17,22 @@ dots-rs = "0.1"
 dots-rs-build = "0.1"
 ```
 
+## Guidance for AI agents
+
+Read the [general AI usage guide](https://github.com/pnxs/dots-rust/blob/master/crates/dots-rs/AI_USAGE_GUIDE.md)
+for models, connections, publishing, subscription replay, dynamic types, and
+testing. It ships as `AI_USAGE_GUIDE.md` and appears in the crate API docs as
+`dots_rs::ai_usage`. Add a pointer in downstream projects' agent instructions.
+
+## Container access guidance
+
+The [container usage guide](https://github.com/pnxs/dots-rust/blob/master/crates/dots-rs/CONTAINER_GUIDE.md)
+covers efficient lookups, borrowed iteration, lock lifetimes, and snapshots
+for developers and AI agents. It is also bundled as `CONTAINER_GUIDE.md` and
+included in API documentation under `dots_rs::container_usage`. Match the
+guide to your resolved dependency revision; development APIs may not yet be
+published. Client projects can link the guide from their own `AGENTS.md`.
+
 ## Example
 
 ```rust

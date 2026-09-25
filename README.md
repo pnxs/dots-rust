@@ -16,6 +16,16 @@ peers without a compiled-in copy can still decode wire payloads.
 This crate set is a from-scratch Rust implementation. It links against
 nothing from `dots-cpp`; the wire format is the only contract.
 
+## Usage guidance for developers and AI agents
+
+Start with the [AI usage guide](crates/dots-rs/AI_USAGE_GUIDE.md) for models,
+connections, publishing, replay, dynamic types, and testing.
+Read the [container access guide](crates/dots-rs/CONTAINER_GUIDE.md) when
+choosing between borrowed lookups, iteration, and snapshots. The
+[user guide](docs/USER_GUIDE.md) covers the wider client API.
+[AGENTS.md](AGENTS.md) points repository agents to this guidance; downstream
+clients should add a pointer in their own agent instructions.
+
 ## Installation
 
 Applications depend on a single crate, **`dots-rs`**, which re-exports the

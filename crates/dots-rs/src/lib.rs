@@ -8,6 +8,9 @@
 //! application only needs `dots-rs` as a dependency — and, when compiling
 //! `.dots` schema files, `dots-rs-build` as a build-dependency.
 //!
+//! For implementation guidance, see the [AI usage guide](ai_usage).
+//! For container access patterns, see the [container usage guide](container_usage).
+//!
 //! ```no_run
 //! use dots_rs::{DotsStruct, dots, App};
 //!
@@ -91,3 +94,11 @@ pub mod prelude {
     pub use dots_rs_derive::{DotsEnum, DotsStruct};
     pub use dots_rs_transport::{App, Client, Container, View};
 }
+
+/// Container access guidance for developers and AI agents.
+#[doc = include_str!("../CONTAINER_GUIDE.md")]
+pub mod container_usage {}
+
+/// General dots-rust usage guidance for AI agents.
+#[doc = include_str!("../AI_USAGE_GUIDE.md")]
+pub mod ai_usage {}

@@ -4,6 +4,10 @@ How to use DOTS from Rust — for human developers and AI agents alike. This
 guide takes you from "what is this" to a working publisher/subscriber, then
 covers the full client API surface.
 
+AI agents should also read the [general usage guidance](../crates/dots-rs/AI_USAGE_GUIDE.md),
+which covers API selection, lifecycle, and verification against the resolved
+dependency version.
+
 If you only read one section, read [Mental model](#mental-model) and
 [Five-minute example](#five-minute-example).
 
@@ -23,6 +27,7 @@ If you only read one section, read [Mental model](#mental-model) and
    - [Generated items](#generated-items)
    - [In `.dots` IDL files](#in-dots-idl-files)
 5. [Connecting](#connecting)
+   - [Early subscription and startup state](#early-subscription-and-startup-state)
 6. [Publishing](#publishing)
 7. [Subscribing](#subscribing)
 8. [The local cache: `Container<T>`](#the-local-cache-containert)
@@ -50,8 +55,8 @@ because they differ from ordinary message buses:
    per key.
 
 3. **The broker keeps a cache, and new subscribers get it for free.** When a
-   type is declared `cached`, the broker remembers the latest value for every
-   key. The instant you subscribe, the broker replays the entire current
+   type is cached (the default in `.dots` schemas), the broker remembers the
+   latest value for every key. The instant you subscribe, the broker replays the entire current
    cache to you *before* live updates begin. You never miss state that was
    published before you connected.
 
@@ -271,30 +276,41 @@ Wrap each in `Option<...>` as always.
 
 ### The `dots!` macro
 
-Constructing values by hand means writing `Some(...)` on every field and
-`.into()` on every string. The `dots!` macro removes that ceremony:
+Prefer `dots!` for constructing DOTS publications, key-only removals, and
+lookup queries. It removes repetitive `Some(...)`, string conversions, and
+explicit assignments for every unused optional property:
 
 ```rust
-use dots_core::dots;
+use dots_rs::dots;
 
 let p = dots!(Pinger {
-    id: 0_u32,          // bare value — auto-wrapped in Some(0)
-    message: "hello",   // &str — auto Into<String>, auto Some(...)
-    sequence: seq,
+    id: 0_u32,
+    message: "hello",
 });
-// equivalent to:
-let p = Pinger {
-    id: Some(0),
-    message: Some("hello".to_string()),
-    sequence: Some(seq),
-    ..Default::default()
-};
+// The omitted optional `sequence` field is None.
+let key = dots!(Pinger { id: 0_u32 });
+// Optional `message` and `sequence` are both None.
 ```
 
-The macro auto-wraps bare values in `Some`, applies `Into` (so `&str` →
-`String`), supports nested struct literals, and fills omitted fields with
-`Default` (i.e. `None`). Fields you leave out stay unset and are not
-transmitted.
+Bare values supplied to optional fields are converted via `Into` and wrapped
+in `Some`. An `Option` expression preserves absence; bare key fields stay bare.
+Nested DOTS struct literals are supported. The normal form without `..base`
+sets every omitted optional field explicitly to **`None`**, without requiring
+`Default`. Required bare key fields must be provided, and unknown field names
+are compile errors.
+
+This helps clients tolerate **new optional model fields**: after regenerating
+the model, existing macro calls remain valid and the new fields stay absent.
+The client neither needs another `field: None` assignment nor accidentally
+publishes a default for a property it does not handle. This is additive
+compatibility, not permission to change wire tags, existing property types,
+or keys incompatibly.
+
+Omitted properties normally remain unsent, leaving existing cached values
+unchanged. Clearing a stored property requires an explicit publish mask that
+addresses the absent property. The explicit `..base` form instead inherits
+unspecified fields from its base, so use the no-base form for fresh partial
+values. See the [AI guide's tested macro example](../crates/dots-rs/AI_USAGE_GUIDE.md#prefer-dots-for-constructing-client-values).
 
 ### Generated items
 
@@ -405,6 +421,28 @@ let app = App::connect_tcp_with_auth("127.0.0.1:11235", "my-client", "secret").a
 
 ---
 
+## Early subscription and startup state
+
+Normal `App` connection constructors finish preload before returning. Typed
+`subscribe::<T>()` and `container::<T>()` calls anchor subscriptions at link
+time, even when those calls execute after connection. The connection joins
+those types and fills their containers from the broker cache during preload.
+An application can therefore inspect existing system state immediately after
+`App::new(...).await?`, initialize itself, and then start reactive handling.
+New handlers replay the local state synchronously; the regular driver loop
+must run for subsequent network traffic.
+
+Configure `[profile.release] lto = true` in the downstream application's
+workspace root and use a release build. On supported ELF targets, LTO removes
+unused type registrations, preventing unnecessary early joins and cache
+traffic. It is needed for precise pruning, not for preload correctness;
+non-LTO builds can retain extra entries. Runtime-discovered subscriptions,
+filtered views opened later, and explicitly non-preload connections do not
+share this immediate-cache guarantee.
+
+See the [early-subscription and LTO guide](../crates/dots-rs/AI_USAGE_GUIDE.md#early-subscription-inspect-startup-state-before-reacting)
+for a complete startup example and platform details.
+
 ## Publishing
 
 `publish` takes a reference to any `Publishable` value (anything that derives
@@ -417,17 +455,103 @@ enqueues the value on the write path and returns `()`.
 app.publish(&dots!(Pinger { id: 1_u32, message: "hi", sequence: 7_u64 }));
 ```
 
-**Partial updates.** To update only some fields of an existing instance
-without touching the rest, use `publish_with_mask` with a `PropertySet`. Only
-the masked-in properties are transmitted; the key must always be included.
+**Prefer partial updates.** In most cases, publish the complete key and only
+the fields that changed. A fresh `dots!` value automatically leaves unrelated
+optional fields absent, so ordinary `publish()` preserves their cached values:
 
 ```rust
-// Update only `sequence`, leave message untouched on the broker side.
+// Client A updates sequence for instance 1.
+app.publish(&dots!(Pinger { id: 1_u32, sequence: 8_u64 }));
+// Client B updates message for the same instance.
+other_client.publish(&dots!(Pinger { id: 1_u32, message: "ready" }));
+```
+
+After both updates are processed, the instance contains both values. Clients
+can maintain different fields of the same instance without overwriting each
+other, provided their addressed fields remain disjoint. The first update can
+create the instance; readers must tolerate other fields arriving later. Use
+`event.updated()` or the container to read the combined state.
+
+If two clients address the same field, the last update processed by the broker
+wins. A full cached-object publication can overwrite another client's newer
+field value with a stale one. Prefer fresh partial values over modifying and
+republishing whole cached copies. Removing an instance affects every client's
+fields, and separate updates are not an atomic transaction.
+
+Use `publish_with_mask()` when restricting an already-populated value to
+selected fields or explicitly clearing a field. Keys are added automatically:
+
+```rust
+app.publish_with_mask(&pinger, Pinger::PROP_SEQUENCE);
+```
+
+See [publishing only changed properties](../crates/dots-rs/AI_USAGE_GUIDE.md#publish-only-the-properties-you-changed)
+for the shared-instance example and coordination limits.
+
+**Invalidation is different from omission.** If an existing object's
+`message` is valid, `publish(&dots!(Pinger { id: 1_u32 }))` leaves it unchanged.
+Setting `message` to `None` locally and using ordinary `publish()` has the
+same effect: the invalid property is absent from the automatically derived
+update mask. To invalidate it remotely, address it explicitly:
+
+```rust
 app.publish_with_mask(
-    &dots!(Pinger { id: 1_u32, sequence: 8_u64 }),
-    Pinger::PROP_ID | Pinger::PROP_SEQUENCE,
+    &dots!(Pinger { id: 1_u32 }), // message remains None in this payload
+    Pinger::PROP_MESSAGE,       // but is explicitly addressed by the update
 );
 ```
+
+Keys are added to the mask automatically. Other cached fields remain
+unchanged, and the instance is not removed. To set one field and clear
+another, supply the first value and include both properties in the mask.
+Do not derive a clear mask solely from `valid_set()`, and do not use an
+all-property mask with a sparse payload: it clears every addressed absent
+field. A zero, false, or empty string is still a valid value, not invalidation.
+See the [invalidation pitfalls guide](../crates/dots-rs/AI_USAGE_GUIDE.md#pitfalls-invalidating-an-already-valid-property)
+for a complete example and the distinction between payload and update mask.
+
+### Checking fields and building masks with PropertySet
+
+`PropertySet` represents a set of property tags, not their values. Generated
+`Type::PROP_FIELD` constants each select one field. Import `StructValue` for
+`valid_set()`, which reports the fields currently present in an instance:
+
+```rust
+use dots_rs::StructValue;
+
+let valid = pinger.valid_set();
+let wanted = Pinger::PROP_MESSAGE | Pinger::PROP_SEQUENCE;
+let has_message = Pinger::PROP_MESSAGE.is_subset_of(valid);
+let has_both = wanted.is_subset_of(valid);
+let has_either = !(valid & wanted).is_empty();
+let missing = wanted - valid;
+
+// Publish only present fields from this allowlist. Keys are added for us.
+app.publish_with_mask(&pinger, valid & wanted);
+```
+
+Use `|` for union, `&` for intersection, and `-` to exclude fields. Rust `^`
+is symmetric difference (unlike dots-cpp, where it means intersection).
+Build a conditional mask from `PropertySet::EMPTY` with assignments such as
+`mask = mask | Pinger::PROP_MESSAGE`. Sets also offer `has(tag)`,
+`with_tag(tag)`, `without_tag(tag)`, `iter()`, `len()`, and `is_empty()`;
+`with_tag` and `without_tag` return new sets. Prefer generated constants for
+known model fields, and never mix constants from unrelated types.
+
+`valid & wanted` excludes absent fields; passing `wanted` directly also
+clears any addressed absent fields. Masks select fields, not differences
+between old and new values. `PropertySet::ALL` is every representable bit,
+not a safe default publish mask for a sparse value.
+
+To check current cached field presence, use `event.updated().valid_set()`.
+For supplied fields, use `event.transmitted().valid_set()`; for addressed
+fields, inspect the optional `event.header.attributes` mask. An addressed
+but absent field is an invalidation. Field presence in a value is distinct
+from field declaration in the schema, which is described by its descriptor.
+See the [PropertySet guide](../crates/dots-rs/AI_USAGE_GUIDE.md#propertyset-check-fields-and-shape-publish-masks)
+for a complete example and additional API details.
+
+### Removing instances
 
 **Removal.** To delete an instance from the (cached) broker, publish a
 key-only removal:
@@ -479,7 +603,7 @@ Useful `header` fields:
 | `remove_obj`       | `Some(true)` when the event is a deletion.                           |
 | `from_cache`       | During replay, the count of cache objects still to come after this one. `None` means "live, not from cache". |
 | `sent_time`        | The sender's send timestamp.                                         |
-| `attributes`       | `PropertySet` of which payload properties are valid.                 |
+| `attributes`       | `Option<PropertySet>` of addressed properties, including explicit clears.                 |
 
 **Subscription lifetime.** `subscribe` returns a `SubscriptionHandle`. When
 that handle drops, the subscription ends (and DOTS publishes a
@@ -505,6 +629,10 @@ synchronous closure.
 ---
 
 ## The local cache: `Container<T>`
+
+For choosing efficient lookup and iteration methods, read the
+[container access guidelines](../crates/dots-rs/CONTAINER_GUIDE.md), including
+borrowed `get_ref()` / `find_ref()`, `with_iter()`, and when to retain a snapshot.
 
 A `Container<T>` is a **local, always-up-to-date mirror** of the broker's
 cache for type `T`. The transport keeps it in sync automatically; you just
@@ -604,8 +732,9 @@ let supported = app
 
 ## Running the event loop
 
-Nothing flows until the I/O loop runs. `App` owns a driver that you consume
-with one of:
+`App` constructors already drive the initial handshake and cache preload.
+Ongoing network traffic requires the normal I/O loop. `App` owns a driver
+that you consume with one of:
 
 ```rust
 app.run().await?;              // runs until exit() is called or the connection closes
@@ -700,8 +829,11 @@ infrastructure.
 - **Keep handlers fast.** Subscription callbacks run on the dispatch path. Do
   heavy work elsewhere (e.g. send to a channel, or read from a `Container`
   off-path).
-- **`cached` vs not.** Only `cached` types get cache replay on subscribe and
-  populate a `Container`. A non-cached type is pure live pub/sub.
+- **State vs events.** `.dots` schema types are cached by default. Use
+  `[cached=false]` for event-only types that should not retain/replay state.
+  Handwritten Rust derives currently require `#[dots(cached)]` to enable
+  caching; omitting it produces an uncached type. The schema generator
+  handles this difference automatically.
 - **Stable tags.** Field tags are the wire contract. Don't renumber them
   across versions if you care about compatibility.
 
