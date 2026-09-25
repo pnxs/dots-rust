@@ -20,14 +20,14 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use dots_rs_core::{StructValue, dots, encode_key_bytes};
+use dots_rs_core::{StructValue, dots};
 use dots_rs_model::{DotsHeader, Transmission, filter::DotsFilter};
 // `dots!` companion macros (see guest.rs note).
 #[allow(unused_imports)]
 use dots_rs_model::*;
 
 use crate::connection::ViewDispatch;
-use crate::container::{Container, ContainerEntry};
+use crate::container::Container;
 use crate::guest::GuestTransceiver;
 
 /// Construction-time errors for [`View<T>`].
@@ -130,23 +130,6 @@ pub struct ViewEvent<T> {
     pub op: ViewOp,
 }
 
-impl<T> ViewState<T>
-where
-    T: StructValue + Send + Sync + Clone + 'static,
-{
-    /// Look up the cached value for `key_bytes`, returning a clone
-    /// of the entry's value (borrowed `&T` out of the stored
-    /// [`dots_rs_core::AnyStruct`] via a descriptor-identity cast).
-    fn cached_value(&self, key_bytes: &[u8]) -> Option<T> {
-        self.container
-            .as_dyn()
-            .with_entries_dyn(|entries| {
-                let entry = entries.get(key_bytes)?;
-                entry.value.as_typed::<T>().cloned()
-            })
-    }
-}
-
 impl<T> ViewDispatch for ViewState<T>
 where
     T: StructValue + Send + Sync + Clone + 'static,
@@ -170,19 +153,17 @@ where
         // — Create on new key, Update on existing key, Remove when
         // the broker tagged the transmission as a leave-view (or
         // any genuine `remove_obj`).
-        let key = encode_key_bytes(&decoded);
         let is_remove = txn.header.remove_obj == Some(true);
-        let pre_value = self.cached_value(&key);
-        let (op, value) = match (is_remove, pre_value) {
-            (true, Some(prev)) => (ViewOp::Remove, prev),
-            // Spec edge: remove of an unknown key. Shouldn't happen
-            // for a well-behaved broker, but if it does we still
-            // surface the wire payload (key-only) so the handler
-            // can react.
-            (true, None) => (ViewOp::Remove, decoded),
-            (false, Some(_)) => (ViewOp::Update, decoded),
-            (false, None) => (ViewOp::Create, decoded),
-        };
+        let (op, value) = {
+            let previous = self.container.get_ref(&decoded);
+            match (is_remove, previous) {
+                (true, Some(prev)) => (ViewOp::Remove, (*prev).clone()),
+                // Unknown removals still surface the wire's key-only value.
+                (true, None) => (ViewOp::Remove, decoded),
+                (false, Some(_)) => (ViewOp::Update, decoded),
+                (false, None) => (ViewOp::Create, decoded),
+            }
+        }; // Release the borrowed entry before updating the container.
 
         // Apply the container update (insert / remove via the same
         // dispatch entry shape used for unfiltered containers).
@@ -301,22 +282,25 @@ where
         // counts down `N-1 … 1, 0` over the snapshot (matching the
         // broker's cache-replay semantics) so a handler can detect the
         // last current-state entry via `from_cache == 0`.
-        let snapshot: Vec<ContainerEntry<T>> = self.state.container.snapshot();
-        let total = snapshot.len();
-        for (i, entry) in snapshot.into_iter().enumerate() {
-            let header = dots!(DotsHeader {
-                type_name: self.type_name.clone(),
-                attributes: <T as dots_rs_core::Transmittable>::valid_set(&entry.value),
-                sender: entry.clone_info.last_update_sender,
-                sent_time: entry.clone_info.last_update_time,
-                from_cache: (total - 1 - i) as u32,
-                subscription_id: self.subscription_id,
-            });
-            handler(&ViewEvent {
-                header,
-                value: entry.value,
+        let events: Vec<ViewEvent<T>> = self.state.container.with_iter(|iter| {
+            iter.map(|(_, value, info)| ViewEvent {
+                header: dots!(DotsHeader {
+                    type_name: self.type_name.clone(),
+                    attributes: <T as dots_rs_core::Transmittable>::valid_set(value),
+                    sender: info.last_update_sender,
+                    sent_time: info.last_update_time,
+                    subscription_id: self.subscription_id,
+                }),
+                value: value.clone(),
                 op: ViewOp::Create,
-            });
+            })
+            .collect()
+        });
+        // Release the container lock before invoking user code.
+        let total = events.len();
+        for (i, mut event) in events.into_iter().enumerate() {
+            event.header.from_cache = Some((total - 1 - i) as u32);
+            handler(&event);
         }
 
         let id = self.state.next_handler_id.fetch_add(1, Ordering::Relaxed);

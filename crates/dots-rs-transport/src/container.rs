@@ -1042,24 +1042,54 @@ where
         })
     }
 
+    /// Borrow the first instance matching `predicate`, without cloning it.
+    ///
+    /// Scans in container iteration order and stops at the first match.
+    /// Returns `None` if nothing matches. For lookup by a complete key,
+    /// prefer [`get_ref`](Self::get_ref), which uses the key index.
+    ///
+    /// The predicate runs under the read lock: keep it brief and do not
+    /// re-enter this container. The returned [`ContainerRef`] keeps that
+    /// lock until dropped, blocking updates to this container. Do not hold
+    /// it across `.await` or lengthy work. Use [`find`](Self::find) for an
+    /// owned copy, or [`with_iter`](Self::with_iter) to extract a field and
+    /// release the lock before returning.
+    pub fn find_ref<F>(&self, mut predicate: F) -> Option<ContainerRef<'_, T>>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let state = self.inner.state.read();
+        let entry = state
+            .entries
+            .values()
+            .find(|entry| predicate(entry.value.as_typed::<T>().expect(TYPED_VIEW_EXPECT)))?;
+        // As in get_ref, the read guard keeps the entry and its typed
+        // buffer stable for the entire lifetime of the returned borrow.
+        let value: *const T = entry.value.as_typed::<T>().expect(TYPED_VIEW_EXPECT);
+        let clone_info: *const CloneInfo = &entry.clone_info;
+        Some(ContainerRef {
+            value,
+            clone_info,
+            _guard: state,
+            _phantom: PhantomData,
+        })
+    }
+
     /// Return an owned copy of the first instance matching `predicate`.
     ///
     /// Scans borrowed instances in container iteration order and stops at
     /// the first match. Only that instance is cloned. Returns `None` if
-    /// nothing matches. For lookup by a complete key, prefer [`get`](Self::get).
+    /// nothing matches. Use [`find_ref`](Self::find_ref) to borrow the match
+    /// without cloning. For lookup by a complete key, prefer [`get_ref`](Self::get_ref).
     ///
     /// The predicate runs under the container's read lock: keep it brief
     /// and do not re-enter this container. The lock is released before
     /// returning; the result can be retained across updates or `.await`.
-    pub fn find<F>(&self, mut predicate: F) -> Option<T>
+    pub fn find<F>(&self, predicate: F) -> Option<T>
     where
         F: FnMut(&T) -> bool,
     {
-        let guard = self.lock();
-        guard
-            .iter()
-            .find(|(_, value, _)| predicate(value))
-            .map(|(_, value, _)| value.clone())
+        self.find_ref(predicate).map(|entry| (*entry).clone())
     }
 
     /// Return owned copies of all instances matching `predicate`.
@@ -1106,6 +1136,16 @@ where
     /// stored `AnyStruct` via a pointer cast. Drops the lock before
     /// returning — useful when the caller wants to process entries
     /// without blocking the dispatch path.
+    ///
+    /// This allocates a vector and clones every instance and its metadata.
+    /// Before using it, consider [`get_ref`](Self::get_ref) for a borrowed
+    /// lookup by key, [`find_ref`](Self::find_ref) for a borrowed predicate
+    /// search, or [`with_iter`](Self::with_iter) for filtering, counting,
+    /// and extracting fields without cloning whole instances.
+    ///
+    /// Use `snapshot` when you need an owned, consistent copy of the entire
+    /// container that can outlive the read lock, for example across `.await`
+    /// or while preserving state for later processing.
     pub fn snapshot(&self) -> Vec<ContainerEntry<T>> {
         let state = self.inner.state.read();
         state
@@ -1997,6 +2037,56 @@ mod search_tests {
         );
         assert_eq!(CLONES.with(Cell::get), 0);
         assert!(container.inner.state.try_write().is_some());
+    }
+
+    #[test]
+    fn find_ref_borrows_first_match_and_pins_only_the_container() {
+        let container = make_view_container::<Item>();
+        assert!(container.find_ref(|_| panic!("empty container")).is_none());
+        assert!(container.inner.state.try_write().is_some());
+        insert(&container, 1, "skip");
+        insert(&container, 2, "match");
+        insert(&container, 3, "match");
+        CLONES.with(|count| count.set(0));
+
+        let found = {
+            let pattern = String::from("match");
+            let mut visited = Vec::new();
+            let found = container
+                .find_ref(|item| {
+                    visited.push(item.id.unwrap());
+                    item.message.as_deref() == Some(pattern.as_str())
+                })
+                .unwrap();
+            assert_eq!(visited, vec![1, 2]);
+            found // The result does not borrow the predicate or its captures.
+        };
+        assert_eq!(found.id, Some(2));
+        assert_eq!(found.message.as_deref(), Some("match"));
+        assert_eq!(found.clone_info().last_operation, Operation::Create);
+        assert_eq!(CLONES.with(Cell::get), 0);
+        assert!(container.inner.state.try_write().is_none());
+        // The reference points into storage, rather than an owned copy.
+        container.with_iter(|mut iter| {
+            let (_, stored, info) = iter.find(|(_, item, _)| item.id == Some(2)).unwrap();
+            assert!(std::ptr::eq(&*found, stored));
+            assert!(std::ptr::eq(found.clone_info(), info));
+        });
+        drop(found);
+        assert!(container.inner.state.try_write().is_some());
+
+        assert!(container.find_ref(|_| false).is_none());
+        assert_eq!(CLONES.with(Cell::get), 0);
+        assert!(container.inner.state.try_write().is_some());
+        insert(&container, 2, "changed");
+        assert_eq!(
+            container
+                .find_ref(|v| v.id == Some(2))
+                .unwrap()
+                .message
+                .as_deref(),
+            Some("changed")
+        );
     }
 
     #[test]

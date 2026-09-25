@@ -26,9 +26,9 @@ impl Stairwell {
                 return;
             }
 
-            // Note: `get` matches by `#[dots(key)]` fields only —
+            // Note: `get_ref` matches by `#[dots(key)]` fields only —
             // `query`'s `brightness == None` is irrelevant.
-            let next_brightness: u32 = match lights.get(&LightControl::new(STAIRWELL_LIGHT)) {
+            let next_brightness: u32 = match lights.get_ref(&LightControl::new(STAIRWELL_LIGHT)) {
                 Some(entry) => {
                     // `None` brightness reads as "0" per the model
                     // contract (invalid property == 0).

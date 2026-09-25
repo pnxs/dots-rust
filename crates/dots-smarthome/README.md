@@ -66,7 +66,7 @@ to fire, or interrupt the reactor.
   the DOTS handshake. No CLI arg parsing.
 - **`app.container::<LightControl>()`** — returns a clone of the
   transceiver-owned container. Multiple components asking for the same
-  type get the same backing store; `lights.get(&query)` matches on the
+  type get the same backing store; `lights.get_ref(&query)` matches on the
   `#[dots(key)]` field.
 - **Subscriptions are dispatch-only** — the components hold their
   `SubscriptionHandle`s to keep the handlers attached; the broker

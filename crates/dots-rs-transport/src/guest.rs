@@ -1310,25 +1310,34 @@ fn replay_events<T>(container: &Arc<DynContainer>) -> Vec<Event<T>>
 where
     T: StructValue + Send + Sync + Clone + 'static,
 {
-    let snapshot = Container::<T>::from_dyn(container.clone()).snapshot();
-    let total = snapshot.len();
-    snapshot
-        .into_iter()
-        .enumerate()
-        .map(|(i, entry)| {
+    // Build the owned events directly, then release the cache lock before
+    // callers invoke handlers. No intermediate container snapshot is needed.
+    let mut events: Vec<Event<T>> = Container::<T>::from_dyn(container.clone()).with_iter(|iter| {
+        iter.map(|(_, value, info)| {
             let header = DotsHeader {
                 type_name: Some(container.name().to_string()),
-                attributes: Some(StructValue::valid_set(&entry.value)),
-                sender: entry.clone_info.last_update_sender,
-                sent_time: entry.clone_info.last_update_time,
-                server_sent_time: entry.clone_info.last_update_time,
-                from_cache: Some((total - 1 - i) as u32),
+                attributes: Some(StructValue::valid_set(value)),
+                sender: info.last_update_sender,
+                sent_time: info.last_update_time,
+                server_sent_time: info.last_update_time,
                 ..Default::default()
             };
-            let updated = Arc::new(entry.value.clone());
-            Event::from_parts(header, entry.value, updated, Operation::Create, entry.clone_info)
+            let updated = Arc::new(value.clone());
+            Event::from_parts(
+                header,
+                value.clone(),
+                updated,
+                Operation::Create,
+                info.clone(),
+            )
         })
         .collect()
+    });
+    let total = events.len();
+    for (i, event) in events.iter_mut().enumerate() {
+        event.header.from_cache = Some((total - 1 - i) as u32);
+    }
+    events
 }
 
 fn register_callback<T, F>(
@@ -1429,29 +1438,33 @@ where
         .expect("dispatch mutex poisoned")
         .register(type_name.clone(), Box::new(entry));
     if let Some(container) = container {
-        let snapshot = container.with_entries_dyn(|entries| {
-            entries.values().cloned().collect::<Vec<_>>()
+        let events: Vec<Event<DynamicStruct>> = container.with_iter(|iter| {
+            iter.map(|(_, stored, info)| {
+                let value = match stored {
+                    ContainerValue::Dynamic(d) => d.clone(),
+                    ContainerValue::Typed(a) => {
+                        DynamicStruct::decode(descriptor.clone(), &dots_rs_core::encode_to_vec(a))
+                            .unwrap_or_else(|_| DynamicStruct::from_struct_value(a))
+                    }
+                };
+                let header = DotsHeader {
+                    type_name: Some(type_name.clone()),
+                    attributes: Some(value.valid_set()),
+                    sender: info.last_update_sender,
+                    sent_time: info.last_update_time,
+                    server_sent_time: info.last_update_time,
+                    ..Default::default()
+                };
+                let updated = Arc::new(value.clone());
+                Event::from_parts(header, value, updated, Operation::Create, info.clone())
+            })
+            .collect()
         });
-        let total = snapshot.len();
-        for (i, entry) in snapshot.into_iter().enumerate() {
-            let value = match entry.value {
-                ContainerValue::Dynamic(d) => d,
-                ContainerValue::Typed(a) => {
-                    DynamicStruct::decode(descriptor.clone(), &dots_rs_core::encode_to_vec(&a))
-                        .unwrap_or_else(|_| DynamicStruct::from_struct_value(&a))
-                }
-            };
-            let header = DotsHeader {
-                type_name: Some(type_name.clone()),
-                attributes: Some(value.valid_set()),
-                sender: entry.clone_info.last_update_sender,
-                sent_time: entry.clone_info.last_update_time,
-                server_sent_time: entry.clone_info.last_update_time,
-                from_cache: Some((total - 1 - i) as u32),
-                ..Default::default()
-            };
-            let updated = Arc::new(value.clone());
-            let event = Event::from_parts(header, value, updated, Operation::Create, entry.clone_info);
+        // Project borrowed storage while locked, but deliver owned events
+        // afterward so callbacks can access the container themselves.
+        let total = events.len();
+        for (i, mut event) in events.into_iter().enumerate() {
+            event.header.from_cache = Some((total - 1 - i) as u32);
             (*replaying)(&event);
         }
     }
