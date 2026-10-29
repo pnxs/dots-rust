@@ -227,11 +227,7 @@ fn wire_only_dynamic_struct_decodes_enum_field() {
 
     // Spot-check that the decoded enum field is DynamicValue::Enum(2)
     // (Status::Running has tag 2 — the wire encoding).
-    let (_, status_value) = dyn_value
-        .properties
-        .iter()
-        .find(|(t, _)| *t == 2)
-        .unwrap();
+    let (_, status_value) = dyn_value.properties.iter().find(|(t, _)| *t == 2).unwrap();
     match status_value {
         DynamicValue::Enum(v) => assert_eq!(*v, 2),
         other => panic!("expected DynamicValue::Enum, got {other:?}"),
@@ -249,4 +245,60 @@ fn unknown_enum_tag_returns_decode_error() {
     e.u32(99).unwrap();
     let result: Result<Job, _> = decode_typed_from_slice(&buf);
     assert!(result.is_err(), "decode of unknown enum tag must fail");
+}
+
+#[test]
+fn display_matches_descriptor_text_parser() {
+    use dots_rs_core::{DynamicEnumDescriptor, DynamicFieldKind};
+
+    let kind = DynamicFieldKind::Enum(Arc::new(DynamicEnumDescriptor::from_static(
+        Errno::DESCRIPTOR,
+    )));
+    for (value, tag, name) in [
+        (Errno::Ok, 1, "Ok"),
+        (Errno::Refused, 2, "Refused"),
+        (Errno::BadMessage, 3, "BadMessage"),
+    ] {
+        let text = value.to_string();
+        assert_eq!(text, name);
+        assert_eq!(text.parse::<Errno>().unwrap(), value);
+        assert_eq!(format!("  {name}\n").parse::<Errno>().unwrap(), value);
+        assert_eq!(tag.to_string().parse::<Errno>().unwrap(), value);
+        let parsed = kind.parse_value(&text).unwrap();
+        assert_eq!(parsed, DynamicValue::Enum(tag));
+        assert_eq!(kind.format_value(&parsed), text);
+        // The parser produces wire tags, which decode back into the typed enum.
+        let bytes = [tag as u8];
+        let mut decoder = dots_rs_core::minicbor::Decoder::new(&bytes);
+        assert_eq!(
+            <Errno as dots_rs_core::DotsField>::dots_decode(&mut decoder).unwrap(),
+            value
+        );
+    }
+}
+
+#[test]
+fn enum_from_str_rejects_unknown_names_and_tags() {
+    use dots_rs_core::ParseErrorReason;
+
+    // Integers denote wire tags, never the enum's metadata values.
+    for text in [
+        "refused",
+        "Errno::Refused",
+        "Unknown",
+        "0",
+        "99",
+        "-1",
+        "4294967296",
+    ] {
+        let error = text.parse::<Errno>().unwrap_err();
+        assert_eq!(error.type_name, "Errno");
+        assert_eq!(error.reason, ParseErrorReason::UnknownEnumerator);
+    }
+    for text in ["", " \n\t"] {
+        assert_eq!(
+            text.parse::<Errno>().unwrap_err().reason,
+            ParseErrorReason::Empty
+        );
+    }
 }

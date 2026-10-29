@@ -171,6 +171,10 @@ pub fn derive_dots_struct(input: TokenStream) -> TokenStream {
 /// 2. `impl DotsTypeKind for T` exposing `FieldKind::Enum(Self::DESCRIPTOR)`.
 /// 3. `impl DotsField for T` that encodes/decodes the wire tag,
 ///    matching variants by tag.
+/// 4. `impl Display for T` that writes the descriptor's enumerator name,
+///    compatible with `DynamicFieldKind::parse_value`.
+/// 5. `impl FromStr for T` accepting exact enumerator names or known decimal
+///    wire tags, with surrounding whitespace ignored.
 #[proc_macro_derive(DotsEnum, attributes(dots))]
 pub fn derive_dots_enum(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -1613,6 +1617,24 @@ fn expand_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     });
 
+    // Match descriptor names exactly so Display feeds the existing text parser.
+    let display_arms = variants.iter().map(|v| {
+        let ident = v.ident;
+        let name = v.ident.to_string();
+        quote! { Self::#ident => #name }
+    });
+
+    let parse_name_arms = variants.iter().map(|v| {
+        let ident = v.ident;
+        let name = v.ident.to_string();
+        quote! { #name => return ::core::result::Result::Ok(Self::#ident) }
+    });
+    let parse_tag_arms = variants.iter().map(|v| {
+        let ident = v.ident;
+        let tag = v.tag;
+        quote! { ::core::result::Result::Ok(#tag) => ::core::result::Result::Ok(Self::#ident) }
+    });
+
     let encode_arms = variants.iter().map(|v| {
         let ident = v.ident;
         let tag = v.tag;
@@ -1660,6 +1682,37 @@ fn expand_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
                     &#descriptor_const_ident;
             }
         };
+
+        impl ::core::fmt::Display for #enum_ident {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                f.write_str(match self {
+                    #( #display_arms ),*
+                })
+            }
+        }
+
+        impl ::core::str::FromStr for #enum_ident {
+            type Err = #dots_rt::ParseValueError;
+
+            fn from_str(text: &str) -> ::core::result::Result<Self, Self::Err> {
+                let text = text.trim();
+                match text {
+                    #( #parse_name_arms, )*
+                    _ => {}
+                }
+                match text.parse::<u32>() {
+                    #( #parse_tag_arms, )*
+                    _ => ::core::result::Result::Err(#dots_rt::ParseValueError {
+                        type_name: #wire_name.into(),
+                        reason: if text.is_empty() {
+                            #dots_rt::ParseErrorReason::Empty
+                        } else {
+                            #dots_rt::ParseErrorReason::UnknownEnumerator
+                        },
+                    }),
+                }
+            }
+        }
 
         impl #dots_rt::DotsTypeKind for #enum_ident {
             const KIND: #dots_rt::FieldKind =
