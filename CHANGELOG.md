@@ -6,6 +6,40 @@ version-bump commits as boundaries; dates indicate those commits, not verified
 publication dates. Version 0.1.0 covers the initial implementation through the
 crates.io workspace restructuring.
 
+## 0.2.0 — 2026-10-29
+
+### Added
+
+- `InstanceRef<T>::materialize_key()` to decode a reference's canonical key
+  directly into `T`, leaving non-key properties absent. Uses the static type
+  descriptor without a dynamic-value round trip, cache lookup, or `T: Default`
+  requirement; rejects keys with incompatible counts or field types.
+- Generate `Display` and `FromStr` implementations for DOTS enums. Display
+  emits the exact descriptor variant name, including with `-Zfmt-debug=none`.
+  Parsing accepts exact names or known decimal wire tags, ignores surrounding
+  whitespace, and returns `ParseValueError` for unknown names or tags. Text
+  names are compatible with the existing descriptor-directed enum parser;
+  numeric inputs refer to wire tags, not enum metadata values.
+- `dots_rs::Uuid` with standard lowercase hyphenated `Display`, compatible
+  `FromStr`, byte-array conversions, and support for keys, vectors, and typed
+  filter predicates. Parsing accepts uppercase or lowercase hexadecimal text
+  and retains the existing compact forms, including the optional `0x` prefix.
+
+### Changed
+
+- Generated `uuid` fields now use `dots_rs::Uuid` instead of `[u8; 16]`.
+  Convert existing arrays with `.into()`
+  or `Uuid::from_bytes`, and retrieve bytes with `as_bytes` or `into_bytes`.
+  The 16-byte CBOR wire encoding and handwritten array fields remain supported.
+- Dynamic UUID display and `uuid_to_string` now emit
+  `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` instead of `0x`-prefixed hexadecimal.
+  UUID text formatting remains available with `-Zfmt-debug=none`.
+
+### Fixed
+
+- Preserve quoted and escaped string keys in `InstanceRef` display when built
+  with `-Zfmt-debug=none`, including dynamic reference display.
+
 ## 0.1.7 - 2026-09-25
 
 ### Added
