@@ -9,10 +9,9 @@
 //!
 //! The scalar types that exist as concrete Rust types also implement
 //! [`FromStr`](core::str::FromStr) — [`Timepoint`](crate::Timepoint),
-//! [`Duration`](crate::Duration) and
-//! [`PropertySet`](crate::PropertySet) — and `uuid` values, which have
-//! no wrapper type, are served by [`uuid_from_str`] /
-//! [`uuid_to_string`].
+//! [`Duration`](crate::Duration), [`PropertySet`](crate::PropertySet), and
+//! [`Uuid`](crate::Uuid). UUID byte arrays are also supported by the helpers
+//! [`uuid_from_str`] / [`uuid_to_string`].
 //!
 //! Nested structs and open `any` values are not parsable from text:
 //! they report [`ParseErrorReason::Unsupported`].
@@ -492,16 +491,9 @@ pub fn uuid_from_str(text: &str) -> Result<[u8; 16], ParseValueError> {
     Ok(bytes)
 }
 
-/// Render a `uuid` as `0x` followed by 32 lowercase hex digits.
+/// Render a `uuid` in lowercase `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form.
 pub fn uuid_to_string(bytes: &[u8; 16]) -> String {
-    use core::fmt::Write;
-
-    let mut out = String::with_capacity(34);
-    out.push_str("0x");
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    crate::Uuid::from_bytes(*bytes).to_string()
 }
 
 // ===== timepoint / duration =====

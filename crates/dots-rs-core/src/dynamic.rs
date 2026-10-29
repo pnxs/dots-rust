@@ -1158,13 +1158,7 @@ impl core::fmt::Display for DynamicValue {
             DynamicValue::F64(v) => write!(f, "{v}"),
             DynamicValue::String(s) => write!(f, "{s:?}"),
             DynamicValue::PropertySet(p) => write!(f, "{p:?}"),
-            DynamicValue::Uuid(b) => {
-                f.write_str("0x")?;
-                for byte in b {
-                    write!(f, "{byte:02x}")?;
-                }
-                Ok(())
-            }
+            DynamicValue::Uuid(b) => core::fmt::Display::fmt(&crate::Uuid::from_bytes(*b), f),
             DynamicValue::Vec(items) => {
                 f.write_str("[")?;
                 for (i, item) in items.iter().enumerate() {

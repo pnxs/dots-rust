@@ -356,6 +356,16 @@ impl IntoPredicateValue for [u8; 16] {
     }
 }
 
+impl IntoPredicateValue for dots_rs_core::Uuid {
+    fn into_scalar(self) -> DotsPredicateValue {
+        self.into_bytes().into_scalar()
+    }
+
+    fn into_list(items: Vec<Self>) -> DotsPredicateValue {
+        <[u8; 16]>::into_list(items.into_iter().map(Self::into_bytes).collect())
+    }
+}
+
 /// Zero-sized typed handle to a struct property.
 ///
 /// Constructed at compile time via `Attr::new(tag)`; `#[derive(DotsStruct)]`

@@ -70,7 +70,7 @@ fn uuid_helpers_round_trip() {
         0x10,
     ];
     let text = uuid_to_string(&bytes);
-    assert_eq!(text, "0x0123456789abcdeffedcba9876543210");
+    assert_eq!(text, "01234567-89ab-cdef-fedc-ba9876543210");
     assert_eq!(uuid_from_str(&text).unwrap(), bytes);
     // The dashed form other DOTS tooling prints is accepted too.
     assert_eq!(
@@ -188,5 +188,34 @@ fn per_kind_text_round_trips_through_the_public_api() {
             "{} round-trip via {text:?}",
             kind.type_name()
         );
+    }
+}
+
+#[test]
+fn uuid_display_and_from_str_use_standard_text() {
+    use dots_rs_core::Uuid;
+    let canonical = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
+    let uuid = canonical.parse::<Uuid>().unwrap();
+    assert_eq!(uuid.to_string(), canonical);
+    assert_eq!(canonical.to_uppercase().parse::<Uuid>().unwrap(), uuid);
+    assert_eq!(
+        "0xf81d4fae7dec11d0a76500a0c91e6bf6"
+            .parse::<Uuid>()
+            .unwrap(),
+        uuid
+    );
+    assert_eq!(Uuid::from_bytes(uuid.into_bytes()), uuid);
+    assert_eq!(DynamicValue::Uuid(uuid.into_bytes()).to_string(), canonical);
+    assert_eq!(
+        DynamicFieldKind::Uuid.format_value(&DynamicValue::Uuid(uuid.into_bytes())),
+        canonical
+    );
+    for invalid in [
+        "",
+        "not-a-uuid",
+        "f81d4fae-7dec-11d0-a765-00a0c91e6bf",
+        "z81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+    ] {
+        assert!(invalid.parse::<Uuid>().is_err());
     }
 }

@@ -1056,7 +1056,7 @@ fn vec_element_type(ty: &Type) -> Option<&Type> {
 
 /// True if `ty` is a leaf type the filter DSL supports as the RHS
 /// of a predicate comparison — scalars, String, Timepoint /
-/// Duration, and the `uuid` array `[u8; 16]`. Vec / nested struct /
+/// Duration, Uuid, and the legacy `uuid` array `[u8; 16]`. Vec / nested struct /
 /// enum fields are intentionally excluded so emitted constants only
 /// exist where they're actually usable.
 fn is_dsl_leaf_type(ty: &Type) -> bool {
@@ -1072,6 +1072,7 @@ fn is_dsl_leaf_type(ty: &Type) -> bool {
                     | "String"
                     | "Timepoint"
                     | "Duration"
+                    | "Uuid"
             );
         }
     }

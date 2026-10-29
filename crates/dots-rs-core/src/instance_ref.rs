@@ -471,7 +471,9 @@ fn fmt_key_item(
             d.skip().map_err(err)?;
             f.write_str("null")
         }
-        Type::String => write!(f, "{:?}", d.str().map_err(err)?),
+        // Escape explicitly through Display: a Debug placeholder would drop
+        // the entire string when compiled with -Zfmt-debug=none.
+        Type::String => write!(f, "\"{}\"", d.str().map_err(err)?.escape_debug()),
         Type::Bytes => {
             f.write_str("0x")?;
             for b in d.bytes().map_err(err)? {

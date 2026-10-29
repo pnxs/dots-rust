@@ -145,3 +145,11 @@ fn tempdir() -> std::path::PathBuf {
     std::fs::create_dir_all(&base).unwrap();
     base
 }
+
+#[test]
+fn uuid_fields_use_the_text_capable_wrapper() {
+    let file = parse_str("struct Token { 1: [key] uuid id; 2: vector<uuid> history; }").unwrap();
+    let source = dots_rs_build::generate(&file);
+    assert!(source.contains("pub id: dots_rs::Uuid"));
+    assert!(source.contains("pub history: Option<Vec<dots_rs::Uuid>>"));
+}

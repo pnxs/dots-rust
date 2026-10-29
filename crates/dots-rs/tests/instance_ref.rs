@@ -62,3 +62,18 @@ fn materialize_singleton_key() {
     assert!(key.value.is_none());
     assert!(key.valid_set().is_empty());
 }
+
+#[test]
+fn display_preserves_escaped_string_keys() {
+    let value = dots!(Device { site: 7_u32, name: "a\"b\\c\n\t\0\u{1b}é" });
+    let reference = InstanceRef::of(&value);
+    let expected = r#"Device[7,"a\"b\\c\n\t\0\u{1b}é"]"#;
+    assert_eq!(reference.to_string(), expected);
+    let generic = reference.into_any();
+    assert_eq!(generic.to_string(), expected);
+    let dynamic = dots_rs::DynamicValue::InstanceRef {
+        type_name: Some("Device".into()),
+        key: generic.key_bytes().to_vec(),
+    };
+    assert_eq!(dynamic.to_string(), expected);
+}

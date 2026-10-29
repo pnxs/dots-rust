@@ -33,6 +33,7 @@ mod registration;
 mod temporal;
 pub mod text;
 mod value;
+mod uuid;
 
 /// Re-export of the `linkme` crate so the derive macro can reference
 /// it as `::dots_rs_core::linkme` without users adding it as a direct
@@ -62,6 +63,7 @@ pub use registration::{
     GlobalRegistration, PUBLISHED_TYPES, SUBSCRIBED_FILTERED_TYPES, SUBSCRIBED_TYPES,
 };
 pub use temporal::{Duration, Timepoint};
+pub use uuid::Uuid;
 pub use text::{ParseErrorReason, ParseValueError, uuid_from_str, uuid_to_string};
 pub use value::{Publishable, StructValue, Transmittable};
 
