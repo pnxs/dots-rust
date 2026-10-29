@@ -1005,6 +1005,54 @@ pub fn decode_typed_from_decoder<T>(decoder: &mut CborDecoder<'_>) -> Result<T, 
 where
     T: StructValue,
 {
+    decode_seeded_typed::<T>(|descriptor, base| {
+        let mut valid = PropertySet::EMPTY;
+        // SAFETY: decode_seeded_typed supplies initialized storage matching
+        // the descriptor for T.
+        unsafe { decode_into_raw(descriptor, base, &mut valid, decoder) }
+    })
+}
+
+/// Decode a complete canonical key directly into T's key property slots.
+/// Non-key slots retain their initialized, absent state.
+pub(crate) fn decode_typed_key<T: StructValue>(bytes: &[u8]) -> Result<T, DecodeError> {
+    let mut decoder = minicbor::Decoder::new(bytes);
+    let key_mask = T::type_descriptor().key_mask();
+    let len = decoder.array()?.ok_or_else(|| {
+        DecodeError::message("indefinite-length array not supported in a canonical key")
+    })?;
+    if len != key_mask.len() as u64 {
+        return Err(DecodeError::message(
+            "canonical key length does not match the type's key property count",
+        ));
+    }
+    decode_seeded_typed::<T>(|descriptor, base| {
+        for tag in key_mask.iter() {
+            if decoder.datatype()? == minicbor::data::Type::Null {
+                return Err(DecodeError::message(
+                    "invalid instance reference: canonical key must not contain null elements",
+                ));
+            }
+            let prop = descriptor
+                .property(tag)
+                .expect("tag comes from this descriptor's key mask");
+            // SAFETY: decode_seeded_typed supplies initialized storage for T;
+            // each property offset and decode thunk belong to its descriptor.
+            unsafe {
+                (prop.vtable.decode_value)(base.add(prop.offset), &mut decoder)?;
+            }
+        }
+        if decoder.position() != bytes.len() {
+            return Err(DecodeError::message("trailing bytes after canonical key"));
+        }
+        Ok(())
+    })
+}
+
+// Share initialization and error cleanup between map and key-array decoding.
+fn decode_seeded_typed<T: StructValue>(
+    decode: impl FnOnce(&'static StructDescriptor, *mut u8) -> Result<(), DecodeError>,
+) -> Result<T, DecodeError> {
     let descriptor = T::type_descriptor();
     let mut slot = core::mem::MaybeUninit::<T>::zeroed();
     let base = slot.as_mut_ptr() as *mut u8;
@@ -1018,17 +1066,12 @@ where
             (prop.vtable.init)(base.add(prop.offset));
         }
     }
-    let mut valid = PropertySet::EMPTY;
     // If decode bails (bad wire, missing key), the seeded buffer is a
     // fully-valid `T` that must be dropped through the property thunks —
     // `assume_init().drop()` can't run because we never reach it. The
     // guard handles that; it's `forget`-ten on the success path.
     let guard = RawStructGuard { descriptor, base };
-    // SAFETY: the buffer is a valid `T` (see above); typed thunks write
-    // at descriptor offsets.
-    unsafe {
-        decode_into_raw(descriptor, base, &mut valid, decoder)?;
-    }
+    decode(descriptor, base)?;
     core::mem::forget(guard);
     // SAFETY: decode succeeded, so the buffer is a fully-initialized `T`.
     Ok(unsafe { slot.assume_init() })

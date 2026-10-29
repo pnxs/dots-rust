@@ -159,6 +159,18 @@ impl InstanceRef<AnyInstance> {
 }
 
 impl<T: RefTarget + StructValue> InstanceRef<T> {
+    /// Recover the referenced instance's key fields as a typed value.
+    ///
+    /// Only key properties are populated; all non-key properties are absent.
+    /// This decodes the identity stored in the reference without looking up
+    /// cached state, and does not require `T: Default`.
+    ///
+    /// Returns an error if the key does not match `T`'s key property count
+    /// or field types (for example, an empty default reference to a keyed type).
+    pub fn materialize_key(&self) -> Result<T, DecodeError> {
+        crate::layout::decode_typed_key(self.key_bytes())
+    }
+
     /// Typed reference to `value` — its canonical key, with the type
     /// fixed by `T`. All of `value`'s key properties must be set.
     pub fn of(value: &T) -> Self {
